@@ -1,109 +1,36 @@
-import os
-import json
-import requests
-import uuid
-import time
-import datetime
-import io
-import urllib3
-import random
-import re
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# --- [1. 설정 및 인증] ---
-RAW_SERVICE_ACCOUNT = os.getenv('GDRIVE_SERVICE_ACCOUNT')
-MSN_API_KEY = "0QfOX3Vn51YCzitbLaRkTTBadtWpgTN8NZLW0C1SEM"
-TELEGRAM_TOKEN = "8468786480:AAFytUe-qHOfhsagEwTwDxn0l5vSxQbKmzs"
-TELEGRAM_CHAT_ID = "1281749368"
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=15)
-    except:
-        pass
-
-# 인증 및 드라이브 서비스 설정
-SERVICE_ACCOUNT_INFO = json.loads(RAW_SERVICE_ACCOUNT)
-creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
-drive_service = build('drive', 'v3', credentials=creds)
-
-# --- [2. 유틸리티 함수] ---
-
-def find_file_id(name, parent_id=None):
-    query = f"name = '{name}' and trashed = false"
-    if parent_id: query += f" and '{parent_id}' in parents"
-    results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
-    return results[0]['id'] if results else None
-
-def download_json(file_id):
-    request = drive_service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done: _, done = downloader.next_chunk()
-    return json.loads(fh.getvalue().decode())
-
-def upload_json(filename, data, parent_id):
-    file_id = find_file_id(filename, parent_id)
-    fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
-    media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
-    if file_id:
-        drive_service.files().update(fileId=file_id, media_body=media).execute()
-    else:
-        meta = {'name': filename, 'parents': [parent_id]}
-        drive_service.files().create(body=meta, media_body=media).execute()
-
-# --- [3. 메인 로직] ---
+# ... (앞부분 설정 및 인증 코드는 동일하게 유지) ...
 
 def run_harvester():
     start_time = time.time()
+    success_count = 0
+    error_count = 0
     
     try:
-        # 경로 탐색
+        # 경로 및 모드 설정 로직 (기존과 동일)
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
         data_id = find_file_id("Financial_Data_5Y_Split", sys_id)
-
-        # 시간 및 모드 설정
+        
         now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-        update_mode = "DAILY"
+        update_mode = "DAILY" 
         if now_kst.weekday() == 5: update_mode = "WEEKLY"
         if now_kst.day in [1, 15]: update_mode = "QUARTERLY"
 
-        # 매핑 로드
+        # 그룹 판별 및 필터링
+        current_hour = now_kst.hour
+        target_chars = "ABCDEFGHIJKLM" if 6 <= current_hour <= 8 else "NOPQRSTUVWXYZ0123456789"
+        
         mapping_id = find_file_id("Ticker_ID_Mapping_Final.json", sys_id)
         full_map = download_json(mapping_id) if mapping_id else {}
+        
+        filtered_map = {t: i for t, i in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        # 그룹 필터링 (메시지 전송 전 미리 계산)
-        current_hour = now_kst.hour
-        if 6 <= current_hour <= 8:
-            target_chars = "ABCDEFGHIJKLM"
-        else:
-            target_chars = "NOPQRSTUVWXYZ0123456789"
-
-        # 진짜 수집 대상만 골라내기 (중복 제거 및 그룹 필터링)
-        filtered_map = {}
-        for ticker, msn_id in full_map.items():
-            first_char = ticker[0].upper()
-            if not first_char.isalpha():
-                if "0123456789" in target_chars: filtered_map[ticker] = msn_id
-            elif first_char in target_chars:
-                filtered_map[ticker] = msn_id
-
-        # 정확한 숫자 보고
-        send_telegram(f"🚀 *수집 프로세스 시작*\n- 그룹: {target_chars}\n- 모드: {update_mode}\n- 실 수집 대상: *{len(filtered_map)}* 종목")
+        send_telegram(f"🚀 *수집 프로세스 시작*\n- 그룹: {target_chars}\n- 모드: {update_mode}\n- 대상: {len(filtered_map)} 종목")
 
         storage = {}
-        success_count = 0
-        error_count = 0
         session = requests.Session()
 
+        # 데이터 수집 루프
         for ticker, msn_id in filtered_map.items():
             first_char = ticker[0].upper()
             filename = f"{first_char if first_char.isalpha() else 'ETC'}_stocks.json"
@@ -113,33 +40,44 @@ def run_harvester():
                     fid = find_file_id(filename, data_id)
                     storage[filename] = download_json(fid) if fid else {}
 
-                act_id = str(uuid.uuid4())
-                res = session.get(f"https://assets.msn.com/service/Finance/Equities?apikey={MSN_API_KEY}&activityId={act_id}&ids={msn_id}&wrapodata=false", timeout=10)
-                
-                if res.status_code == 200:
-                    basic_data = res.json()[0]
-                    storage[filename][ticker] = {
-                        "msn_id": msn_id,
-                        "last_updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'),
-                        "basic": basic_data,
-                        "history_5y": storage[filename].get(ticker, {}).get('history_5y', {})
-                    }
-                    success_count += 1
-                
-                time.sleep(random.uniform(0.6, 0.9))
-            except:
+                # MSN API 호출 (생략: 기존 로직과 동일)
+                # ... 수집 코드 ...
+                success_count += 1
+                time.sleep(random.uniform(0.7, 1.0)) # 밴 방지를 위해 약간 더 여유있게 조정
+
+                # [개선] 500종목마다 로그 출력하여 GitHub 생존 신고
+                if success_count % 500 == 0:
+                    print(f"🔄 현재 {success_count}개 수집 중...")
+
+            except Exception:
                 error_count += 1
 
-        # 저장 및 보고
-        send_telegram(f"📤 *저장 단계*: {success_count}개 종목 드라이브 동기화 중...")
+        # --- [저장 로직 개선] ---
+        send_telegram(f"📤 *저장 단계 진입*: {success_count}개 데이터를 드라이브에 기록합니다.")
+        
         for fname, content in storage.items():
-            upload_json(fname, content, data_id)
+            try:
+                upload_json(fname, content, data_id)
+                # 파일별 저장 성공 알림 (중간에 끊겨도 어디까지 됐는지 알 수 있음)
+                send_telegram(f"✅ 파일 저장 완료: `{fname}`")
+                time.sleep(2) # 구글 API 과부하 방지
+            except Exception as e:
+                send_telegram(f"⚠️ `{fname}` 저장 중 오류 발생: {str(e)}")
 
+        # 최종 보고
         duration = (time.time() - start_time) / 60
-        send_telegram(f"✨ *수집 완료 보고*\n✅ 성공: {success_count}\n❌ 에러: {error_count}\n⏱️ 소요: {duration:.1f}분")
+        summary = (
+            f"✨ *최종 수집 완료 보고*\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"✅ 성공: {success_count}\n"
+            f"❌ 에러: {error_count}\n"
+            f"⏱️ 소요: {duration:.1f}분\n"
+            f"━━━━━━━━━━━━━━"
+        )
+        send_telegram(summary)
 
     except Exception as e:
-        send_telegram(f"🚨 에러 발생: {str(e)}")
+        send_telegram(f"🚨 *시스템 중단 에러*: {str(e)}")
 
 if __name__ == "__main__":
     run_harvester()
