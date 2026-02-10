@@ -1,15 +1,16 @@
-name: MSN Stock Data Harvester
+name: US Stock Data Master Sync
 
 on:
   schedule:
-    # 매일 한국 시간 오전 4시 (UTC 19:00)에 실행
-    - cron: '0 19 * * *'
-  workflow_dispatch: # 필요할 때 GitHub 웹에서 수동으로 'Run workflow' 버튼을 눌러 실행 가능
+    # 1차 실행: 한국 시간 오전 7:00 (UTC 22:00) - 매핑 갱신 및 A-M 종목 수집
+    - cron: '0 22 * * *'
+    # 2차 실행: 한국 시간 오전 10:00 (UTC 01:00) - N-Z 및 기타 종목 수집
+    - cron: '0 1 * * *'
+  workflow_dispatch: # 수동 실행 가능
 
 jobs:
   harvest:
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -20,11 +21,10 @@ jobs:
           python-version: '3.9'
 
       - name: Install Dependencies
-        run: |
-          pip install requests google-api-python-client google-auth urllib3
+        run: pip install requests google-api-python-client google-auth urllib3
 
-      - name: Run Harvester Script
+      - name: Run Master Harvester
         env:
-          # GitHub Secrets에 등록한 서비스 계정 JSON 내용
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+        # GitHub 환경 시간(UTC)에 따라 파이썬 코드 내에서 그룹을 자동 판단하여 실행
         run: python harvester.py
