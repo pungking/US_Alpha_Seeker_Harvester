@@ -29,4 +29,7 @@ jobs:
       - name: Run Master Harvester
         env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MSN_API_KEY: ${{ secrets.MSN_API_KEY }}  # 이 줄을 꼭 추가하세요!
         run: python harvester.py
