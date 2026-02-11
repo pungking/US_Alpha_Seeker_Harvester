@@ -2,17 +2,16 @@ name: Master Stock Harvester
 
 on:
   schedule:
-    # 1차 수집 (A-M): 한국시간 오전 7시 (UTC 22:00)
-    - cron: '0 22 * * *'
-    # 2차 수집 (N-Z+): 한국시간 오전 10시 (UTC 01:00)
-    - cron: '0 1 * * *'
+    # 1차 수집 (A-M): 한국시간 화~토 오전 7시 (UTC 월~금 22:00)
+    - cron: '0 22 * * 1-5'
+    # 2차 수집 (N-Z+): 한국시간 화~토 오전 10시 (UTC 월~금 01:00)
+    - cron: '0 1 * * 2-6'
   workflow_dispatch: # 수동 실행 버튼
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # ⏳ 타임아웃을 6시간으로 연장 (기본값보다 훨씬 넉넉함)
-    timeout-minutes: 360 
+    timeout-minutes: 360 # 타임아웃 6시간 유지
 
     steps:
       - name: Checkout Repository
