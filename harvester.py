@@ -127,7 +127,6 @@ def run_harvester():
                     basic_data = res_a.json()[0]
                     history_data = storage[filename].get(ticker, {}).get('history_5y', {})
                     
-                    # 분기별 모드일 때만 재무제표 추가 수집
                     if update_mode == "QUARTERLY":
                         res_b = session.get(f"https://assets.msn.com/service/Finance/Equities/financialstatements?apikey={MSN_API_KEY}&activityId={act_id}&$filter=_p eq '{msn_id}'&wrapodata=false", timeout=15)
                         if res_b.status_code == 200:
@@ -141,7 +140,7 @@ def run_harvester():
                     }
                     success_count += 1
                 
-                # 🛡️ 밴 방지를 위한 랜덤 슬립 (요청하신 부분)
+                # 🛡️ 밴 방지를 위해 안전한 슬립 유지 (0.7 ~ 1.1초)
                 time.sleep(random.uniform(0.7, 1.1))
 
                 if success_count % 500 == 0:
@@ -150,7 +149,7 @@ def run_harvester():
             except Exception:
                 error_count += 1
 
-        # --- [저장 로직 개선] ---
+        # --- [저장 로직] ---
         send_telegram(f"📤 *저장 단계 진입*: {success_count}개 데이터를 드라이브에 기록합니다.")
         
         for fname, content in storage.items():
