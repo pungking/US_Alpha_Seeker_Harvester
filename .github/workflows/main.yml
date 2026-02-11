@@ -1,30 +1,33 @@
-name: US Stock Data Master Sync
+name: Master Stock Harvester
 
 on:
   schedule:
-    # 1차 실행: 한국 시간 오전 7:00 (UTC 22:00) - 매핑 갱신 및 A-M 종목 수집
+    # 1차 수집 (A-M): 한국시간 오전 7시 (UTC 22:00)
     - cron: '0 22 * * *'
-    # 2차 실행: 한국 시간 오전 10:00 (UTC 01:00) - N-Z 및 기타 종목 수집
+    # 2차 수집 (N-Z+): 한국시간 오전 10시 (UTC 01:00)
     - cron: '0 1 * * *'
-  workflow_dispatch: # 수동 실행 가능
+  workflow_dispatch: # 수동 실행 버튼
 
 jobs:
-  harvest:
+  build:
     runs-on: ubuntu-latest
+    # ⏳ 타임아웃을 6시간으로 연장 (기본값보다 훨씬 넉넉함)
+    timeout-minutes: 360 
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests google-api-python-client google-auth urllib3
+        run: |
+          pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client requests
 
       - name: Run Master Harvester
         env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
-        # GitHub 환경 시간(UTC)에 따라 파이썬 코드 내에서 그룹을 자동 판단하여 실행
         run: python harvester.py
