@@ -80,18 +80,21 @@ def run_harvester():
     success_count = 0
     error_count = 0
     
-    send_telegram("🤖 *안전 모드 수집 가동*")
+    send_telegram("🤖 *수집기 가동 시작*")
 
     try:
+        # 경로 탐색
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
         data_id = find_file_id("Financial_Data_5Y_Split", sys_id)
-
+        
+        # 시간 및 모드 설정
         now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-        update_mode = "DAILY"
+        update_mode = "DAILY" 
         if now_kst.weekday() == 5: update_mode = "WEEKLY"
         if now_kst.day in [1, 15]: update_mode = "QUARTERLY"
 
+        # 그룹 판별 및 필터링
         current_hour = now_kst.hour
         target_chars = "ABCDEFGHIJKLM" if 6 <= current_hour <= 8 else "NOPQRSTUVWXYZ0123456789"
         
@@ -100,13 +103,13 @@ def run_harvester():
         
         filtered_map = {t: i for t, i in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        send_telegram(f"🚀 *수집 시작*\n- 그룹: {target_chars}\n- 대상: {len(filtered_map)} 종목")
+        send_telegram(f"🚀 *수집 프로세스 시작*\n- 그룹: {target_chars}\n- 모드: {update_mode}\n- 대상: {len(filtered_map)} 종목")
 
         storage = {}
         session = requests.Session()
-        # 봇으로 의심받지 않도록 User-Agent 랜덤화 고려 가능하나 일단 표준 설정 유지
         session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
 
+        # 데이터 수집 루프
         for ticker, msn_id in filtered_map.items():
             first_char = ticker[0].upper()
             filename = f"{first_char if first_char.isalpha() else 'ETC'}_stocks.json"
@@ -117,46 +120,61 @@ def run_harvester():
                     storage[filename] = download_json(fid) if fid else {}
 
                 act_id = str(uuid.uuid4())
-                res = session.get(f"https://assets.msn.com/service/Finance/Equities?apikey={MSN_API_KEY}&activityId={act_id}&ids={msn_id}&wrapodata=false", timeout=10)
+                # MSN 기본 데이터 수집
+                res_a = session.get(f"https://assets.msn.com/service/Finance/Equities?apikey={MSN_API_KEY}&activityId={act_id}&ids={msn_id}&wrapodata=false", timeout=10)
                 
-                if res.status_code == 200:
-                    basic_data = res.json()[0]
+                if res_a.status_code == 200:
+                    basic_data = res_a.json()[0]
+                    history_data = storage[filename].get(ticker, {}).get('history_5y', {})
+                    
+                    # 분기별 모드일 때만 재무제표 추가 수집
+                    if update_mode == "QUARTERLY":
+                        res_b = session.get(f"https://assets.msn.com/service/Finance/Equities/financialstatements?apikey={MSN_API_KEY}&activityId={act_id}&$filter=_p eq '{msn_id}'&wrapodata=false", timeout=15)
+                        if res_b.status_code == 200:
+                            history_data = slice_5y(res_b.json())
+
                     storage[filename][ticker] = {
                         "msn_id": msn_id,
                         "last_updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'),
                         "basic": basic_data,
-                        "history_5y": storage[filename].get(ticker, {}).get('history_5y', {})
+                        "history_5y": history_data
                     }
                     success_count += 1
                 
-                # 🛡️ 밴 방지 안전 장치 (0.7 ~ 1.1초 사이 랜덤 대기)
+                # 🛡️ 밴 방지를 위한 랜덤 슬립 (요청하신 부분)
                 time.sleep(random.uniform(0.7, 1.1))
-                
-                if success_count % 500 == 0:
-                    print(f"🔄 안정 수집 중: {success_count}개 완료...")
 
-            except:
+                if success_count % 500 == 0:
+                    print(f"🔄 현재 {success_count}개 수집 중...")
+
+            except Exception:
                 error_count += 1
 
-        # 저장 단계
-        send_telegram(f"📤 *데이터 저장 단계*\n{success_count}개 종목 드라이브 기록 중...")
+        # --- [저장 로직 개선] ---
+        send_telegram(f"📤 *저장 단계 진입*: {success_count}개 데이터를 드라이브에 기록합니다.")
         
         for fname, content in storage.items():
-            upload_json(fname, content, data_id)
+            try:
+                upload_json(fname, content, data_id)
+                send_telegram(f"✅ 파일 저장 완료: `{fname}`")
+                time.sleep(2) # 구글 API 과부하 방지
+            except Exception as e:
+                send_telegram(f"⚠️ `{fname}` 저장 중 오류 발생: {str(e)}")
 
+        # 최종 보고
         duration = (time.time() - start_time) / 60
         summary = (
             f"✨ *최종 수집 완료 보고*\n"
             f"━━━━━━━━━━━━━━\n"
             f"✅ 성공: {success_count}\n"
             f"❌ 에러: {error_count}\n"
-            f"⏱️ 소요: {duration:.1f} 분\n"
+            f"⏱️ 소요: {duration:.1f}분\n"
             f"━━━━━━━━━━━━━━"
         )
         send_telegram(summary)
 
     except Exception as e:
-        send_telegram(f"🚨 *에러 발생*: {str(e)}")
+        send_telegram(f"🚨 *시스템 중단 에러*: {str(e)}")
 
 if __name__ == "__main__":
     run_harvester()
