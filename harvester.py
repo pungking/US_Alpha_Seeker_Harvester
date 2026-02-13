@@ -12,7 +12,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
-# 로그 실시간 출력 설정
+# 로그 실시간 출력을 위한 설정 (Buffering 해제)
 sys.stdout.reconfigure(line_buffering=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -21,23 +21,16 @@ RAW_SERVICE_ACCOUNT = os.getenv('GDRIVE_SERVICE_ACCOUNT')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# [최종 확정] 해지펀드급 28개 분석 필드 (Quantum Jump)
+# [최종 확정] 해지펀드급 28개 분석 필드
 STANDARD_KEYS = [
-    # 1. 기본 정보 & 가격
     "symbol", "name", "price", "currency", "marketCap", "updated", "Hist",
-    # 2. 밸류에이션 (Value)
     "per", "pbr", "psr", "pegRatio", "targetMeanPrice",
-    # 3. 수익성 & 효율성 (Quality)
     "roe", "roa", "eps", "operatingMargins", "debtToEquity",
-    # 4. 성장성 & 현금흐름 (Growth & Cash)
     "revenueGrowth", "operatingCashflow",
-    # 5. 주주 환원 (Dividend)
     "dividendRate", "dividendYield",
-    # 6. 수급 & 추세 (Momentum & Sentiment)
     "volume", "beta", "heldPercentInstitutions", "shortRatio",
     "fiftyDayAverage", "twoHundredDayAverage", 
     "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
-    # 7. 메타 데이터
     "sector", "industry"
 ]
 
@@ -48,7 +41,7 @@ def send_telegram(message):
     except: pass
 
 if not RAW_SERVICE_ACCOUNT:
-    print("❌ 에러: 서비스 계정 설정이 없습니다."); sys.exit(1)
+    print("❌ 에러: 서비스 계정 설정(Secrets)이 없습니다."); sys.exit(1)
 
 SERVICE_ACCOUNT_INFO = json.loads(RAW_SERVICE_ACCOUNT)
 creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
@@ -71,7 +64,7 @@ def download_json(file_id):
     return json.loads(fh.getvalue().decode())
 
 def upload_json(filename, data, parent_id):
-    print(f"📤 업로드 중: {filename}...")
+    print(f"📤 드라이브 업로드 시도: {filename}...")
     file_id = find_file_id(filename, parent_id)
     fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
     media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
@@ -89,8 +82,9 @@ def run_harvester():
     
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
-    is_weekend_update = (now_kst.weekday() == 5)
+    is_weekend_update = (now_kst.weekday() == 5) # 토요일은 전체 갱신
     
+    # 시간대별 그룹 필터링
     current_hour = now_kst.hour
     if 6 <= current_hour <= 11:
         group_label = "1차 수집 (A-M)"
@@ -100,7 +94,7 @@ def run_harvester():
         target_chars = "NOPQRSTUVWXYZ0123456789"
 
     try:
-        print(f"🔍 시스템 가동: {today_str}")
+        print(f"🔍 시스템 점검 시작: {today_str}")
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
@@ -109,7 +103,8 @@ def run_harvester():
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        send_telegram(f"📡 *[US Alpha Seeker] 엔진 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` | *필드:* `28개` (Hedge Fund Edition)")
+        print(f"🚀 {group_label} 가동! 대상 종목: {len(filtered_tickers)}개")
+        send_telegram(f"📡 *[US Alpha Seeker] 엔진 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목 수:* `{len(filtered_tickers)}` | *필드:* `28개` (HF Edition)")
 
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
 
@@ -117,98 +112,100 @@ def run_harvester():
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
             g_total, g_success, g_error = len(group_tickers), 0, 0
             
-            print(f"\n--- 📦 그룹 [{group}] 시작 ({g_total}개) ---")
+            print(f"\n--- 📦 그룹 [{group}] 작업 시작 (총 {g_total}개) ---")
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
             
             daily_data = download_json(find_file_id(daily_name, daily_dir_id))
             hist_data = download_json(find_file_id(hist_name, hist_dir_id))
 
             for i, ticker in enumerate(group_tickers, 1):
-                try:
-                    if i % 50 == 0: print(f"   > 진행 중: {group} {i}/{g_total}...")
-                    time.sleep(random.uniform(1.1, 1.3))
-                    stock = yf.Ticker(ticker)
-                    
-                    # History 수집
-                    hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
-                    if hist_status == '❌' or is_weekend_update:
-                        try:
-                            f_data = stock.quarterly_financials
-                            if not f_data.empty:
-                                hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
-                                hist_status = '✅'
-                        except: pass
-
-                    # Daily 수집 (28개 필드 - Hedge Fund Logic)
-                    info = stock.info
-                    price = info.get('currentPrice') or info.get('regularMarketPrice')
-                    
-                    if price:
-                        raw_record = {
-                            # 1. 기본
-                            "symbol": ticker,
-                            "name": info.get('shortName') or info.get('longName'),
-                            "price": price,
-                            "currency": info.get('currency', 'USD'),
-                            "marketCap": info.get('marketCap'),
-                            "updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'),
-                            "Hist": hist_status,
-                            
-                            # 2. 밸류에이션
-                            "per": info.get('trailingPE'),
-                            "pbr": info.get('priceToBook'),
-                            "psr": info.get('priceToSalesTrailing12Months'),
-                            "pegRatio": info.get('pegRatio'), # New: 성장성 대비 가치
-                            "targetMeanPrice": info.get('targetMeanPrice'),
-                            
-                            # 3. 수익성 & 효율성
-                            "roe": info.get('returnOnEquity'),
-                            "roa": info.get('returnOnAssets'), # New: 자산 효율성
-                            "eps": info.get('trailingEps'),
-                            "operatingMargins": info.get('operatingMargins'), # New: 영업이익률
-                            "debtToEquity": info.get('debtToEquity'),
-                            
-                            # 4. 성장성 & 현금
-                            "revenueGrowth": info.get('revenueGrowth'), # New: 매출 성장률
-                            "operatingCashflow": info.get('operatingCashflow'), # New: 영업 현금흐름
-                            
-                            # 5. 배당
-                            "dividendRate": info.get('dividendRate', 0),
-                            "dividendYield": info.get('dividendYield', 0),
-                            
-                            # 6. 수급 & 추세
-                            "volume": info.get('regularMarketVolume'),
-                            "beta": info.get('beta'),
-                            "heldPercentInstitutions": info.get('heldPercentInstitutions'),
-                            "shortRatio": info.get('shortRatio'), # New: 공매도 비율
-                            "fiftyDayAverage": info.get('fiftyDayAverage'), # New: 50일 이평선 (단기 추세)
-                            "twoHundredDayAverage": info.get('twoHundredDayAverage'), # New: 200일 이평선 (장기 추세)
-                            "fiftyTwoWeekHigh": info.get('fiftyTwoWeekHigh'),
-                            "fiftyTwoWeekLow": info.get('fiftyTwoWeekLow'),
-                            
-                            # 7. 메타
-                            "sector": info.get('sector'),
-                            "industry": info.get('industry')
-                        }
+                # [핵심 보강] 네트워크 에러 대비 3회 재시도 루프
+                success_flag = False
+                for attempt in range(3):
+                    try:
+                        if i % 50 == 0: print(f"   > 진행 중: {group}그룹 {i}/{g_total}...")
+                        time.sleep(random.uniform(1.2, 1.5))
+                        stock = yf.Ticker(ticker)
                         
-                        # 28개 필드 매핑 및 저장
-                        daily_data[ticker] = {k: raw_record.get(k, None) for k in STANDARD_KEYS}
-                        g_success += 1
-                    else: g_error += 1
-                except: g_error += 1
+                        # 1. History 업데이트 체크
+                        hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
+                        if hist_status == '❌' or is_weekend_update:
+                            try:
+                                f_data = stock.quarterly_financials
+                                if not f_data.empty:
+                                    hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
+                                    hist_status = '✅'
+                            except: pass
 
-            # 업로드
+                        # 2. Daily 업데이트 (28개 필드 정밀 매핑)
+                        info = stock.info
+                        price = info.get('currentPrice') or info.get('regularMarketPrice')
+                        
+                        if price:
+                            raw_record = {
+                                "symbol": ticker,
+                                "name": info.get('shortName') or info.get('longName'),
+                                "price": price,
+                                "currency": info.get('currency', 'USD'),
+                                "marketCap": info.get('marketCap'),
+                                "updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'),
+                                "Hist": hist_status,
+                                "per": info.get('trailingPE'),
+                                "pbr": info.get('priceToBook'),
+                                "psr": info.get('priceToSalesTrailing12Months'),
+                                "pegRatio": info.get('pegRatio'),
+                                "targetMeanPrice": info.get('targetMeanPrice'),
+                                "roe": info.get('returnOnEquity'),
+                                "roa": info.get('returnOnAssets'),
+                                "eps": info.get('trailingEps'),
+                                "operatingMargins": info.get('operatingMargins'),
+                                "debtToEquity": info.get('debtToEquity'),
+                                "revenueGrowth": info.get('revenueGrowth'),
+                                "operatingCashflow": info.get('operatingCashflow'),
+                                "dividendRate": info.get('dividendRate', 0),
+                                "dividendYield": info.get('dividendYield', 0),
+                                "volume": info.get('regularMarketVolume'),
+                                "beta": info.get('beta'),
+                                "heldPercentInstitutions": info.get('heldPercentInstitutions'),
+                                "shortRatio": info.get('shortRatio'),
+                                "fiftyDayAverage": info.get('fiftyDayAverage'),
+                                "twoHundredDayAverage": info.get('twoHundredDayAverage'),
+                                "fiftyTwoWeekHigh": info.get('fiftyTwoWeekHigh'),
+                                "fiftyTwoWeekLow": info.get('fiftyTwoWeekLow'),
+                                "sector": info.get('sector'),
+                                "industry": info.get('industry')
+                            }
+                            daily_data[ticker] = {k: raw_record.get(k, None) for k in STANDARD_KEYS}
+                            g_success += 1
+                            success_flag = True
+                            break # 수집 성공 시 시도 루프 종료
+                        else:
+                            # 가격 정보가 없는 경우 재시도 무의미하므로 즉시 에러 처리
+                            break
+                    except Exception as e:
+                        if attempt < 2:
+                            print(f"   ⚠️ {ticker} 연결 지연.. 재시도 중 ({attempt+1}/3)")
+                            time.sleep(3)
+                        else:
+                            print(f"   ❌ {ticker} 최종 수집 실패: {str(e)}")
+
+                if not success_flag:
+                    g_error += 1
+
+            # 그룹별 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
             upload_json(hist_name, hist_data, hist_dir_id)
-            total_success += g_success; total_error += g_error
             
+            total_success += g_success; total_error += g_error
+            print(f"✅ 그룹 [{group}] 완료: 성공 {g_success}, 실패 {g_error}")
             send_telegram(f"📦 *그룹 [{group}] 완료*\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`\n📊 합계: `{g_total}` (Sync OK)")
 
         duration = (time.time() - start_time) / 60
-        send_telegram(f"🏁 *전체 수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
+        print(f"\n🏁 전체 프로세스 종료! 소요시간: {duration:.1f}분")
+        send_telegram(f"🏁 *전체 수집 종료*\n⏱️ `{duration:.1f}분` | 총 성공: `{total_success}` | 총 실패: `{total_error}`")
 
     except Exception as e:
-        print(f"🚨 에러: {str(e)}")
+        print(f"🚨 치명적 에러: {str(e)}")
         send_telegram(f"🚨 *에러 발생:* `{str(e)}` ")
 
 if __name__ == "__main__":
