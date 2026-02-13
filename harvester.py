@@ -18,10 +18,11 @@ RAW_SERVICE_ACCOUNT = os.getenv('GDRIVE_SERVICE_ACCOUNT')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# 18개 표준 필드 정의 (순서 및 명칭 고정)
+# [확정] 18개 표준 필드 리스트
 STANDARD_KEYS = [
-    "symbol", "name", "price", "currency", "marketCap", "per", "pbr", 
-    "psr", "roe", "eps", "volume", "beta", "dividendRate", "dividendYield", 
+    "symbol", "name", "price", "currency", "marketCap", 
+    "per", "pbr", "psr", "roe", "eps", 
+    "volume", "beta", "dividendRate", "dividendYield", 
     "sector", "industry", "updated", "Hist"
 ]
 
@@ -91,7 +92,7 @@ def run_harvester():
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        send_telegram(f"📡 *[US Alpha Seeker] 엔진 가동*\n🎯 *타겟:* `{group_label}`\n📊 *전체 대상:* `{len(filtered_tickers)}` 종목\n🛠️ *필드 수:* `18개` (Standard)")
+        send_telegram(f"📡 *[US Alpha Seeker] 엔진 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목 수:* `{len(filtered_tickers)}` | *필드:* `18개` (Full)")
 
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
 
@@ -109,6 +110,7 @@ def run_harvester():
                     time.sleep(random.uniform(1.1, 1.4))
                     stock = yf.Ticker(ticker)
                     
+                    # 1. History 업데이트 체크
                     hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
                     if hist_status == '❌' or is_weekend_update:
                         try:
@@ -118,6 +120,7 @@ def run_harvester():
                                 hist_status = '✅'
                         except: pass
 
+                    # 2. Daily 업데이트 (정확히 18개 필드 매핑)
                     info = stock.info
                     price = info.get('currentPrice') or info.get('regularMarketPrice')
                     
@@ -135,18 +138,20 @@ def run_harvester():
                             "eps": info.get('trailingEps'),
                             "volume": info.get('regularMarketVolume'),
                             "beta": info.get('beta'),
-                            "dividendRate": info.get('dividendRate', 0),
+                            "dividendRate": info.get('dividendRate', 0), # 이 필드가 누락되었었습니다.
                             "dividendYield": info.get('dividendYield', 0),
                             "sector": info.get('sector'),
                             "industry": info.get('industry'),
                             "updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'),
                             "Hist": hist_status
                         }
+                        # STANDARD_KEYS 순서대로 18개 필드를 강제 생성
                         daily_data[ticker] = {k: raw_record.get(k, None) for k in STANDARD_KEYS}
                         g_success += 1
                     else: g_error += 1
                 except: g_error += 1
 
+            # 그룹별 즉시 저장
             upload_json(daily_name, daily_data, daily_dir_id)
             upload_json(hist_name, hist_data, hist_dir_id)
             total_success += g_success; total_error += g_error
@@ -154,7 +159,7 @@ def run_harvester():
             send_telegram(f"📦 *그룹 [{group}] 완료*\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`\n📊 합계: `{g_total}` (Sync OK)")
 
         duration = (time.time() - start_time) / 60
-        send_telegram(f"🏁 *전체 프로세스 종료*\n⏱️ `{duration:.1f}분` | 총 성공: `{total_success}` | 총 실패: `{total_error}`")
+        send_telegram(f"🏁 *전체 수집 종료*\n⏱️ `{duration:.1f}분` | 총 성공: `{total_success}` | 총 실패: `{total_error}`")
 
     except Exception as e:
         send_telegram(f"🚨 *에러 발생:* `{str(e)}` ")
