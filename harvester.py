@@ -1,13 +1,12 @@
 import os
 import json
 import requests
-import uuid
 import time
 import datetime
 import io
 import urllib3
 import random
-import re
+import yfinance as yf
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
@@ -16,9 +15,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- [1. 설정 및 인증] ---
 RAW_SERVICE_ACCOUNT = os.getenv('GDRIVE_SERVICE_ACCOUNT')
-MSN_API_KEY = os.getenv('MSN_API_KEY')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# 사용자님이 정하신 데이터 규격 그대로 유지
+STANDARD_KEYS = ["symbol", "name", "price", "currency", "marketCap", "per", "pbr", "psr", "roe", "eps", "volume", "beta", "dividendYield", "sector", "industry", "updated", "Hist"]
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -36,7 +37,7 @@ SERVICE_ACCOUNT_INFO = json.loads(RAW_SERVICE_ACCOUNT)
 creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
 drive_service = build('drive', 'v3', credentials=creds)
 
-# --- [2. 유틸리티 함수] ---
+# --- [2. 구글 드라이브 유틸리티 함수] ---
 def find_file_id(name, parent_id=None):
     query = f"name = '{name}' and trashed = false"
     if parent_id: query += f" and '{parent_id}' in parents"
@@ -44,6 +45,7 @@ def find_file_id(name, parent_id=None):
     return results[0]['id'] if results else None
 
 def download_json(file_id):
+    if not file_id: return {}
     request = drive_service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
@@ -61,100 +63,118 @@ def upload_json(filename, data, parent_id):
         meta = {'name': filename, 'parents': [parent_id]}
         drive_service.files().create(body=meta, media_body=media).execute()
 
-def slice_5y(data):
-    if not data: return {}
-    for r in ['incomeStatement', 'balanceSheet', 'cashFlow']:
-        if r in data:
-            if 'annual' in data[r]: data[r]['annual'] = data[r]['annual'][:5]
-            if 'interim' in data[r]: data[r]['interim'] = data[r]['interim'][:20]
-    return data
-
-# --- [3. 메인 로직] ---
+# --- [3. 메인 하베스터 로직] ---
 def run_harvester():
     start_time = time.time()
     success_count = 0
     error_count = 0
     
-    send_telegram("🤖 *종합 지표 업데이트 가동*")
+    now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    today_str = now_kst.strftime('%Y-%m-%d')
+    
+    send_telegram(f"🤖 *Alpha Seeker v2 가동* ({today_str})")
 
     try:
+        # 폴더 구조 확인
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
-        data_id = find_file_id("Financial_Data_5Y_Split", sys_id)
+        daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
+        hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
         
-        now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-        update_mode = "DAILY" 
-        if now_kst.weekday() == 5: update_mode = "WEEKLY"
-        if now_kst.day in [1, 15]: update_mode = "QUARTERLY"
-
-        current_hour = now_kst.hour
-        target_chars = "ABCDEFGHIJKLM" if 6 <= current_hour <= 8 else "NOPQRSTUVWXYZ0123456789"
-        
+        # 매핑 로드
         mapping_id = find_file_id("Ticker_ID_Mapping_Final.json", sys_id)
-        full_map = download_json(mapping_id) if mapping_id else {}
-        filtered_map = {t: i for t, i in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
+        full_map = download_json(mapping_id)
 
-        send_telegram(f"🚀 *데이터 수집 시작*\n- 모드: {update_mode}\n- 대상: {len(filtered_map)} 종목 (지표 포함)")
+        # 수집 부하 분산을 위한 시간별 필터링 (기존 로직 유지)
+        current_hour = now_kst.hour
+        target_chars = "ABCDEFGHIJKLM" if 6 <= current_hour <= 9 else "NOPQRSTUVWXYZ0123456789"
+        
+        filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
+        
+        send_telegram(f"🚀 *수집 시작*: {len(filtered_tickers)} 종목 대상")
 
-        storage = {}
-        session = requests.Session()
-        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
+        # 메모리 내 저장소 (그룹별 캐싱)
+        daily_storage = {}
+        hist_storage = {}
 
-        for ticker, msn_id in filtered_map.items():
-            first_char = ticker[0].upper()
-            filename = f"{first_char if first_char.isalpha() else 'ETC'}_stocks.json"
-            
+        for ticker in filtered_tickers:
+            group = filtered_tickers[ticker]['group']
+            daily_name = f"{group}_stocks_daily.json"
+            hist_name = f"{group}_stocks_history.json"
+
+            # 1. 파일 캐싱 (없을 때만 다운로드)
+            if daily_name not in daily_storage:
+                fid = find_file_id(daily_name, daily_dir_id)
+                daily_storage[daily_name] = download_json(fid) if fid else {}
+            if hist_name not in hist_storage:
+                fid = find_file_id(hist_name, hist_dir_id)
+                hist_storage[hist_name] = download_json(fid) if fid else {}
+
+            # 2. Yahoo Finance 데이터 수집
             try:
-                if filename not in storage:
-                    fid = find_file_id(filename, data_id)
-                    storage[filename] = download_json(fid) if fid else {}
-
-                act_id = str(uuid.uuid4())
-                # 1. 종합 지표 수집 (가격, 시총, PER, PBR, 거래량 등 포함)
-                res_a = session.get(f"https://assets.msn.com/service/Finance/Equities?apikey={MSN_API_KEY}&activityId={act_id}&ids={msn_id}&wrapodata=false", timeout=10)
+                time.sleep(random.uniform(1.2, 1.6)) # 안전한 딜레이
+                stock = yf.Ticker(ticker)
                 
-                if res_a.status_code == 200:
-                    basic_data = res_a.json()[0]
-                    history_data = storage[filename].get(ticker, {}).get('history_5y', {})
-                    
-                    if update_mode == "QUARTERLY":
-                        res_b = session.get(f"https://assets.msn.com/service/Finance/Equities/financialstatements?apikey={MSN_API_KEY}&activityId={act_id}&$filter=_p eq '{msn_id}'&wrapodata=false", timeout=15)
-                        if res_b.status_code == 200:
-                            history_data = slice_5y(res_b.json())
+                # [히스토리 보완 체크]
+                hist_status = daily_storage[daily_name].get(ticker, {}).get('Hist', '❌')
+                if hist_status == '❌':
+                    try:
+                        f_data = stock.quarterly_financials
+                        if not f_data.empty:
+                            hist_storage[hist_name][ticker] = {str(k): v for k, v in f_data.to_dict().items()}
+                            hist_status = '✅'
+                    except: pass
 
-                    # 기존 데이터 구조 유지하며 최신 지표로 덮어쓰기
-                    storage[filename][ticker] = {
-                        "msn_id": msn_id,
-                        "last_updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'),
-                        "basic": basic_data,  # 여기에 종가, 시총 등이 다 들어있습니다.
-                        "history_5y": history_data
+                # [데일리 업데이트]
+                info = stock.info
+                price = info.get('currentPrice') or info.get('regularMarketPrice')
+                
+                if price:
+                    raw_info = {
+                        "symbol": ticker,
+                        "name": info.get('shortName') or info.get('longName'),
+                        "price": price,
+                        "currency": info.get('currency', 'USD'),
+                        "marketCap": info.get('marketCap'),
+                        "per": info.get('trailingPE'),
+                        "pbr": info.get('priceToBook'),
+                        "psr": info.get('priceToSalesTrailing12Months'),
+                        "roe": info.get('returnOnEquity'),
+                        "eps": info.get('trailingEps'),
+                        "volume": info.get('regularMarketVolume'),
+                        "beta": info.get('beta'),
+                        "dividendYield": info.get('dividendYield', 0),
+                        "sector": info.get('sector'),
+                        "industry": info.get('industry'),
+                        "updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'),
+                        "Hist": hist_status
                     }
+                    daily_storage[daily_name][ticker] = {k: raw_info.get(k, None) for k in STANDARD_KEYS}
                     success_count += 1
                 
-                time.sleep(random.uniform(0.7, 1.1)) # 안전 슬립
+                if success_count % 200 == 0:
+                    print(f"🔄 진행 중: {success_count}개 수집 완료...")
 
-                if success_count % 500 == 0:
-                    print(f"🔄 진행 중: {success_count}개 완료...")
-
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ {ticker} 에러: {e}")
                 error_count += 1
 
-        # --- [저장 및 알림] ---
-        send_telegram(f"📤 *저장 단계*: {success_count}개 종목 최신 지표 반영 중...")
+        # 3. 드라이브 업데이트 (Daily & History)
+        send_telegram(f"📤 *저장 단계*: 최신 데이터 업로드 중...")
         
-        for fname, content in storage.items():
-            try:
-                upload_json(fname, content, data_id)
-                send_telegram(f"✅ 파일 저장 완료: `{fname}`")
-                time.sleep(1)
-            except Exception as e:
-                send_telegram(f"⚠️ `{fname}` 저장 오류: {str(e)}")
+        for d_name, d_content in daily_storage.items():
+            upload_json(d_name, d_content, daily_dir_id)
+            time.sleep(0.5)
+            
+        for h_name, h_content in hist_storage.items():
+            upload_json(h_name, h_content, hist_dir_id)
+            time.sleep(0.5)
 
         duration = (time.time() - start_time) / 60
-        send_telegram(f"✨ *최종 완료 보고*\n✅ 성공: {success_count}\n⏱️ 소요: {duration:.1f}분\n지표 업데이트가 성공적으로 끝났습니다.")
+        send_telegram(f"✨ *최종 완료 보고*\n✅ 성공: {success_count}\n❌ 실패: {error_count}\n⏱️ 소요: {duration:.1f}분\n모든 지표가 최신으로 유지되었습니다.")
 
     except Exception as e:
-        send_telegram(f"🚨 에러 발생: {str(e)}")
+        send_telegram(f"🚨 하베스터 치명적 에러: {str(e)}")
 
 if __name__ == "__main__":
     run_harvester()
