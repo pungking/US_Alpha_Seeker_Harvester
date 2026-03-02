@@ -8,7 +8,6 @@ import urllib3
 import random
 import sys
 import yfinance as yf
-import pandas as pd
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
@@ -45,15 +44,16 @@ if not RAW_SERVICE_ACCOUNT:
 
 SERVICE_ACCOUNT_INFO = json.loads(RAW_SERVICE_ACCOUNT)
 creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
+# cache_discovery=False로 네트워크 지연 최소화
 drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-# --- [2. 드라이브 유틸리티] ---
+# --- [2. 드라이브 유틸리티 - 에러 방어형] ---
 def find_file_id(name, parent_id=None):
     for _ in range(3):
         try:
             query = f"name = '{name}' and trashed = false"
             if parent_id: query += f" and '{parent_id}' in parents"
-            results = drive_service.files().list(q=query, fields="files(id, name)").execute().get('files', [])
+            results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
             return results[0]['id'] if results else None
         except: time.sleep(2)
     return None
@@ -86,19 +86,19 @@ def upload_json(filename, data, parent_id):
             print(f"✅ 업로드 완료: {filename}")
             return
         except Exception as e:
-            print(f"    ⚠️ 업로드 실패 ({attempt+1}/5): {str(e)}")
+            print(f"   ⚠️ 업로드 실패 ({attempt+1}/5): {str(e)}")
             time.sleep(10)
 
-# --- [추가 로직: OHLCV 누적 수집 및 병합 엔진] ---
-def sync_ohlcv_incremental(ticker, drive_service, ohlcv_dir_id):
-    """종목별 OHLCV 데이터를 드라이브에서 찾아 신규 데이터만 Append 합니다."""
+# --- [신규 추가: OHLCV 누적 수집 및 병합 로직] ---
+def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
+    """구글 드라이브의 기존 OHLCV 데이터를 찾아 신규 데이터만 추가합니다."""
     file_name = f"{ticker}_OHLCV.json"
     file_id = find_file_id(file_name, ohlcv_dir_id)
     existing_data = download_json(file_id) if file_id else []
 
     try:
         stock = yf.Ticker(ticker)
-        # 이미 데이터가 있으면 최근 7일치만, 없으면 1년치를 가져옵니다.
+        # 데이터가 있으면 최근 7일치만(중복방지), 없으면 1년치를 가져옵니다.
         period = "7d" if existing_data else "1y"
         df = stock.history(period=period, interval="1d")
         
@@ -115,8 +115,8 @@ def sync_ohlcv_incremental(ticker, drive_service, ohlcv_dir_id):
                 "volume": int(row['Volume'])
             })
 
-        # 날짜 중복 제거 병합
         if existing_data:
+            # 날짜를 키로 사용하여 중복 제거 병합
             combined = {item['date']: item for item in existing_data + new_records}
             final_data = sorted(combined.values(), key=lambda x: x['date'])
         else:
@@ -148,48 +148,55 @@ def run_harvester():
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
         hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
         
-        # [추가] OHLCV 및 결과 폴더 ID 확보
+        # OHLCV 폴더 확인 및 생성
         ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
-        if not ohlcv_dir_id: # 폴더 없으면 생성
+        if not ohlcv_dir_id:
             meta = {'name': 'Financial_Data_OHLCV', 'parents': [sys_id], 'mimeType': 'application/vnd.google-apps.folder'}
             ohlcv_dir_id = drive_service.files().create(body=meta, fields='id').execute().get('id')
 
-        full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
-        filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
-
-        send_telegram(f"📡 *[US Alpha Seeker] 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` 수집 시작")
-
-        # --- [추가 로직: Stage 3 기반 OHLCV 트리거 체크] ---
+        # --- [추가 로직: Stage 3 기반 트리거 및 OHLCV 수집] ---
         # 드라이브에서 가장 최신 STAGE3 파일을 찾습니다.
         query = "name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
         s3_files = drive_service.files().list(q=query, fields="files(id, name, createdTime)", orderBy="createdTime desc").execute().get('files', [])
         
         if s3_files:
             latest_s3 = s3_files[0]
-            print(f"💎 최신 Stage 3 탐지: {latest_s3['name']}")
-            s3_content = download_json(latest_s3['id'])
-            s3_tickers = [item['symbol'] for item in s3_content.get('fundamental_universe', [])]
+            # 처리 여부 확인 (신호 파일의 trigger_file 필드와 대조)
+            ready_id = find_file_id("LATEST_STAGE4_READY.json", sys_id)
+            ready_info = download_json(ready_id) if ready_id else {}
             
-            if s3_tickers:
-                send_telegram(f"🔍 *Stage 3 트리거 감지:* `{len(s3_tickers)}`종목 OHLCV 누적 수집 개시")
-                s3_success = 0
-                for st in s3_tickers:
-                    if sync_ohlcv_incremental(st, drive_service, ohlcv_dir_id):
-                        s3_success += 1
-                    time.sleep(random.uniform(1.2, 1.5))
+            if ready_info.get("trigger_file") != latest_s3['name']:
+                print(f"💎 신규 Stage 3 탐지: {latest_s3['name']}")
+                s3_content = download_json(latest_s3['id'])
+                s3_tickers = [item['symbol'] for item in s3_content.get('fundamental_universe', [])]
                 
-                # 웹앱 완료 신호 전송
-                signal = {
-                    "status": "READY",
-                    "stage": 4,
-                    "trigger_file": latest_s3['name'],
-                    "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "count": s3_success
-                }
-                upload_json("LATEST_STAGE4_READY.json", signal, sys_id)
-                send_telegram(f"✅ *Stage 4 준비 완료*\n수집된 OHLCV: `{s3_success}`종목")
+                if s3_tickers:
+                    send_telegram(f"🔍 *Stage 3 트리거 확인:* `{len(s3_tickers)}`종목 OHLCV 수집 개시")
+                    s3_success = 0
+                    for st in s3_tickers:
+                        if sync_ohlcv_incremental(st, ohlcv_dir_id):
+                            s3_success += 1
+                        time.sleep(random.uniform(1.3, 1.6))
+                    
+                    # 수집 완료 신호 플래그 생성 (웹앱용)
+                    signal = {
+                        "status": "READY",
+                        "stage": 4,
+                        "trigger_file": latest_s3['name'],
+                        "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        "count": s3_success
+                    }
+                    upload_json("LATEST_STAGE4_READY.json", signal, sys_id)
+                    send_telegram(f"✅ *Stage 4 준비 완료*\n누적 수집 성공: `{s3_success}` 종목")
+            else:
+                print("ℹ️ 최신 Stage 3 파일이 이미 처리되었습니다.")
 
-        # --- [기존 메인 수집 엔진 유지] ---
+        # --- [기존 데일리 수집 로직] ---
+        full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
+        filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
+
+        send_telegram(f"📡 *[US Alpha Seeker] 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` | `28필드` (HF Edition)")
+
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
 
         for group in groups:
@@ -205,7 +212,7 @@ def run_harvester():
                 success_flag = False
                 for attempt in range(3):
                     try:
-                        if i % 50 == 0: print(f"    > 진행 중: {group} {i}/{g_total}...")
+                        if i % 50 == 0: print(f"   > 진행 중: {group} {i}/{g_total}...")
                         time.sleep(random.uniform(1.3, 1.6))
                         stock = yf.Ticker(ticker)
                         
