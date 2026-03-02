@@ -1,35 +1,33 @@
 name: Master Stock Harvester
 
 on:
+  # 웹앱에서 신호를 주면 즉시 실행
+  repository_dispatch:
+    types: [stage3_completed]
+    
+  # 정기 스케줄
   schedule:
-    # 1차 수집 (A-M): 한국시간 화~토 오전 7시 (UTC 월~금 22:00)
     - cron: '0 22 * * 1-5'
-    # 2차 수집 (N-Z+): 한국시간 화~토 오전 10시 (UTC 월~금 01:00)
     - cron: '0 1 * * 2-6'
+    
   workflow_dispatch: # 수동 실행 버튼
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 타임아웃 6시간 유지
-
+    timeout-minutes: 360
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install Dependencies
-        run: |
-          pip install google-api-python-client google-auth requests yfinance pandas
-
+        run: pip install google-api-python-client google-auth requests yfinance pandas
       - name: Run Master Harvester
         env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # MSN_API_KEY는 이제 필요 없으므로 제거해도 무방합니다.
         run: python harvester.py
