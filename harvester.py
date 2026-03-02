@@ -52,8 +52,13 @@ def find_file_id(name, parent_id=None):
         try:
             query = f"name = '{name}' and trashed = false"
             if parent_id: query += f" and '{parent_id}' in parents"
-            # supportsAllDrives를 추가하여 소유권이 다른 폴더 내 검색 허용
-            results = drive_service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get('files', [])
+            # supportsAllDrives를 통해 소유권이 다른 폴더 내 검색 허용
+            results = drive_service.files().list(
+                q=query, 
+                fields="files(id)", 
+                supportsAllDrives=True, 
+                includeItemsFromAllDrives=True
+            ).execute().get('files', [])
             return results[0]['id'] if results else None
         except: time.sleep(2)
     return None
@@ -73,7 +78,7 @@ def download_json(file_id):
 
 def upload_json(filename, data, parent_id):
     """
-    사용자 소유 폴더 내에서 서비스 계정이 용량 제한 없이 업로드하도록 돕는 함수
+    403 Quota 에러 방지를 위해 소유권 우회 옵션(supportsAllDrives)을 강제 적용합니다.
     """
     print(f"📤 업로드 시도: {filename}...")
     for attempt in range(5):
@@ -83,14 +88,14 @@ def upload_json(filename, data, parent_id):
             media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
             
             if file_id:
-                # 파일이 있으면 업데이트 (기존 소유권 유지)
+                # 기존 파일 업데이트 (사용자 소유권 유지)
                 drive_service.files().update(
                     fileId=file_id, 
                     media_body=media,
                     supportsAllDrives=True 
                 ).execute()
             else:
-                # 파일이 없으면 생성 (폴더가 사용자 소유이므로 supportsAllDrives 필수)
+                # 새 파일 생성 (부모 폴더의 소유권 정책을 따르도록 설정)
                 meta = {'name': filename, 'parents': [parent_id]}
                 drive_service.files().create(
                     body=meta, 
@@ -104,7 +109,7 @@ def upload_json(filename, data, parent_id):
             print(f"   ⚠️ 업로드 실패 ({attempt+1}/5): {str(e)}")
             time.sleep(10)
 
-# --- [신규: OHLCV 누적 수집 로직] ---
+# --- [신규 로직: 종목별 OHLCV 누적 수집] ---
 def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
     file_name = f"{ticker}_OHLCV.json"
     file_id = find_file_id(file_name, ohlcv_dir_id)
@@ -112,6 +117,7 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
 
     try:
         stock = yf.Ticker(ticker)
+        # 데이터가 있으면 최근 7일(중복 방지용), 없으면 1년 수집
         period = "7d" if existing_data else "1y"
         df = stock.history(period=period, interval="1d")
         if df.empty: return False
@@ -120,12 +126,15 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
         for date, row in df.iterrows():
             new_records.append({
                 "date": date.strftime('%Y-%m-%d'),
-                "open": round(row['Open'], 2), "high": round(row['High'], 2),
-                "low": round(row['Low'], 2), "close": round(row['Close'], 2),
+                "open": round(row['Open'], 2), 
+                "high": round(row['High'], 2),
+                "low": round(row['Low'], 2), 
+                "close": round(row['Close'], 2),
                 "volume": int(row['Volume'])
             })
 
         if existing_data:
+            # 날짜를 키로 사용하여 중복 제거 병합
             combined = {item['date']: item for item in existing_data + new_records}
             final_data = sorted(combined.values(), key=lambda x: x['date'])
         else:
@@ -133,12 +142,13 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
 
         upload_json(file_name, final_data, ohlcv_dir_id)
         return True
-    except: return False
+    except:
+        return False
 
 # --- [3. 메인 엔진] ---
 def run_harvester():
     start_time = time.time()
-    total_success, total_error = 0, 0
+    total_success = 0
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
     is_weekend_update = (now_kst.weekday() == 5)
@@ -147,8 +157,6 @@ def run_harvester():
         print(f"🔍 시스템 가동: {today_str}")
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
-        daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
-        hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
         
         # OHLCV 전용 폴더 확보
         ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
@@ -156,11 +164,17 @@ def run_harvester():
             meta = {'name': 'Financial_Data_OHLCV', 'parents': [sys_id], 'mimeType': 'application/vnd.google-apps.folder'}
             ohlcv_dir_id = drive_service.files().create(body=meta, fields='id', supportsAllDrives=True).execute().get('id')
 
-        # [핵심] 스테이지 3 트리거 확인 및 수집
+        # 🎯 [STAGE 3 트리거 확인]
         s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
         if s3_folder_id:
             query = f"'{s3_folder_id}' in parents and name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
-            s3_files = drive_service.files().list(q=query, fields="files(id, name, createdTime)", orderBy="createdTime desc", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get('files', [])
+            s3_files = drive_service.files().list(
+                q=query, 
+                fields="files(id, name, createdTime)", 
+                orderBy="createdTime desc", 
+                supportsAllDrives=True, 
+                includeItemsFromAllDrives=True
+            ).execute().get('files', [])
             
             if s3_files:
                 latest_s3 = s3_files[0]
@@ -176,11 +190,14 @@ def run_harvester():
                         send_telegram(f"🔍 *Drive 트리거 감지:* `{latest_s3['name']}` 기반 OHLCV 수집 시작")
                         s3_count = 0
                         for st in s3_tickers:
-                            if sync_ohlcv_incremental(st, ohlcv_dir_id): s3_count += 1
+                            if sync_ohlcv_incremental(st, ohlcv_dir_id): 
+                                s3_count += 1
                             time.sleep(random.uniform(1.3, 1.6))
                         
                         signal = {
-                            "status": "COMPLETED", "stage": 4, "trigger_file": latest_s3['name'],
+                            "status": "COMPLETED", 
+                            "stage": 4, 
+                            "trigger_file": latest_s3['name'],
                             "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             "count": s3_count
                         }
@@ -190,6 +207,9 @@ def run_harvester():
                     print("ℹ️ 드라이브의 최신 Stage 3 파일이 이미 처리되었습니다.")
 
         # --- [기존 데일리 수집 로직] ---
+        daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
+        hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
+        
         current_hour = now_kst.hour
         if 6 <= current_hour <= 11:
             group_label, target_chars = "1차 (A-M)", "ABCDEFGHIJKLM"
@@ -199,13 +219,13 @@ def run_harvester():
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        send_telegram(f"📡 *[US Alpha Seeker] 정기 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` 수집 중")
+        send_telegram(f"📡 *[US Alpha Seeker] 정기 가동*\n🎯 *타겟:* `{group_label}` | `{len(filtered_tickers)}`종목")
 
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
 
         for group in groups:
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
-            g_total, g_success = len(group_tickers), 0
+            g_success = 0
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
             daily_data = download_json(find_file_id(daily_name, daily_dir_id))
             hist_data = download_json(find_file_id(hist_name, hist_dir_id))
@@ -225,7 +245,7 @@ def run_harvester():
                     price = info.get('currentPrice') or info.get('regularMarketPrice')
                     if price:
                         raw_record = {
-                            "symbol": ticker, "name": info.get('shortName') or info.get('longName'),
+                            "symbol": ticker, "name": info.get('shortName'),
                             "price": price, "currency": info.get('currency', 'USD'),
                             "marketCap": info.get('marketCap'), "updated": now_kst.strftime('%Y-%m-%d %H:%M:%S'), "Hist": hist_status,
                             "per": info.get('trailingPE'), "pbr": info.get('priceToBook'), "psr": info.get('priceToSalesTrailing12Months'),
@@ -249,10 +269,10 @@ def run_harvester():
             total_success += g_success
 
         duration = (time.time() - start_time) / 60
-        send_telegram(f"🏁 *수집 종료* | ⏱️ `{duration:.1f}분` | 성공: `{total_success}`")
+        send_telegram(f"🏁 *전체 수집 종료* | ⏱️ `{duration:.1f}분` | 성공: `{total_success}`")
 
     except Exception as e:
-        send_telegram(f"🚨 *에러:* `{str(e)}` ")
+        send_telegram(f"🚨 *치명적 에러:* `{str(e)}` ")
 
 if __name__ == "__main__":
     run_harvester()
