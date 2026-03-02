@@ -8,6 +8,7 @@ import urllib3
 import random
 import sys
 import yfinance as yf
+import pandas as pd
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
@@ -44,17 +45,15 @@ if not RAW_SERVICE_ACCOUNT:
 
 SERVICE_ACCOUNT_INFO = json.loads(RAW_SERVICE_ACCOUNT)
 creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
-# cache_discovery=False로 네트워크 지연 최소화
 drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-# --- [2. 드라이브 유틸리티 - 에러 방어형] ---
+# --- [2. 드라이브 유틸리티] ---
 def find_file_id(name, parent_id=None):
-    # 네트워크 문제로 API 실패 시 최대 3번 시도
     for _ in range(3):
         try:
             query = f"name = '{name}' and trashed = false"
             if parent_id: query += f" and '{parent_id}' in parents"
-            results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            results = drive_service.files().list(q=query, fields="files(id, name)").execute().get('files', [])
             return results[0]['id'] if results else None
         except: time.sleep(2)
     return None
@@ -74,7 +73,6 @@ def download_json(file_id):
 
 def upload_json(filename, data, parent_id):
     print(f"📤 업로드 시도: {filename}...")
-    # SSL 에러(EOF) 발생 지점을 방어하기 위한 5회 재시도
     for attempt in range(5):
         try:
             file_id = find_file_id(filename, parent_id)
@@ -88,8 +86,46 @@ def upload_json(filename, data, parent_id):
             print(f"✅ 업로드 완료: {filename}")
             return
         except Exception as e:
-            print(f"   ⚠️ 업로드 실패 ({attempt+1}/5): {str(e)}")
-            time.sleep(10) # 실패 시 10초 대기 후 재시도
+            print(f"    ⚠️ 업로드 실패 ({attempt+1}/5): {str(e)}")
+            time.sleep(10)
+
+# --- [추가 로직: OHLCV 누적 수집 및 병합 엔진] ---
+def sync_ohlcv_incremental(ticker, drive_service, ohlcv_dir_id):
+    """종목별 OHLCV 데이터를 드라이브에서 찾아 신규 데이터만 Append 합니다."""
+    file_name = f"{ticker}_OHLCV.json"
+    file_id = find_file_id(file_name, ohlcv_dir_id)
+    existing_data = download_json(file_id) if file_id else []
+
+    try:
+        stock = yf.Ticker(ticker)
+        # 이미 데이터가 있으면 최근 7일치만, 없으면 1년치를 가져옵니다.
+        period = "7d" if existing_data else "1y"
+        df = stock.history(period=period, interval="1d")
+        
+        if df.empty: return False
+
+        new_records = []
+        for date, row in df.iterrows():
+            new_records.append({
+                "date": date.strftime('%Y-%m-%d'),
+                "open": round(row['Open'], 2),
+                "high": round(row['High'], 2),
+                "low": round(row['Low'], 2),
+                "close": round(row['Close'], 2),
+                "volume": int(row['Volume'])
+            })
+
+        # 날짜 중복 제거 병합
+        if existing_data:
+            combined = {item['date']: item for item in existing_data + new_records}
+            final_data = sorted(combined.values(), key=lambda x: x['date'])
+        else:
+            final_data = new_records
+
+        upload_json(file_name, final_data, ohlcv_dir_id)
+        return True
+    except:
+        return False
 
 # --- [3. 메인 엔진] ---
 def run_harvester():
@@ -112,11 +148,48 @@ def run_harvester():
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
         hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
         
+        # [추가] OHLCV 및 결과 폴더 ID 확보
+        ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
+        if not ohlcv_dir_id: # 폴더 없으면 생성
+            meta = {'name': 'Financial_Data_OHLCV', 'parents': [sys_id], 'mimeType': 'application/vnd.google-apps.folder'}
+            ohlcv_dir_id = drive_service.files().create(body=meta, fields='id').execute().get('id')
+
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        send_telegram(f"📡 *[US Alpha Seeker] 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` | `28필드` (HF Edition)")
+        send_telegram(f"📡 *[US Alpha Seeker] 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` 수집 시작")
 
+        # --- [추가 로직: Stage 3 기반 OHLCV 트리거 체크] ---
+        # 드라이브에서 가장 최신 STAGE3 파일을 찾습니다.
+        query = "name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
+        s3_files = drive_service.files().list(q=query, fields="files(id, name, createdTime)", orderBy="createdTime desc").execute().get('files', [])
+        
+        if s3_files:
+            latest_s3 = s3_files[0]
+            print(f"💎 최신 Stage 3 탐지: {latest_s3['name']}")
+            s3_content = download_json(latest_s3['id'])
+            s3_tickers = [item['symbol'] for item in s3_content.get('fundamental_universe', [])]
+            
+            if s3_tickers:
+                send_telegram(f"🔍 *Stage 3 트리거 감지:* `{len(s3_tickers)}`종목 OHLCV 누적 수집 개시")
+                s3_success = 0
+                for st in s3_tickers:
+                    if sync_ohlcv_incremental(st, drive_service, ohlcv_dir_id):
+                        s3_success += 1
+                    time.sleep(random.uniform(1.2, 1.5))
+                
+                # 웹앱 완료 신호 전송
+                signal = {
+                    "status": "READY",
+                    "stage": 4,
+                    "trigger_file": latest_s3['name'],
+                    "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "count": s3_success
+                }
+                upload_json("LATEST_STAGE4_READY.json", signal, sys_id)
+                send_telegram(f"✅ *Stage 4 준비 완료*\n수집된 OHLCV: `{s3_success}`종목")
+
+        # --- [기존 메인 수집 엔진 유지] ---
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
 
         for group in groups:
@@ -130,13 +203,12 @@ def run_harvester():
 
             for i, ticker in enumerate(group_tickers, 1):
                 success_flag = False
-                for attempt in range(3): # 수집 재시도
+                for attempt in range(3):
                     try:
-                        if i % 50 == 0: print(f"   > 진행 중: {group} {i}/{g_total}...")
+                        if i % 50 == 0: print(f"    > 진행 중: {group} {i}/{g_total}...")
                         time.sleep(random.uniform(1.3, 1.6))
                         stock = yf.Ticker(ticker)
                         
-                        # 재무 데이터(History)
                         hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
                         if hist_status == '❌' or is_weekend_update:
                             try:
@@ -146,7 +218,6 @@ def run_harvester():
                                     hist_status = '✅'
                             except: pass
 
-                        # 28개 필드 수집 (사용자님 원본 필드 그대로 유지)
                         info = stock.info
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
                         
@@ -177,7 +248,6 @@ def run_harvester():
                 
                 if not success_flag: g_error += 1
 
-            # 이 부분에서 에러가 나도 upload_json 내의 5회 재시도가 방어함
             upload_json(daily_name, daily_data, daily_dir_id)
             upload_json(hist_name, hist_data, hist_dir_id)
             total_success += g_success; total_error += g_error
