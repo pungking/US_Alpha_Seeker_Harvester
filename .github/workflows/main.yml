@@ -5,7 +5,7 @@ on:
   repository_dispatch:
     types: [stage3_completed]
     
-  # 정기 스케줄
+  # 정기 스케줄 (KST 기준 오전 7시, 오전 10시 등)
   schedule:
     - cron: '0 22 * * 1-5'
     - cron: '0 1 * * 2-6'
@@ -30,9 +30,14 @@ jobs:
         
       - name: Run Master Harvester
         env:
-          GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+          # 🎯 [본계정 모드 전용 키로 교체]
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 🎯 [필수 추가] 파이썬 코드가 실행 이벤트를 알 수 있도록 환경변수를 주입합니다.
+          
+          # 🎯 파이썬 코드가 웹앱 신호인지 스케줄 실행인지 판단하는 핵심 변수
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python harvester.py
