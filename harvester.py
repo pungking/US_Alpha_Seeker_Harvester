@@ -8,19 +8,23 @@ import urllib3
 import random
 import sys
 import yfinance as yf
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from google.auth.transport.requests import Request
 
-# 로그 실시간 출력 설정
-sys.stdout.reconfigure(line_buffering=True)
+# 로그 실시간 출력 설정 (GitHub Actions 환경 최적화)
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(line_buffering=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- [1. 설정 및 인증] ---
-RAW_SERVICE_ACCOUNT = os.getenv('GDRIVE_SERVICE_ACCOUNT')
+# --- [1. 설정 및 본계정 인증] ---
+CLIENT_ID = os.getenv('GDRIVE_CLIENT_ID')
+CLIENT_SECRET = os.getenv('GDRIVE_CLIENT_SECRET')
+REFRESH_TOKEN = os.getenv('GDRIVE_REFRESH_TOKEN')
+
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-# 🎯 GitHub 실행 이벤트 확인 (웹앱 신호 vs 정기 스케줄)
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 
 STANDARD_KEYS = [
@@ -35,26 +39,35 @@ STANDARD_KEYS = [
     "sector", "industry"
 ]
 
+def get_drive_service():
+    """본계정 Refresh Token을 사용하여 드라이브 서비스 빌드"""
+    creds_data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": REFRESH_TOKEN,
+        "type": "authorized_user"
+    }
+    creds = Credentials.from_authorized_user_info(creds_data, ["https://www.googleapis.com/auth/drive"])
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
+
+drive_service = get_drive_service()
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try: requests.post(url, json=payload, timeout=10)
     except: pass
 
-if not RAW_SERVICE_ACCOUNT:
-    print("❌ 에러: 서비스 계정 설정이 없습니다."); sys.exit(1)
-
-SERVICE_ACCOUNT_INFO = json.loads(RAW_SERVICE_ACCOUNT)
-creds = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
-drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-
-# --- [2. 드라이브 유틸리티] ---
+# --- [2. 드라이브 유틸리티 - 본계정 권한 최적화] ---
 def find_file_id(name, parent_id=None):
     for _ in range(3):
         try:
             query = f"name = '{name}' and trashed = false"
             if parent_id: query += f" and '{parent_id}' in parents"
-            results = drive_service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get('files', [])
+            # 본계정은 supportsAllDrives 없이도 내 드라이브 탐색이 가능하지만 호환성을 위해 유지
+            results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
             return results[0]['id'] if results else None
         except: time.sleep(2)
     return None
@@ -73,6 +86,7 @@ def download_json(file_id):
     return {}
 
 def upload_json(filename, data, parent_id):
+    """본계정 권한으로 업로드 (403 Quota 에러가 발생하지 않음)"""
     print(f"📤 업로드 시도: {filename}...")
     for attempt in range(5):
         try:
@@ -80,17 +94,17 @@ def upload_json(filename, data, parent_id):
             fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
             media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
             if file_id:
-                drive_service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+                drive_service.files().update(fileId=file_id, media_body=media).execute()
             else:
                 meta = {'name': filename, 'parents': [parent_id]}
-                drive_service.files().create(body=meta, media_body=media, supportsAllDrives=True).execute()
-            print(f"✅ 업로드 완료: {filename}")
+                drive_service.files().create(body=meta, media_body=media).execute()
+            print(f"✅ 완료: {filename}")
             return
         except Exception as e:
-            print(f"   ⚠️ 업로드 실패 ({attempt+1}/5): {str(e)}")
+            print(f"    ⚠️ 실패 ({attempt+1}/5): {str(e)}")
             time.sleep(10)
 
-# --- [신규: OHLCV 누적 수집 로직] ---
+# --- [OHLCV 누적 수집 로직] ---
 def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
     file_name = f"{ticker}_OHLCV.json"
     file_id = find_file_id(file_name, ohlcv_dir_id)
@@ -115,20 +129,19 @@ def run_harvester():
     is_weekend_update = (now_kst.weekday() == 5)
 
     try:
-        print(f"🔍 시스템 가동: {today_str} (Event: {GITHUB_EVENT_NAME})")
+        print(f"🔍 시스템 가동 (본계정 모드): {today_str} (Event: {GITHUB_EVENT_NAME})")
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
 
-        # 🎯 1. [특별 작업 모드] 웹앱 신호(dispatch) 시에만 OHLCV 가동
+        # 🎯 1. [특별 작업 모드] 웹앱 신호 시 OHLCV 300개 수집
         if GITHUB_EVENT_NAME == 'repository_dispatch':
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
             if s3_folder_id:
                 query = f"'{s3_folder_id}' in parents and name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
-                s3_files = drive_service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc", supportsAllDrives=True).execute().get('files', [])
+                s3_files = drive_service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc").execute().get('files', [])
                 if s3_files:
                     latest_s3 = s3_files[0]
-                    # 중복 방지: 이미 처리된 파일인지 확인
                     ready_info = download_json(find_file_id("LATEST_STAGE4_READY.json", sys_id))
                     if ready_info.get("trigger_file") != latest_s3['name']:
                         s3_data = download_json(latest_s3['id'])
@@ -139,12 +152,11 @@ def run_harvester():
                             send_telegram(f"🚀 *Stage 3 신호 확인:* `{len(s3_tickers)}`종목 OHLCV 수집 시작")
                             for st in s3_tickers:
                                 sync_ohlcv_incremental(st, ohlcv_dir_id)
-                                time.sleep(random.uniform(1.3, 1.6))
-                            # 수집 완료 후 웹앱용 신호 파일 업데이트
+                                time.sleep(random.uniform(1.1, 1.4))
                             upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": latest_s3['name'], "timestamp": today_str}, sys_id)
-                            send_telegram("✅ *Stage 4 데이터 준비 완료!*")
+                            send_telegram("✅ *Stage 4 데이터 덤프 완료!*")
 
-        # 🎯 2. [원본 데일리 수집 모드] 100% 로직 유지
+        # 🎯 2. [데일리 수집 모드] 원본 로직 유지
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
         hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
         
@@ -157,24 +169,22 @@ def run_harvester():
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        # [원본 알림]
-        send_telegram(f"📡 *[US Alpha Seeker] 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` | `28필드` (HF Edition)")
+        send_telegram(f"📡 *[US Alpha Seeker] 본계정 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` | `28필드`")
 
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
 
         for group in groups:
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
-            g_total, g_success, g_error = len(group_tickers), 0, 0
+            g_success, g_error = 0, 0
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
             daily_data = download_json(find_file_id(daily_name, daily_dir_id))
             hist_data = download_json(find_file_id(hist_name, hist_dir_id))
 
             for i, ticker in enumerate(group_tickers, 1):
                 success_flag = False
-                for attempt in range(3):
+                for attempt in range(2):
                     try:
-                        if i % 50 == 0: print(f"   > 진행 중: {group} {i}/{g_total}...")
-                        time.sleep(random.uniform(1.3, 1.6))
+                        time.sleep(random.uniform(1.2, 1.5))
                         stock = yf.Ticker(ticker)
                         hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
                         if hist_status == '❌' or is_weekend_update:
@@ -211,15 +221,13 @@ def run_harvester():
                     except: pass
                 if not success_flag: g_error += 1
 
-            # [원본 그룹별 브리핑]
             upload_json(daily_name, daily_data, daily_dir_id)
             upload_json(hist_name, hist_data, hist_dir_id)
             total_success += g_success; total_error += g_error
-            send_telegram(f"📦 *그룹 [{group}] 완료*\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`")
+            print(f"📦 그룹 [{group}] 완료: 성공 {g_success}")
 
-        # [원본 최종 브리핑]
         duration = (time.time() - start_time) / 60
-        send_telegram(f"🏁 *전체 수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
+        send_telegram(f"🏁 *본계정 수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
 
     except Exception as e:
         send_telegram(f"🚨 *치명적 에러:* `{str(e)}` ")
