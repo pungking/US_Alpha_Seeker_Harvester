@@ -111,7 +111,7 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
     existing_data = download_json(file_id) if file_id else []
     try:
         stock = yf.Ticker(ticker)
-        period = "7d" if existing_data else "1y"
+        period = "7d" if existing_data else "2y"
         df = stock.history(period=period, interval="1d")
         if df.empty: return False
         new_recs = [{"date": d.strftime('%Y-%m-%d'), "open": round(r['Open'], 2), "high": round(r['High'], 2), "low": round(r['Low'], 2), "close": round(r['Close'], 2), "volume": int(r['Volume'])} for d, r in df.iterrows()]
