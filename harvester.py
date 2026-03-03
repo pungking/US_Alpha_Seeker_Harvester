@@ -20,7 +20,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 RAW_SERVICE_ACCOUNT = os.getenv('GDRIVE_SERVICE_ACCOUNT')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-# 🎯 실행 원인 파악 (정기 스케줄 vs 웹앱 신호)
+# 🎯 GitHub 실행 이벤트 확인 (웹앱 신호 vs 정기 스케줄)
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 
 STANDARD_KEYS = [
@@ -90,7 +90,7 @@ def upload_json(filename, data, parent_id):
             print(f"   ⚠️ 업로드 실패 ({attempt+1}/5): {str(e)}")
             time.sleep(10)
 
-# --- [신규: OHLCV 누적 수집 함수] ---
+# --- [신규: OHLCV 누적 수집 로직] ---
 def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
     file_name = f"{ticker}_OHLCV.json"
     file_id = find_file_id(file_name, ohlcv_dir_id)
@@ -119,7 +119,7 @@ def run_harvester():
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
 
-        # 🎯 [핵심] 웹앱 신호(dispatch)가 있을 때만 OHLCV 로직 작동
+        # 🎯 1. [특별 작업 모드] 웹앱 신호(dispatch) 시에만 OHLCV 가동
         if GITHUB_EVENT_NAME == 'repository_dispatch':
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
@@ -128,12 +128,9 @@ def run_harvester():
                 s3_files = drive_service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc", supportsAllDrives=True).execute().get('files', [])
                 if s3_files:
                     latest_s3 = s3_files[0]
-                    # 💡 이미 처리된 파일인지 신호 파일과 대조 (중복 수집 방지)
-                    ready_id = find_file_id("LATEST_STAGE4_READY.json", sys_id)
-                    ready_info = download_json(ready_id) if ready_id else {}
-                    
+                    # 중복 방지: 이미 처리된 파일인지 확인
+                    ready_info = download_json(find_file_id("LATEST_STAGE4_READY.json", sys_id))
                     if ready_info.get("trigger_file") != latest_s3['name']:
-                        print(f"💎 신규 데이터 감지: {latest_s3['name']}")
                         s3_data = download_json(latest_s3['id'])
                         t_list = s3_data.get('fundamental_universe') or s3_data.get('stocks') or (s3_data if isinstance(s3_data, list) else [])
                         s3_tickers = [item['symbol'] for item in t_list if isinstance(item, dict) and 'symbol' in item]
@@ -143,11 +140,11 @@ def run_harvester():
                             for st in s3_tickers:
                                 sync_ohlcv_incremental(st, ohlcv_dir_id)
                                 time.sleep(random.uniform(1.3, 1.6))
-                            # 수집 완료 후 트리거 파일 업데이트 (웹앱은 이 파일을 보고 다음 단계 진행)
+                            # 수집 완료 후 웹앱용 신호 파일 업데이트
                             upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": latest_s3['name'], "timestamp": today_str}, sys_id)
-                            send_telegram("✅ *Stage 4 수집 완료. 웹앱에서 진행하세요.*")
-        
-        # 🎯 [원본 로직 100% 유지] 정기 데일리 수집 모드
+                            send_telegram("✅ *Stage 4 데이터 준비 완료!*")
+
+        # 🎯 2. [원본 데일리 수집 모드] 100% 로직 유지
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
         hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
         
@@ -160,7 +157,7 @@ def run_harvester():
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        # 🚀 [원본 브리핑 알림]
+        # [원본 알림]
         send_telegram(f"📡 *[US Alpha Seeker] 가동*\n🎯 *타겟:* `{group_label}`\n📊 *종목:* `{len(filtered_tickers)}` | `28필드` (HF Edition)")
 
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
@@ -168,7 +165,6 @@ def run_harvester():
         for group in groups:
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
             g_total, g_success, g_error = len(group_tickers), 0, 0
-            
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
             daily_data = download_json(find_file_id(daily_name, daily_dir_id))
             hist_data = download_json(find_file_id(hist_name, hist_dir_id))
@@ -177,15 +173,18 @@ def run_harvester():
                 success_flag = False
                 for attempt in range(3):
                     try:
+                        if i % 50 == 0: print(f"   > 진행 중: {group} {i}/{g_total}...")
                         time.sleep(random.uniform(1.3, 1.6))
                         stock = yf.Ticker(ticker)
                         hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
                         if hist_status == '❌' or is_weekend_update:
-                            f_data = stock.quarterly_financials
-                            if not f_data.empty:
-                                hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
-                                hist_status = '✅'
-                        
+                            try:
+                                f_data = stock.quarterly_financials
+                                if not f_data.empty:
+                                    hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
+                                    hist_status = '✅'
+                            except: pass
+
                         info = stock.info
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
                         if price:
@@ -212,18 +211,18 @@ def run_harvester():
                     except: pass
                 if not success_flag: g_error += 1
 
+            # [원본 그룹별 브리핑]
             upload_json(daily_name, daily_data, daily_dir_id)
             upload_json(hist_name, hist_data, hist_dir_id)
             total_success += g_success; total_error += g_error
-            # 🚀 [원본 그룹별 알림]
             send_telegram(f"📦 *그룹 [{group}] 완료*\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`")
 
-        # 🚀 [원본 최종 보고]
+        # [원본 최종 브리핑]
         duration = (time.time() - start_time) / 60
         send_telegram(f"🏁 *전체 수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
 
     except Exception as e:
-        send_telegram(f"🚨 *에러 발생:* `{str(e)}` ")
+        send_telegram(f"🚨 *치명적 에러:* `{str(e)}` ")
 
 if __name__ == "__main__":
     run_harvester()
