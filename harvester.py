@@ -13,7 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
 
-# 로그 실시간 출력 설정
+# 로그 실시간 출력 설정 (GitHub Actions 환경 최적화)
 if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(line_buffering=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -40,6 +40,7 @@ STANDARD_KEYS = [
 ]
 
 def get_drive_service():
+    """본계정 Refresh Token을 사용하여 드라이브 서비스 빌드"""
     creds_data = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -85,7 +86,6 @@ def upload_json(filename, data, parent_id):
     fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
     media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
     
-    # 본계정 권한이라 403 에러 없이 생성/수정 가능
     try:
         if file_id:
             drive_service.files().update(fileId=file_id, media_body=media).execute()
@@ -96,6 +96,19 @@ def upload_json(filename, data, parent_id):
     except Exception as e:
         print(f"❌ 업로드 에러: {str(e)}")
 
+# [ADDED] 실시간 진행률 기록 함수
+def update_progress(current, total, ticker, sys_id, status="PROCESSING"):
+    progress_data = {
+        "status": status,
+        "current": current,
+        "total": total,
+        "last_ticker": ticker,
+        "percentage": round((current / total) * 100, 1) if total > 0 else 0,
+        "updated": (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M:%S')
+    }
+    # 웹앱 조회를 위해 고정된 파일명 사용
+    upload_json("COLLECTION_PROGRESS.json", progress_data, sys_id)
+
 # --- [OHLCV 누적 수집 로직] ---
 def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
     file_name = f"{ticker}_OHLCV.json"
@@ -104,13 +117,11 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
     
     try:
         stock = yf.Ticker(ticker)
-        # 데이터가 없으면 2년(2y), 있으면 최근 7일(7d)만
         period = "7d" if existing_data else "2y"
         df = stock.history(period=period, interval="1d")
         
         if df.empty: return False
         
-        # [수정] 각 레코드마다 symbol 필드를 강제로 추가
         new_recs = [
             {
                 "symbol": ticker,
@@ -123,9 +134,7 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
             } for d, r in df.iterrows()
         ]
         
-        # 날짜 기준 중복 제거 및 합치기
         combined = {item['date']: item for item in (existing_data + new_recs)}
-        # 최신 2년치(약 500거래일) 데이터만 유지하여 파일 크기 관리
         final_list = sorted(combined.values(), key=lambda x: x['date'])[-500:]
         
         upload_json(file_name, final_list, ohlcv_dir_id)
@@ -143,7 +152,7 @@ def run_harvester():
     try:
         print(f"🔍 시스템 가동: {today_str} (Event: {GITHUB_EVENT_NAME})")
         root_id = find_file_id("US_Alpha_Seeker")
-        sys_id = find_id_map = find_file_id("System_Identity_Maps", root_id)
+        sys_id = find_file_id("System_Identity_Maps", root_id)
 
         # 🎯 1. [특별 작업 모드] 웹앱 신호 시 OHLCV 300개 수집
         if GITHUB_EVENT_NAME == 'repository_dispatch':
@@ -158,27 +167,35 @@ def run_harvester():
                     latest_s3 = s3_files[0]
                     s3_data = download_json(latest_s3['id'])
                     
-                    # 티커 리스트 추출 및 중복 제거 (무한루프 방지)
                     t_list = s3_data.get('fundamental_universe') or s3_data.get('stocks') or (s3_data if isinstance(s3_data, list) else [])
                     s3_tickers = list(set([item['symbol'] for item in t_list if isinstance(item, dict) and 'symbol' in item]))
                     
                     if s3_tickers:
-                        send_telegram(f"🚀 *수집 시작:* `{len(s3_tickers)}`종목 (2년치)")
-                        for st in s3_tickers:
+                        total_tickers = len(s3_tickers)
+                        send_telegram(f"🚀 *수집 시작:* `{total_tickers}`종목 (2년치)")
+                        
+                        # [ADDED] 수집 시작 알림
+                        update_progress(0, total_tickers, "STARTING...", sys_id, "PROCESSING")
+
+                        for idx, st in enumerate(s3_tickers, 1):
                             if sync_ohlcv_incremental(st, ohlcv_dir_id):
                                 total_success += 1
                             else:
                                 total_error += 1
-                            # 야후 차단 방지를 위한 여유 있는 슬립
-                            time.sleep(random.uniform(1.6, 2.3))
                             
-                            # 진행 상황 출력
-                            if (total_success + total_error) % 10 == 0:
-                                print(f"📊 진행 중... {total_success + total_error}/{len(s3_tickers)}")
-                                
+                            # [ADDED] 10종목마다 또는 마지막에 드라이브 진행률 업데이트
+                            if idx % 10 == 0 or idx == total_tickers:
+                                update_progress(idx, total_tickers, st, sys_id, "PROCESSING")
+                                print(f"📊 진행 상황: {idx}/{total_tickers} ({st})")
+
+                            time.sleep(random.uniform(1.6, 2.3))
+                        
+                        # [ADDED] 수집 종료 상태 업데이트
+                        update_progress(total_tickers, total_tickers, "FINISHED", sys_id, "COMPLETED")
+                        
                         upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": latest_s3['name'], "timestamp": today_str}, sys_id)
                         send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`")
-            return # dispatch 작업 시 여기서 종료
+            return 
 
         # 🎯 2. [데일리 수집 모드]
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
@@ -214,7 +231,6 @@ def run_harvester():
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
                         
                         if price:
-                            # 기존 로직 동일 (중략)
                             daily_data[ticker] = {k: info.get(k) for k in STANDARD_KEYS}
                             daily_data[ticker]["updated"] = today_str
                             daily_data[ticker]["symbol"] = ticker
@@ -225,6 +241,7 @@ def run_harvester():
                 if not success_flag: g_error += 1
 
             upload_json(daily_name, daily_data, daily_dir_id)
+            upload_json(hist_name, hist_data, hist_dir_id)
             total_success += g_success; total_error += g_error
 
         duration = (time.time() - start_time) / 60
