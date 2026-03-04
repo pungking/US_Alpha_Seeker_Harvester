@@ -63,38 +63,47 @@ def send_telegram(message):
 def find_file_id(name, parent_id=None):
     query = f"name = '{name}' and trashed = false"
     if parent_id: query += f" and '{parent_id}' in parents"
-    try:
-        results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
-        return results[0]['id'] if results else None
-    except: return None
+    
+    for _ in range(3): # 🎯 3번 재시도 (네트워크 지연으로 인한 중복 파일 생성 완벽 방지)
+        try:
+            results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
+            return results[0]['id'] if results else None
+        except: 
+            time.sleep(2)
+    return None
 
 def download_json(file_id):
-    if not file_id: return {} # 리스트가 아닌 딕셔너리로 초기화하도록 수정 (데일리 데이터 호환성)
-    try:
-        request = drive_service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done: _, done = downloader.next_chunk()
-        return json.loads(fh.getvalue().decode())
-    except: return {}
+    if not file_id: return None # 반환값을 None으로 명확히 하여 메인 로직에서 타입 캐스팅 유도
+    for _ in range(3): # 다운로드도 3번 재시도
+        try:
+            request = drive_service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done: _, done = downloader.next_chunk()
+            return json.loads(fh.getvalue().decode())
+        except: 
+            time.sleep(2)
+    return None
 
 def upload_json(filename, data, parent_id):
     print(f"📤 업로드 시도: {filename}...")
-    file_id = find_file_id(filename, parent_id)
-    fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
-    media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
-    
-    # 본계정 권한이라 403 에러 없이 생성/수정 가능
-    try:
-        if file_id:
-            drive_service.files().update(fileId=file_id, media_body=media).execute()
-        else:
-            meta = {'name': filename, 'parents': [parent_id]}
-            drive_service.files().create(body=meta, media_body=media).execute()
-        print(f"✅ 완료: {filename}")
-    except Exception as e:
-        print(f"❌ 업로드 에러: {str(e)}")
+    for attempt in range(3): # 🎯 업로드 중 끊김 방지
+        try:
+            file_id = find_file_id(filename, parent_id)
+            fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
+            media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
+            
+            if file_id:
+                drive_service.files().update(fileId=file_id, media_body=media).execute()
+            else:
+                meta = {'name': filename, 'parents': [parent_id]}
+                drive_service.files().create(body=meta, media_body=media).execute()
+            print(f"✅ 완료: {filename}")
+            return # 성공하면 함수 깔끔하게 종료
+        except Exception as e:
+            print(f"   ⚠️ 실패 ({attempt+1}/3): {str(e)}")
+            time.sleep(3)
 
 # [추가됨] 실시간 진행 상태 기록 함수
 def update_progress(current, total, ticker, sys_id, status="PROCESSING"):
