@@ -47,6 +47,8 @@ BENCHMARK_SPECS = [
 ]
 
 MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
+EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
+FMP_API_KEY = os.getenv("FMP_KEY")
 
 def get_drive_service():
     creds_data = {
@@ -415,6 +417,70 @@ def build_market_regime_snapshot(trigger_file, timestamp, tickers, ohlcv_dir_id)
     }
 
 
+def classify_event_risk(days_to_event):
+    if days_to_event is None:
+        return "NONE"
+    if days_to_event <= 2:
+        return "HIGH"
+    if days_to_event <= 7:
+        return "MEDIUM"
+    return "NONE"
+
+
+def fetch_earnings_event_map(tickers, trigger_file, timestamp):
+    payload = {
+        "timestamp": timestamp,
+        "trigger_file": trigger_file,
+        "source": "unavailable",
+        "universe_count": len(tickers),
+        "events": {}
+    }
+
+    if not tickers or not FMP_API_KEY:
+        return payload
+
+    try:
+        now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+        start_date = now_kst.strftime('%Y-%m-%d')
+        end_date = (now_kst + datetime.timedelta(days=45)).strftime('%Y-%m-%d')
+        url = f"https://financialmodelingprep.com/api/v3/earning_calendar?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        calendar = response.json()
+
+        event_map = {}
+        target_set = {ticker.upper() for ticker in tickers}
+
+        for event in calendar if isinstance(calendar, list) else []:
+            symbol = str(event.get('symbol') or '').upper()
+            date_str = str(event.get('date') or '')[:10]
+            if not symbol or not date_str or symbol not in target_set:
+                continue
+
+            try:
+                event_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+                days_to_event = (event_date - now_kst.date()).days
+            except ValueError:
+                continue
+
+            current = event_map.get(symbol)
+            if current and current['days_to_event'] <= days_to_event:
+                continue
+
+            event_map[symbol] = {
+                "earnings_date": date_str,
+                "days_to_event": days_to_event,
+                "event_risk": classify_event_risk(days_to_event)
+            }
+
+        payload["source"] = "fmp"
+        payload["events"] = event_map
+        return payload
+    except Exception as e:
+        print(f"⚠️ Earnings event map 생성 실패: {str(e)}")
+        return payload
+
+
 # --- [4. 메인 엔진] ---
 def run_harvester():
     start_time = time.time()
@@ -496,11 +562,23 @@ def run_harvester():
                         except Exception as e:
                             print(f"⚠️ 시장 국면 스냅샷 생성 실패: {str(e)}")
 
+                        earnings_event_ready = False
+                        earnings_event_count = 0
+                        try:
+                            earnings_event_map = fetch_earnings_event_map(s3_tickers, current_trigger_file, today_str)
+                            earnings_event_count = len(earnings_event_map.get('events', {}))
+                            upload_json(EARNINGS_EVENT_FILENAME, earnings_event_map, sys_id)
+                            earnings_event_ready = True
+                            print(f"📅 실적 이벤트 맵 완료: {earnings_event_count}건")
+                        except Exception as e:
+                            print(f"⚠️ 실적 이벤트 맵 업로드 실패: {str(e)}")
+
                         update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
 
                         upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": current_trigger_file, "timestamp": today_str}, sys_id)
                         regime_status = "READY" if market_regime_ready else "SKIPPED"
-                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`")
+                        earnings_status = "READY" if earnings_event_ready else "SKIPPED"
+                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`\n실적이벤트: `{earnings_status}` ({earnings_event_count})")
             return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
