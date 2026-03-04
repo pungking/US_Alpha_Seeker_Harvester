@@ -284,7 +284,7 @@ def run_harvester():
             total_error += g_error
             
             # 그룹별 완료 알림 (선택사항, 너무 많으면 주석처리 가능)
-            # print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error}")
+            print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error}")
 
         duration = (time.time() - start_time) / 60
         send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
