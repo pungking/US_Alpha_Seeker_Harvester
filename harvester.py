@@ -26,6 +26,7 @@ REFRESH_TOKEN = os.getenv('GDRIVE_REFRESH_TOKEN')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
+GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
 
 STANDARD_KEYS = [
     "symbol", "name", "price", "currency", "marketCap", "updated", "Hist",
@@ -105,8 +106,19 @@ def upload_json(filename, data, parent_id):
             print(f"   ⚠️ 실패 ({attempt+1}/3): {str(e)}")
             time.sleep(3)
 
+def get_dispatch_trigger_file():
+    if not GITHUB_EVENT_PATH:
+        return None
+    try:
+        with open(GITHUB_EVENT_PATH, 'r', encoding='utf-8') as f:
+            event = json.load(f)
+        return event.get('client_payload', {}).get('trigger_file')
+    except Exception as e:
+        print(f"⚠️ trigger_file 파싱 실패: {str(e)}")
+        return None
+
 # [추가됨] 실시간 진행 상태 기록 함수
-def update_progress(current, total, ticker, sys_id, status="PROCESSING"):
+def update_progress(current, total, ticker, sys_id, status="PROCESSING", trigger_file=None):
     progress_data = {
         "status": status,
         "current": current,
@@ -115,6 +127,8 @@ def update_progress(current, total, ticker, sys_id, status="PROCESSING"):
         "percentage": round((current / total) * 100, 1) if total > 0 else 0,
         "updated": (datetime.datetime.utcnow() + datetime.timedelta(hours=9)).strftime('%Y-%m-%d %H:%M:%S')
     }
+    if trigger_file:
+        progress_data["trigger_file"] = trigger_file
     upload_json("COLLECTION_PROGRESS.json", progress_data, sys_id)
 
 # --- [OHLCV 누적 수집 로직] ---
@@ -172,14 +186,26 @@ def run_harvester():
         if GITHUB_EVENT_NAME == 'repository_dispatch':
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
+            dispatch_trigger_file = get_dispatch_trigger_file()
             
             if s3_folder_id:
                 query = f"'{s3_folder_id}' in parents and name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
                 s3_files = drive_service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc").execute().get('files', [])
                 
                 if s3_files:
-                    latest_s3 = s3_files[0]
-                    s3_data = download_json(latest_s3['id'])
+                    target_s3 = None
+                    if dispatch_trigger_file:
+                        target_s3 = next((f for f in s3_files if f.get('name') == dispatch_trigger_file), None)
+                        if target_s3:
+                            print(f"🎯 지정된 Stage 3 파일 사용: {dispatch_trigger_file}")
+                        else:
+                            print(f"⚠️ 지정된 trigger_file 미발견: {dispatch_trigger_file} → 최신 파일로 대체")
+                    
+                    if not target_s3:
+                        target_s3 = s3_files[0]
+                    
+                    s3_data = download_json(target_s3['id'])
+                    current_trigger_file = target_s3['name']
                     
                     # 티커 리스트 추출 및 중복 제거 (무한루프 방지)
                     t_list = s3_data.get('fundamental_universe') or s3_data.get('stocks') or (s3_data if isinstance(s3_data, list) else [])
@@ -189,7 +215,7 @@ def run_harvester():
                         total_count = len(s3_tickers)
                         send_telegram(f"🚀 *수집 시작:* `{total_count}`종목 (2년치)")
                         
-                        update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING")
+                        update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING", current_trigger_file)
 
                         for idx, st in enumerate(s3_tickers, 1):
                             if sync_ohlcv_incremental(st, ohlcv_dir_id):
@@ -201,11 +227,11 @@ def run_harvester():
                             
                             if idx % 10 == 0 or idx == total_count:
                                 print(f"📊 진행 중... {idx}/{total_count}")
-                                update_progress(idx, total_count, st, sys_id, "PROCESSING")
+                                update_progress(idx, total_count, st, sys_id, "PROCESSING", current_trigger_file)
                                 
-                        update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED")
+                        update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
                         
-                        upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": latest_s3['name'], "timestamp": today_str}, sys_id)
+                        upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": current_trigger_file, "timestamp": today_str}, sys_id)
                         send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`")
             return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
