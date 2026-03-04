@@ -46,6 +46,8 @@ BENCHMARK_SPECS = [
     {"source": "^VIX", "alias": "VIX_INDEX"},
 ]
 
+MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
+
 def get_drive_service():
     creds_data = {
         "client_id": CLIENT_ID,
@@ -199,7 +201,221 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
     except:
         return False
 
-# --- [3. 메인 엔진] ---
+# --- [3. 시장 컨텍스트 스냅샷 생성] ---
+def safe_sma(values, window):
+    if len(values) < window:
+        return None
+    return round(sum(values[-window:]) / window, 2)
+
+
+def safe_return_pct(values, lookback):
+    if len(values) <= lookback:
+        return None
+    base = values[-lookback-1]
+    if not base:
+        return None
+    return round(((values[-1] / base) - 1) * 100, 2)
+
+
+def classify_vix_risk(vix_close):
+    if vix_close is None:
+        return "UNKNOWN"
+    if vix_close >= 28:
+        return "HIGH"
+    if vix_close >= 20:
+        return "ELEVATED"
+    if vix_close >= 15:
+        return "NORMAL"
+    return "LOW"
+
+
+def build_benchmark_snapshot(records, benchmark_alias):
+    if not isinstance(records, list) or not records:
+        return None
+    closes = [float(item.get("close", 0) or 0) for item in records if item.get("close") is not None]
+    if not closes:
+        return None
+
+    sma50 = safe_sma(closes, 50)
+    sma200 = safe_sma(closes, 200)
+    snapshot = {
+        "close": round(closes[-1], 2),
+        "return_20d": safe_return_pct(closes, 20),
+        "above_sma50": bool(sma50 is not None and closes[-1] > sma50),
+        "above_sma200": bool(sma200 is not None and closes[-1] > sma200),
+    }
+    if benchmark_alias == "VIX_INDEX":
+        snapshot["risk_state"] = classify_vix_risk(snapshot["close"])
+    return snapshot
+
+
+def build_breadth_snapshot(tickers, ohlcv_dir_id):
+    total = len(tickers)
+    if total == 0:
+        return {
+            "source": "stage3_universe",
+            "total": 0,
+            "above_sma50_pct": 0.0,
+            "above_sma200_pct": 0.0,
+            "near_52w_high_pct": 0.0,
+            "valid_count": 0
+        }
+
+    valid_count = 0
+    above_sma50 = 0
+    above_sma200 = 0
+    near_52w_high = 0
+
+    for ticker in tickers:
+        file_id = find_file_id(f"{ticker}_OHLCV.json", ohlcv_dir_id)
+        records = download_json(file_id)
+        if not isinstance(records, list) or len(records) < 50:
+            continue
+
+        closes = [float(item.get("close", 0) or 0) for item in records if item.get("close") is not None]
+        if len(closes) < 50:
+            continue
+
+        valid_count += 1
+        last_close = closes[-1]
+        sma50 = safe_sma(closes, 50)
+        sma200 = safe_sma(closes, 200)
+        high_52w = max(closes[-252:]) if len(closes) >= 252 else max(closes)
+
+        if sma50 is not None and last_close > sma50:
+            above_sma50 += 1
+        if sma200 is not None and last_close > sma200:
+            above_sma200 += 1
+        if high_52w and last_close >= high_52w * 0.9:
+            near_52w_high += 1
+
+    base_count = valid_count or total
+    return {
+        "source": "stage3_universe",
+        "total": total,
+        "valid_count": valid_count,
+        "above_sma50_pct": round((above_sma50 / base_count) * 100, 1),
+        "above_sma200_pct": round((above_sma200 / base_count) * 100, 1),
+        "near_52w_high_pct": round((near_52w_high / base_count) * 100, 1)
+    }
+
+
+def derive_market_regime(benchmark_snapshots, breadth_snapshot):
+    score = 50
+    reasons = []
+
+    sp500 = benchmark_snapshots.get("sp500") or {}
+    nasdaq = benchmark_snapshots.get("nasdaq") or {}
+    vix = benchmark_snapshots.get("vix") or {}
+
+    if sp500.get("above_sma50"):
+        score += 8
+        reasons.append("SPX above 50DMA")
+    else:
+        score -= 8
+        reasons.append("SPX below 50DMA")
+
+    if sp500.get("above_sma200"):
+        score += 10
+        reasons.append("SPX above 200DMA")
+    else:
+        score -= 10
+        reasons.append("SPX below 200DMA")
+
+    if nasdaq.get("above_sma50"):
+        score += 6
+        reasons.append("NDX above 50DMA")
+    else:
+        score -= 6
+        reasons.append("NDX below 50DMA")
+
+    if nasdaq.get("above_sma200"):
+        score += 6
+        reasons.append("NDX above 200DMA")
+    else:
+        score -= 6
+        reasons.append("NDX below 200DMA")
+
+    breadth50 = breadth_snapshot.get("above_sma50_pct", 0)
+    breadth200 = breadth_snapshot.get("above_sma200_pct", 0)
+    highs = breadth_snapshot.get("near_52w_high_pct", 0)
+
+    if breadth50 >= 60:
+        score += 5
+        reasons.append("Breadth50 healthy")
+    elif breadth50 < 45:
+        score -= 5
+        reasons.append("Breadth50 weak")
+
+    if breadth200 >= 55:
+        score += 7
+        reasons.append("Breadth200 healthy")
+    elif breadth200 < 40:
+        score -= 7
+        reasons.append("Breadth200 weak")
+
+    if highs >= 18:
+        score += 4
+        reasons.append("Leaders near highs")
+    elif highs < 8:
+        score -= 4
+        reasons.append("Few leaders near highs")
+
+    vix_close = vix.get("close")
+    if vix_close is not None:
+        if vix_close >= 28:
+            score -= 16
+            reasons.append("VIX stress")
+        elif vix_close >= 20:
+            score -= 8
+            reasons.append("VIX elevated")
+        elif vix_close < 15:
+            score += 3
+            reasons.append("VIX calm")
+
+    score = max(0, min(100, int(round(score))))
+    if score >= 70:
+        state = "RISK_ON"
+    elif score >= 45:
+        state = "NEUTRAL"
+    else:
+        state = "RISK_OFF"
+
+    return {
+        "state": state,
+        "score": score,
+        "reasons": reasons
+    }
+
+
+def build_market_regime_snapshot(trigger_file, timestamp, tickers, ohlcv_dir_id):
+    benchmark_snapshots = {}
+    for benchmark in BENCHMARK_SPECS:
+        alias = benchmark["alias"]
+        file_id = find_file_id(f"{alias}_OHLCV.json", ohlcv_dir_id)
+        records = download_json(file_id)
+        snapshot = build_benchmark_snapshot(records, alias)
+        if snapshot:
+            if alias == "SP500_INDEX":
+                benchmark_snapshots["sp500"] = snapshot
+            elif alias == "NASDAQ_INDEX":
+                benchmark_snapshots["nasdaq"] = snapshot
+            elif alias == "VIX_INDEX":
+                benchmark_snapshots["vix"] = snapshot
+
+    breadth_snapshot = build_breadth_snapshot(tickers, ohlcv_dir_id)
+    regime_snapshot = derive_market_regime(benchmark_snapshots, breadth_snapshot)
+
+    return {
+        "timestamp": timestamp,
+        "trigger_file": trigger_file,
+        "benchmarks": benchmark_snapshots,
+        "breadth": breadth_snapshot,
+        "regime": regime_snapshot
+    }
+
+
+# --- [4. 메인 엔진] ---
 def run_harvester():
     start_time = time.time()
     total_success, total_error = 0, 0
@@ -270,11 +486,21 @@ def run_harvester():
                             else:
                                 benchmark_fail += 1
                                 print(f"⚠️ 벤치마크 수집 실패: {alias}")
-                                
+
+                        market_regime_ready = False
+                        try:
+                            regime_snapshot = build_market_regime_snapshot(current_trigger_file, today_str, s3_tickers, ohlcv_dir_id)
+                            upload_json(MARKET_REGIME_FILENAME, regime_snapshot, sys_id)
+                            market_regime_ready = True
+                            print(f"🧭 시장 국면 스냅샷 완료: {regime_snapshot.get('regime', {}).get('state', 'UNKNOWN')} ({regime_snapshot.get('regime', {}).get('score', 0)})")
+                        except Exception as e:
+                            print(f"⚠️ 시장 국면 스냅샷 생성 실패: {str(e)}")
+
                         update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
-                        
+
                         upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": current_trigger_file, "timestamp": today_str}, sys_id)
-                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 / `{benchmark_fail}` 실패")
+                        regime_status = "READY" if market_regime_ready else "SKIPPED"
+                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`")
             return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
