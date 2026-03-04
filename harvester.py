@@ -69,7 +69,7 @@ def find_file_id(name, parent_id=None):
     except: return None
 
 def download_json(file_id):
-    if not file_id: return []
+    if not file_id: return {} # 리스트가 아닌 딕셔너리로 초기화하도록 수정 (데일리 데이터 호환성)
     try:
         request = drive_service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -77,7 +77,7 @@ def download_json(file_id):
         done = False
         while not done: _, done = downloader.next_chunk()
         return json.loads(fh.getvalue().decode())
-    except: return []
+    except: return {}
 
 def upload_json(filename, data, parent_id):
     print(f"📤 업로드 시도: {filename}...")
@@ -112,7 +112,9 @@ def update_progress(current, total, ticker, sys_id, status="PROCESSING"):
 def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
     file_name = f"{ticker}_OHLCV.json"
     file_id = find_file_id(file_name, ohlcv_dir_id)
-    existing_data = download_json(file_id) if file_id else []
+    # OHLCV는 리스트 형태이므로 리스트로 변환 보장
+    existing_data = download_json(file_id)
+    if not isinstance(existing_data, list): existing_data = []
     
     try:
         stock = yf.Ticker(ticker)
@@ -122,7 +124,7 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
         
         if df.empty: return False
         
-        # [수정] 각 레코드마다 symbol 필드를 강제로 추가
+        # 각 레코드마다 symbol 필드를 강제로 추가
         new_recs = [
             {
                 "symbol": ticker,
@@ -155,7 +157,7 @@ def run_harvester():
     try:
         print(f"🔍 시스템 가동: {today_str} (Event: {GITHUB_EVENT_NAME})")
         root_id = find_file_id("US_Alpha_Seeker")
-        sys_id = find_id_map = find_file_id("System_Identity_Maps", root_id)
+        sys_id = find_file_id("System_Identity_Maps", root_id) # 변수명 오류 수정 (find_id_map 제거)
 
         # 🎯 1. [특별 작업 모드] 웹앱 신호 시 OHLCV 300개 수집
         if GITHUB_EVENT_NAME == 'repository_dispatch':
@@ -178,7 +180,6 @@ def run_harvester():
                         total_count = len(s3_tickers)
                         send_telegram(f"🚀 *수집 시작:* `{total_count}`종목 (2년치)")
                         
-                        # [추가됨] 시작 상태 드라이브에 기록
                         update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING")
 
                         for idx, st in enumerate(s3_tickers, 1):
@@ -187,22 +188,19 @@ def run_harvester():
                             else:
                                 total_error += 1
                             
-                            # 야후 차단 방지를 위한 여유 있는 슬립
                             time.sleep(random.uniform(1.6, 2.3))
                             
-                            # [추가됨] 진행 상황 출력 및 10종목마다 드라이브 업데이트
                             if idx % 10 == 0 or idx == total_count:
                                 print(f"📊 진행 중... {idx}/{total_count}")
                                 update_progress(idx, total_count, st, sys_id, "PROCESSING")
                                 
-                        # [추가됨] 최종 완료 상태 드라이브에 기록
                         update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED")
                         
                         upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": latest_s3['name'], "timestamp": today_str}, sys_id)
                         send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`")
-            return # dispatch 작업 시 여기서 종료
+            return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
-        # 🎯 2. [데일리 수집 모드]
+        # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
         hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
         
@@ -213,6 +211,11 @@ def run_harvester():
             group_label, target_chars = "2차 (N-Z & 기타)", "NOPQRSTUVWXYZ0123456789"
 
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
+        
+        # 딕셔너리가 아닌 경우 빈 딕셔너리로 초기화 방어
+        if not isinstance(full_map, dict):
+            full_map = {}
+            
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
         send_telegram(f"📡 *[Daily] 본계정 가동*\n🎯 *타겟:* `{group_label}` | `{len(filtered_tickers)}`종목")
@@ -223,8 +226,12 @@ def run_harvester():
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
             g_success, g_error = 0, 0
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
+            
             daily_data = download_json(find_file_id(daily_name, daily_dir_id))
             hist_data = download_json(find_file_id(hist_name, hist_dir_id))
+            
+            if not isinstance(daily_data, dict): daily_data = {}
+            if not isinstance(hist_data, dict): hist_data = {}
 
             for ticker in group_tickers:
                 success_flag = False
@@ -232,25 +239,46 @@ def run_harvester():
                     try:
                         time.sleep(random.uniform(1.3, 1.8))
                         stock = yf.Ticker(ticker)
+                        
+                        # [중요 보완] 히스토리(재무제표) 데이터 수집 로직 복구
+                        hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
+                        if hist_status == '❌' or is_weekend_update:
+                            try:
+                                f_data = stock.quarterly_financials
+                                if not f_data.empty:
+                                    hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
+                                    hist_status = '✅'
+                            except: pass
+
                         info = stock.info
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
                         
                         if price:
-                            # 기존 로직 동일
+                            # STANDARD_KEYS에 맞게 데이터 추출
                             daily_data[ticker] = {k: info.get(k) for k in STANDARD_KEYS}
                             daily_data[ticker]["updated"] = today_str
                             daily_data[ticker]["symbol"] = ticker
+                            daily_data[ticker]["Hist"] = hist_status # 히스토리 상태 업데이트
+                            
                             g_success += 1
                             success_flag = True
                             break
                     except: pass
+                
                 if not success_flag: g_error += 1
 
+            # 데일리 데이터와 히스토리 데이터 모두 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
-            total_success += g_success; total_error += g_error
+            upload_json(hist_name, hist_data, hist_dir_id) # 누락되었던 히스토리 업로드 복구
+            
+            total_success += g_success
+            total_error += g_error
+            
+            # 그룹별 완료 알림 (선택사항, 너무 많으면 주석처리 가능)
+            # print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error}")
 
         duration = (time.time() - start_time) / 60
-        send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}`")
+        send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
 
     except Exception as e:
         send_telegram(f"🚨 *에러 발생:* `{str(e)}` ")
