@@ -40,6 +40,12 @@ STANDARD_KEYS = [
     "sector", "industry"
 ]
 
+BENCHMARK_SPECS = [
+    {"source": "^GSPC", "alias": "SP500_INDEX"},
+    {"source": "^IXIC", "alias": "NASDAQ_INDEX"},
+    {"source": "^VIX", "alias": "VIX_INDEX"},
+]
+
 def get_drive_service():
     creds_data = {
         "client_id": CLIENT_ID,
@@ -132,15 +138,33 @@ def update_progress(current, total, ticker, sys_id, status="PROCESSING", trigger
     upload_json("COLLECTION_PROGRESS.json", progress_data, sys_id)
 
 # --- [OHLCV 누적 수집 로직] ---
-def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
-    file_name = f"{ticker}_OHLCV.json"
+def trim_zero_volume_flat_tail(records):
+    trimmed = list(records)
+    removed = 0
+    while len(trimmed) >= 2:
+        last = trimmed[-1]
+        prev = trimmed[-2]
+        is_flat_bar = last.get('open') == last.get('high') == last.get('low') == last.get('close')
+        is_zero_volume = int(last.get('volume', 0) or 0) == 0
+        if is_flat_bar and is_zero_volume and last.get('close') == prev.get('close'):
+            trimmed.pop()
+            removed += 1
+        else:
+            break
+    return trimmed, removed
+
+
+def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symbol=None):
+    source_symbol = source_symbol or ticker
+    record_symbol = record_symbol or ticker
+    file_name = f"{record_symbol}_OHLCV.json"
     file_id = find_file_id(file_name, ohlcv_dir_id)
     # OHLCV는 리스트 형태이므로 리스트로 변환 보장
     existing_data = download_json(file_id)
     if not isinstance(existing_data, list): existing_data = []
     
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(source_symbol)
         # 데이터가 없으면 2년(2y), 있으면 최근 7일(7d)만
         period = "7d" if existing_data else "2y"
         df = stock.history(period=period, interval="1d")
@@ -150,24 +174,30 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id):
         # 각 레코드마다 symbol 필드를 강제로 추가
         new_recs = [
             {
-                "symbol": ticker,
+                "symbol": record_symbol,
                 "date": d.strftime('%Y-%m-%d'), 
-                "open": round(r['Open'], 2), 
-                "high": round(r['High'], 2), 
-                "low": round(r['Low'], 2), 
-                "close": round(r['Close'], 2), 
-                "volume": int(r['Volume'])
+                "open": round(r["Open"], 2), 
+                "high": round(r["High"], 2), 
+                "low": round(r["Low"], 2), 
+                "close": round(r["Close"], 2), 
+                "volume": int(r["Volume"])
             } for d, r in df.iterrows()
         ]
         
         # 날짜 기준 중복 제거 및 합치기
-        combined = {item['date']: item for item in (existing_data + new_recs)}
+        combined = {item["date"]: item for item in (existing_data + new_recs)}
         # 최신 2년치(약 500거래일) 데이터만 유지하여 파일 크기 관리
-        final_list = sorted(combined.values(), key=lambda x: x['date'])[-500:]
+        final_list = sorted(combined.values(), key=lambda x: x["date"])[-500:]
+        final_list, removed_tail = trim_zero_volume_flat_tail(final_list)
+        if removed_tail > 0:
+            print(f"🧹 {file_name}: zero-volume flat tail {removed_tail}건 제거")
+        if not final_list:
+            return False
         
         upload_json(file_name, final_list, ohlcv_dir_id)
         return True
-    except: return False
+    except:
+        return False
 
 # --- [3. 메인 엔진] ---
 def run_harvester():
@@ -229,10 +259,22 @@ def run_harvester():
                                 print(f"📊 진행 중... {idx}/{total_count}")
                                 update_progress(idx, total_count, st, sys_id, "PROCESSING", current_trigger_file)
                                 
+                        benchmark_success = 0
+                        benchmark_fail = 0
+                        for benchmark in BENCHMARK_SPECS:
+                            alias = benchmark["alias"]
+                            source = benchmark["source"]
+                            print(f"📈 벤치마크 수집: {alias} <- {source}")
+                            if sync_ohlcv_incremental(alias, ohlcv_dir_id, source_symbol=source, record_symbol=alias):
+                                benchmark_success += 1
+                            else:
+                                benchmark_fail += 1
+                                print(f"⚠️ 벤치마크 수집 실패: {alias}")
+                                
                         update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
                         
                         upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": current_trigger_file, "timestamp": today_str}, sys_id)
-                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`")
+                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 / `{benchmark_fail}` 실패")
             return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
