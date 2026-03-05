@@ -50,6 +50,7 @@ BENCHMARK_SPECS = [
 MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
 EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
 FMP_API_KEY = os.getenv("FMP_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_KEY") or os.getenv("FINNHUB_API_KEY")
 
 def get_drive_service():
     creds_data = {
@@ -428,58 +429,228 @@ def classify_event_risk(days_to_event):
     return "NONE"
 
 
+def normalize_event_date(raw_value):
+    if raw_value is None:
+        return None
+
+    # datetime/date
+    if isinstance(raw_value, datetime.datetime):
+        return raw_value.date().strftime('%Y-%m-%d')
+    if isinstance(raw_value, datetime.date):
+        return raw_value.strftime('%Y-%m-%d')
+
+    # unix timestamp (sec or ms)
+    if isinstance(raw_value, (int, float)):
+        ts = float(raw_value)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        if ts > 0:
+            try:
+                dt = datetime.datetime.utcfromtimestamp(ts)
+                return dt.strftime('%Y-%m-%d')
+            except Exception:
+                return None
+
+    # string-like
+    value = str(raw_value).strip()
+    if not value:
+        return None
+
+    # ISO / pandas Timestamp string 등은 앞 10자리(YYYY-MM-DD) 우선 사용
+    if len(value) >= 10 and value[4] == '-' and value[7] == '-':
+        return value[:10]
+
+    # 기타 포맷 파싱 시도
+    for fmt in ('%Y/%m/%d', '%m/%d/%Y', '%Y%m%d'):
+        try:
+            return datetime.datetime.strptime(value, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+
+    return None
+
+
+def upsert_earnings_event(event_map, symbol, date_str, now_date, source, confidence):
+    if not symbol or not date_str:
+        return
+
+    try:
+        event_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return
+
+    days_to_event = (event_date - now_date).days
+    if days_to_event < 0 or days_to_event > 60:
+        return
+
+    new_payload = {
+        "earnings_date": date_str,
+        "days_to_event": days_to_event,
+        "event_risk": classify_event_risk(days_to_event),
+        "source": source,
+        "confidence": confidence
+    }
+
+    current = event_map.get(symbol)
+    if not current:
+        event_map[symbol] = new_payload
+        return
+
+    # 더 가까운 이벤트 우선. 동일 거리면 confidence 높은 소스 우선.
+    rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
+    current_days = current.get('days_to_event', 9999)
+    current_conf = rank.get(current.get('confidence', 'UNKNOWN'), 0)
+    new_conf = rank.get(confidence, 0)
+
+    if days_to_event < current_days or (days_to_event == current_days and new_conf > current_conf):
+        event_map[symbol] = new_payload
+
+
+def extract_yf_earnings_date(stock):
+    # 1) get_earnings_dates (가장 신뢰도 높음)
+    try:
+        df = stock.get_earnings_dates(limit=1)
+        if df is not None and hasattr(df, 'index') and len(df.index) > 0:
+            return normalize_event_date(df.index[0])
+    except Exception:
+        pass
+
+    # 2) calendar 구조 파싱
+    try:
+        cal = stock.calendar
+        if isinstance(cal, dict):
+            for key in ('Earnings Date', 'Earnings Date Start', 'earningsDate'):
+                if key in cal:
+                    val = cal.get(key)
+                    if isinstance(val, (list, tuple)) and val:
+                        val = val[0]
+                    date_str = normalize_event_date(val)
+                    if date_str:
+                        return date_str
+        elif hasattr(cal, 'to_dict'):
+            cdict = cal.to_dict()
+            if isinstance(cdict, dict):
+                for _, v in cdict.items():
+                    if isinstance(v, dict):
+                        for kk, vv in v.items():
+                            if 'earn' in str(kk).lower():
+                                date_str = normalize_event_date(vv)
+                                if date_str:
+                                    return date_str
+    except Exception:
+        pass
+
+    # 3) info timestamp fallback
+    try:
+        info = stock.info if isinstance(stock.info, dict) else {}
+        for key in ('earningsTimestamp', 'earningsTimestampStart', 'earningsTimestampEnd'):
+            date_str = normalize_event_date(info.get(key))
+            if date_str:
+                return date_str
+    except Exception:
+        pass
+
+    return None
+
+
 def fetch_earnings_event_map(tickers, trigger_file, timestamp):
     payload = {
         "timestamp": timestamp,
         "trigger_file": trigger_file,
         "source": "unavailable",
         "universe_count": len(tickers),
+        "covered_count": 0,
+        "missing_count": len(tickers),
         "events": {}
     }
 
-    if not tickers or not FMP_API_KEY:
+    if not tickers:
         return payload
 
-    try:
-        now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-        start_date = now_kst.strftime('%Y-%m-%d')
-        end_date = (now_kst + datetime.timedelta(days=45)).strftime('%Y-%m-%d')
-        url = f"https://financialmodelingprep.com/api/v3/earning_calendar?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        calendar = response.json()
+    now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    start_date = now_kst.strftime('%Y-%m-%d')
+    end_date = (now_kst + datetime.timedelta(days=45)).strftime('%Y-%m-%d')
+    now_date = now_kst.date()
 
-        event_map = {}
-        target_set = {ticker.upper() for ticker in tickers}
+    target_set = {ticker.upper() for ticker in tickers if ticker}
+    event_map = {}
+    source_labels = []
 
-        for event in calendar if isinstance(calendar, list) else []:
-            symbol = str(event.get('symbol') or '').upper()
-            date_str = str(event.get('date') or '')[:10]
-            if not symbol or not date_str or symbol not in target_set:
-                continue
+    # 1) FMP 캘린더 (단일 호출)
+    if FMP_API_KEY:
+        try:
+            url = f"https://financialmodelingprep.com/api/v3/earning_calendar?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            calendar = response.json()
 
+            for event in calendar if isinstance(calendar, list) else []:
+                symbol = str(event.get('symbol') or '').upper()
+                if symbol not in target_set:
+                    continue
+                date_str = normalize_event_date(event.get('date'))
+                upsert_earnings_event(event_map, symbol, date_str, now_date, 'fmp', 'HIGH')
+
+            if event_map:
+                source_labels.append('fmp')
+        except Exception as e:
+            print(f"⚠️ FMP earnings calendar 실패: {str(e)}")
+
+    # 2) Finnhub 캘린더 (단일 호출)
+    missing_symbols = sorted(target_set - set(event_map.keys()))
+    if missing_symbols and FINNHUB_API_KEY:
+        try:
+            url = f"https://finnhub.io/api/v1/calendar/earnings?from={start_date}&to={end_date}&token={FINNHUB_API_KEY}"
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            payload_json = response.json() if response.content else {}
+
+            rows = []
+            if isinstance(payload_json, dict):
+                rows = payload_json.get('earningsCalendar') or payload_json.get('earnings') or []
+            elif isinstance(payload_json, list):
+                rows = payload_json
+
+            for event in rows if isinstance(rows, list) else []:
+                symbol = str(event.get('symbol') or '').upper()
+                if symbol not in target_set:
+                    continue
+                date_str = normalize_event_date(event.get('date'))
+                upsert_earnings_event(event_map, symbol, date_str, now_date, 'finnhub', 'HIGH')
+
+            if any(v.get('source') == 'finnhub' for v in event_map.values()):
+                source_labels.append('finnhub')
+        except Exception as e:
+            print(f"⚠️ Finnhub earnings calendar 실패: {str(e)}")
+
+    # 3) yfinance fallback (누락 티커만)
+    missing_symbols = sorted(target_set - set(event_map.keys()))
+    if missing_symbols:
+        print(f"ℹ️ Earnings fallback(yfinance) 시작: {len(missing_symbols)} symbols")
+        yf_found = 0
+        for idx, symbol in enumerate(missing_symbols, 1):
             try:
-                event_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
-                days_to_event = (event_date - now_kst.date()).days
-            except ValueError:
-                continue
+                stock = yf.Ticker(symbol)
+                date_str = extract_yf_earnings_date(stock)
+                upsert_earnings_event(event_map, symbol, date_str, now_date, 'yfinance', 'MEDIUM')
+                if symbol in event_map and event_map[symbol].get('source') == 'yfinance':
+                    yf_found += 1
+            except Exception:
+                pass
 
-            current = event_map.get(symbol)
-            if current and current['days_to_event'] <= days_to_event:
-                continue
+            if idx % 50 == 0 or idx == len(missing_symbols):
+                print(f"   > yfinance earnings fallback {idx}/{len(missing_symbols)}")
+            time.sleep(random.uniform(0.05, 0.12))
 
-            event_map[symbol] = {
-                "earnings_date": date_str,
-                "days_to_event": days_to_event,
-                "event_risk": classify_event_risk(days_to_event)
-            }
+        if yf_found > 0:
+            source_labels.append('yfinance')
 
-        payload["source"] = "fmp"
-        payload["events"] = event_map
-        return payload
-    except Exception as e:
-        print(f"⚠️ Earnings event map 생성 실패: {str(e)}")
-        return payload
+    payload["events"] = event_map
+    payload["covered_count"] = len(event_map)
+    payload["missing_count"] = max(0, len(target_set) - len(event_map))
+    payload["source"] = '+'.join(source_labels) if source_labels else 'unavailable'
+
+    return payload
 
 
 # --- [4. 메인 엔진] ---
@@ -565,12 +736,16 @@ def run_harvester():
 
                         earnings_event_ready = False
                         earnings_event_count = 0
+                        earnings_event_source = "unavailable"
+                        earnings_event_missing = total_count
                         try:
                             earnings_event_map = fetch_earnings_event_map(s3_tickers, current_trigger_file, today_str)
                             earnings_event_count = len(earnings_event_map.get('events', {}))
+                            earnings_event_source = earnings_event_map.get('source', 'unavailable')
+                            earnings_event_missing = int(earnings_event_map.get('missing_count', max(0, total_count - earnings_event_count)))
                             upload_json(EARNINGS_EVENT_FILENAME, earnings_event_map, sys_id)
                             earnings_event_ready = True
-                            print(f"📅 실적 이벤트 맵 완료: {earnings_event_count}건")
+                            print(f"📅 실적 이벤트 맵 완료: {earnings_event_count}건 (source: {earnings_event_source}, missing: {earnings_event_missing})")
                         except Exception as e:
                             print(f"⚠️ 실적 이벤트 맵 업로드 실패: {str(e)}")
 
