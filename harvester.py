@@ -635,11 +635,42 @@ def run_harvester():
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
                         
                         if price:
-                            # STANDARD_KEYS에 맞게 데이터 추출
-                            daily_data[ticker] = {k: info.get(k) for k in STANDARD_KEYS}
-                            daily_data[ticker]["updated"] = today_str
-                            daily_data[ticker]["symbol"] = ticker
-                            daily_data[ticker]["Hist"] = hist_status # 히스토리 상태 업데이트
+                            # [FIX] Restore legacy raw-record mapping so STANDARD_KEYS are filled with
+                            # Yahoo source keys (trailingPE, priceToBook, returnOnEquity, etc).
+                            raw_record = {
+                                "symbol": ticker,
+                                "name": info.get('shortName') or info.get('longName'),
+                                "price": price,
+                                "currency": info.get('currency', 'USD'),
+                                "marketCap": info.get('marketCap'),
+                                "updated": today_str,
+                                "Hist": hist_status,
+                                "per": info.get('trailingPE'),
+                                "pbr": info.get('priceToBook'),
+                                "psr": info.get('priceToSalesTrailing12Months'),
+                                "pegRatio": info.get('pegRatio'),
+                                "targetMeanPrice": info.get('targetMeanPrice'),
+                                "roe": info.get('returnOnEquity'),
+                                "roa": info.get('returnOnAssets'),
+                                "eps": info.get('trailingEps'),
+                                "operatingMargins": info.get('operatingMargins'),
+                                "debtToEquity": info.get('debtToEquity'),
+                                "revenueGrowth": info.get('revenueGrowth'),
+                                "operatingCashflow": info.get('operatingCashflow'),
+                                "dividendRate": info.get('dividendRate', 0),
+                                "dividendYield": info.get('dividendYield', 0),
+                                "volume": info.get('regularMarketVolume'),
+                                "beta": info.get('beta'),
+                                "heldPercentInstitutions": info.get('heldPercentInstitutions'),
+                                "shortRatio": info.get('shortRatio'),
+                                "fiftyDayAverage": info.get('fiftyDayAverage'),
+                                "twoHundredDayAverage": info.get('twoHundredDayAverage'),
+                                "fiftyTwoWeekHigh": info.get('fiftyTwoWeekHigh'),
+                                "fiftyTwoWeekLow": info.get('fiftyTwoWeekLow'),
+                                "sector": info.get('sector'),
+                                "industry": info.get('industry')
+                            }
+                            daily_data[ticker] = {k: raw_record.get(k, None) for k in STANDARD_KEYS}
                             
                             g_success += 1
                             success_flag = True
