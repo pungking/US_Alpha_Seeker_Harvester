@@ -14,7 +14,8 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
 
 # 로그 실시간 출력 설정
-if sys.stdout.encoding.lower() != 'utf-8':
+# 항상 line buffering을 켜서 GitHub Actions/터미널에 진행 로그가 즉시 보이게 한다.
+if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -605,7 +606,9 @@ def run_harvester():
 
         for group in groups:
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
+            g_total = len(group_tickers)
             g_success, g_error = 0, 0
+            print(f"\n--- 📦 그룹 [{group}] 작업 시작 ---")
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
             
             daily_data = download_json(find_file_id(daily_name, daily_dir_id))
@@ -614,22 +617,26 @@ def run_harvester():
             if not isinstance(daily_data, dict): daily_data = {}
             if not isinstance(hist_data, dict): hist_data = {}
 
-            for ticker in group_tickers:
+            for i, ticker in enumerate(group_tickers, 1):
                 success_flag = False
-                for _ in range(2):
+                for attempt in range(3): # 수집 재시도
                     try:
+                        if i % 50 == 0:
+                            print(f"   > 진행 중: {group} {i}/{g_total}...")
                         time.sleep(random.uniform(1.3, 1.8))
                         stock = yf.Ticker(ticker)
                         
                         # [중요 보완] 히스토리(재무제표) 데이터 수집 로직 복구
-                        hist_status = daily_data.get(ticker, {}).get('Hist', '❌')
+                        prev_hist = daily_data.get(ticker, {}).get('Hist')
+                        hist_status = prev_hist if prev_hist in ('✅', '❌') else '❌'
                         if hist_status == '❌' or is_weekend_update:
                             try:
                                 f_data = stock.quarterly_financials
                                 if not f_data.empty:
                                     hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
                                     hist_status = '✅'
-                            except: pass
+                            except:
+                                pass
 
                         info = stock.info
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
@@ -670,24 +677,37 @@ def run_harvester():
                                 "sector": info.get('sector'),
                                 "industry": info.get('industry')
                             }
-                            daily_data[ticker] = {k: raw_record.get(k, None) for k in STANDARD_KEYS}
+
+                            # 신규 값이 None일 때 기존 값을 덮어쓰지 않도록 보존
+                            prev_record = daily_data.get(ticker, {}) if isinstance(daily_data.get(ticker), dict) else {}
+                            merged_record = {}
+                            for k in STANDARD_KEYS:
+                                new_v = raw_record.get(k, None)
+                                old_v = prev_record.get(k, None)
+                                merged_record[k] = new_v if new_v is not None else old_v
+                            daily_data[ticker] = merged_record
                             
                             g_success += 1
                             success_flag = True
                             break
-                    except: pass
+                        else:
+                            break
+                    except Exception as e:
+                        if "SSL" in str(e) or "EOF" in str(e):
+                            time.sleep(5)
                 
-                if not success_flag: g_error += 1
+                if not success_flag:
+                    g_error += 1
 
             # 데일리 데이터와 히스토리 데이터 모두 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
-            upload_json(hist_name, hist_data, hist_dir_id) # 누락되었던 히스토리 업로드 복구
+            upload_json(hist_name, hist_data, hist_dir_id)
             
             total_success += g_success
             total_error += g_error
             
-            # 그룹별 완료 알림 (선택사항, 너무 많으면 주석처리 가능)
             print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error}")
+            send_telegram(f"📦 *그룹 [{group}] 완료*\\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`")
 
         duration = (time.time() - start_time) / 60
         send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
