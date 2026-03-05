@@ -943,7 +943,7 @@ def run_harvester():
             total_error += g_error
             
             print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error}")
-            send_telegram(f"📦 *그룹 [{group}] 완료*\\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`")
+            send_telegram(f"📦 *그룹 [{group}] 완료*\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`")
 
         duration = (time.time() - start_time) / 60
         send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
