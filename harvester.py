@@ -160,6 +160,48 @@ def trim_zero_volume_flat_tail(records):
     return trimmed, removed
 
 
+def get_latest_ohlcv_date(records):
+    if not isinstance(records, list) or not records:
+        return None
+    try:
+        latest = max(str(item.get("date", "")) for item in records if isinstance(item, dict) and item.get("date"))
+        return latest if latest else None
+    except Exception:
+        return None
+
+
+def get_expected_market_date_str():
+    """
+    미국(뉴욕) 기준으로 일봉이 확정되어 있어야 하는 최신 거래일(YYYY-MM-DD)을 계산한다.
+    - 장 마감(보수적으로 18:00 ET) 이전 실행: 직전 거래일
+    - 주말 실행: 직전 금요일
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        ny_now = datetime.datetime.now(datetime.timezone.utc).astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        # zoneinfo 사용 불가 환경 fallback (DST 미반영)
+        ny_now = datetime.datetime.utcnow() - datetime.timedelta(hours=5)
+
+    ref_date = ny_now.date()
+    if getattr(ny_now, 'hour', 0) < 18:
+        ref_date -= datetime.timedelta(days=1)
+
+    while ref_date.weekday() >= 5:
+        ref_date -= datetime.timedelta(days=1)
+
+    return ref_date.strftime('%Y-%m-%d')
+
+
+def is_ohlcv_fresh(existing_records):
+    latest = get_latest_ohlcv_date(existing_records)
+    if not latest:
+        return False
+    expected = get_expected_market_date_str()
+    return latest >= expected
+
+
+# --- [OHLCV 누적 수집 로직] ---
 def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symbol=None):
     source_symbol = source_symbol or ticker
     record_symbol = record_symbol or ticker
@@ -168,28 +210,33 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
     # OHLCV는 리스트 형태이므로 리스트로 변환 보장
     existing_data = download_json(file_id)
     if not isinstance(existing_data, list): existing_data = []
-    
+
+    # [최적화] 최신 거래일까지 이미 수집된 종목은 재호출 스킵
+    if existing_data and is_ohlcv_fresh(existing_data):
+        return "SKIPPED"
+
     try:
         stock = yf.Ticker(source_symbol)
         # 데이터가 없으면 2년(2y), 있으면 최근 7일(7d)만
         period = "7d" if existing_data else "2y"
         df = stock.history(period=period, interval="1d")
-        
-        if df.empty: return False
-        
+
+        if df.empty:
+            return "FAILED"
+
         # 각 레코드마다 symbol 필드를 강제로 추가
         new_recs = [
             {
                 "symbol": record_symbol,
-                "date": d.strftime('%Y-%m-%d'), 
-                "open": round(r["Open"], 2), 
-                "high": round(r["High"], 2), 
-                "low": round(r["Low"], 2), 
-                "close": round(r["Close"], 2), 
+                "date": d.strftime('%Y-%m-%d'),
+                "open": round(r["Open"], 2),
+                "high": round(r["High"], 2),
+                "low": round(r["Low"], 2),
+                "close": round(r["Close"], 2),
                 "volume": int(r["Volume"])
             } for d, r in df.iterrows()
         ]
-        
+
         # 날짜 기준 중복 제거 및 합치기
         combined = {item["date"]: item for item in (existing_data + new_recs)}
         # 최신 2년치(약 500거래일) 데이터만 유지하여 파일 크기 관리
@@ -198,12 +245,12 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
         if removed_tail > 0:
             print(f"🧹 {file_name}: zero-volume flat tail {removed_tail}건 제거")
         if not final_list:
-            return False
-        
+            return "FAILED"
+
         upload_json(file_name, final_list, ohlcv_dir_id)
-        return True
+        return "UPDATED"
     except:
-        return False
+        return "FAILED"
 
 # --- [3. 시장 컨텍스트 스냅샷 생성] ---
 def safe_sma(values, window):
@@ -701,26 +748,40 @@ def run_harvester():
                         
                         update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING", current_trigger_file)
 
+                        ohlcv_skipped = 0
                         for idx, st in enumerate(s3_tickers, 1):
-                            if sync_ohlcv_incremental(st, ohlcv_dir_id):
+                            sync_status = sync_ohlcv_incremental(st, ohlcv_dir_id)
+                            if sync_status == "UPDATED":
                                 total_success += 1
+                            elif sync_status == "SKIPPED":
+                                total_success += 1
+                                ohlcv_skipped += 1
                             else:
                                 total_error += 1
-                            
-                            time.sleep(random.uniform(1.6, 2.3))
-                            
+
+                            # 최신 데이터가 이미 있는 종목은 짧게 대기하여 전체 테스트 시간을 절감
+                            if sync_status == "SKIPPED":
+                                time.sleep(random.uniform(0.05, 0.15))
+                            else:
+                                time.sleep(random.uniform(1.6, 2.3))
+
                             if idx % 10 == 0 or idx == total_count:
-                                print(f"📊 진행 중... {idx}/{total_count}")
+                                print(f"📊 진행 중... {idx}/{total_count} (skip {ohlcv_skipped})")
                                 update_progress(idx, total_count, st, sys_id, "PROCESSING", current_trigger_file)
-                                
+
                         benchmark_success = 0
                         benchmark_fail = 0
+                        benchmark_skipped = 0
                         for benchmark in BENCHMARK_SPECS:
                             alias = benchmark["alias"]
                             source = benchmark["source"]
                             print(f"📈 벤치마크 수집: {alias} <- {source}")
-                            if sync_ohlcv_incremental(alias, ohlcv_dir_id, source_symbol=source, record_symbol=alias):
+                            benchmark_status = sync_ohlcv_incremental(alias, ohlcv_dir_id, source_symbol=source, record_symbol=alias)
+                            if benchmark_status == "UPDATED":
                                 benchmark_success += 1
+                            elif benchmark_status == "SKIPPED":
+                                benchmark_success += 1
+                                benchmark_skipped += 1
                             else:
                                 benchmark_fail += 1
                                 print(f"⚠️ 벤치마크 수집 실패: {alias}")
@@ -754,7 +815,7 @@ def run_harvester():
                         upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": current_trigger_file, "timestamp": today_str}, sys_id)
                         regime_status = "READY" if market_regime_ready else "SKIPPED"
                         earnings_status = "READY" if earnings_event_ready else "SKIPPED"
-                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`\n실적이벤트: `{earnings_status}` ({earnings_event_count})")
+                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` (skip `{ohlcv_skipped}`) | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 (skip `{benchmark_skipped}`) / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`\n실적이벤트: `{earnings_status}` ({earnings_event_count})")
             return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
