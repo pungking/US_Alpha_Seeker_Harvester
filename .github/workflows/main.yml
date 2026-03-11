@@ -41,3 +41,6 @@ jobs:
           # 🎯 파이썬 코드가 웹앱 신호인지 스케줄 실행인지 판단하는 핵심 변수
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python harvester.py
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
