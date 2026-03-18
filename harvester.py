@@ -33,6 +33,9 @@ STANDARD_KEYS = [
     "symbol", "name", "price", "currency", "marketCap", "updated", "Hist",
     "per", "pbr", "psr", "pegRatio", "targetMeanPrice",
     "roe", "roa", "eps", "operatingMargins", "debtToEquity",
+    # Balance-sheet absolute debt/equity fields (for ROIC accuracy and safer fallback logic)
+    "totalDebt", "longTermDebt", "shortLongTermDebtTotal",
+    "totalDebtAndCapitalLeaseObligation", "totalEquity", "totalStockholdersEquity",
     "revenueGrowth", "operatingCashflow",
     "dividendRate", "dividendYield",
     "volume", "beta", "heldPercentInstitutions", "shortRatio",
@@ -898,6 +901,24 @@ def run_harvester():
                                 "eps": info.get('trailingEps'),
                                 "operatingMargins": info.get('operatingMargins'),
                                 "debtToEquity": info.get('debtToEquity'),
+                                "totalDebt": info.get('totalDebt'),
+                                "longTermDebt": info.get('longTermDebt'),
+                                "shortLongTermDebtTotal": info.get('shortLongTermDebt'),
+                                "totalDebtAndCapitalLeaseObligation": (
+                                    info.get('totalDebtAndCapitalLeaseObligation')
+                                    or info.get('totalDebt')
+                                ),
+                                "totalEquity": (
+                                    info.get('totalEquity')
+                                    or info.get('stockholdersEquity')
+                                    or info.get('totalStockholderEquity')
+                                ),
+                                "totalStockholdersEquity": (
+                                    info.get('totalStockholdersEquity')
+                                    or info.get('totalStockholderEquity')
+                                    or info.get('stockholdersEquity')
+                                    or info.get('totalEquity')
+                                ),
                                 "revenueGrowth": info.get('revenueGrowth'),
                                 "operatingCashflow": info.get('operatingCashflow'),
                                 "dividendRate": info.get('dividendRate', 0),
