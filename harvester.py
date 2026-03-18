@@ -9,9 +9,11 @@ import random
 import sys
 import re
 import math
+import traceback
 import yfinance as yf
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
 
@@ -79,27 +81,40 @@ def get_drive_service():
 drive_service = get_drive_service()
 
 def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try: requests.post(url, json=payload, timeout=10)
-    except: pass
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        print(f"⚠️ Telegram 알림 실패: {type(e).__name__}: {e}", flush=True)
 
 # --- [2. 드라이브 유틸리티] ---
 def find_file_id(name, parent_id=None):
     query = f"name = '{name}' and trashed = false"
     if parent_id: query += f" and '{parent_id}' in parents"
     
-    for _ in range(3): # 🎯 3번 재시도 (네트워크 지연으로 인한 중복 파일 생성 완벽 방지)
+    for attempt in range(3): # 🎯 3번 재시도 (네트워크 지연으로 인한 중복 파일 생성 완벽 방지)
         try:
             results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
             return results[0]['id'] if results else None
-        except: 
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status in (401, 403):
+                print(f"⛔ Drive API 인증 오류(find_file_id:{name}): {status} {e}", flush=True)
+                raise
+            print(f"⚠️ Drive 파일 조회 실패(find_file_id:{name}) [{attempt + 1}/3]: {status} {e}", flush=True)
+            time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ Drive 파일 조회 예외(find_file_id:{name}) [{attempt + 1}/3]: {type(e).__name__}: {e}", flush=True)
             time.sleep(2)
     return None
 
 def download_json(file_id):
     if not file_id: return None # 반환값을 None으로 명확히 하여 메인 로직에서 타입 캐스팅 유도
-    for _ in range(3): # 다운로드도 3번 재시도
+    for attempt in range(3): # 다운로드도 3번 재시도
         try:
             request = drive_service.files().get_media(fileId=file_id)
             fh = io.BytesIO()
@@ -107,7 +122,18 @@ def download_json(file_id):
             done = False
             while not done: _, done = downloader.next_chunk()
             return json.loads(fh.getvalue().decode())
-        except: 
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON 파싱 오류(download_json:{file_id}): {e}", flush=True)
+            return None
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status in (401, 403):
+                print(f"⛔ Drive API 인증 오류(download_json:{file_id}): {status} {e}", flush=True)
+                raise
+            print(f"⚠️ Drive 다운로드 실패(download_json:{file_id}) [{attempt + 1}/3]: {status} {e}", flush=True)
+            time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ 다운로드 예외(download_json:{file_id}) [{attempt + 1}/3]: {type(e).__name__}: {e}", flush=True)
             time.sleep(2)
     return None
 
@@ -429,7 +455,13 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
 
         upload_json(file_name, final_list, ohlcv_dir_id)
         return "UPDATED"
-    except:
+    except Exception as e:
+        print(
+            f"⚠️ OHLCV sync 실패 [{record_symbol}] source={source_symbol}: "
+            f"{type(e).__name__}: {e}",
+            flush=True
+        )
+        traceback.print_exc()
         return "FAILED"
 
 # --- [3. 시장 컨텍스트 스냅샷 생성] ---
@@ -1051,8 +1083,8 @@ def run_harvester():
                                 if not f_data.empty:
                                     hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
                                     hist_status = '✅'
-                            except:
-                                pass
+                            except Exception as e:
+                                print(f"⚠️ 재무제표 수집 실패 [{ticker}]: {type(e).__name__}: {e}", flush=True)
 
                         info = stock.info
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
