@@ -8,6 +8,7 @@ import urllib3
 import random
 import sys
 import re
+import math
 import yfinance as yf
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -146,8 +147,37 @@ def summarize_key_coverage(records, keys):
         summary[key] = {"present": present, "missing": missing, "coveragePct": coverage_pct}
     return summary
 
+def _first_present(mapping, keys):
+    if not isinstance(mapping, dict):
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ''):
+            return value
+    return None
+
 def _norm_label(value):
     return re.sub(r'[^a-z0-9]', '', str(value or '').lower())
+
+def _to_finite_float(value):
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+def _first_finite_from_values(values):
+    if values is None:
+        return None
+    for value in values:
+        num = _to_finite_float(value)
+        if num is not None:
+            return num
+    return None
 
 def _safe_statement_value(df, candidate_rows):
     if df is None or getattr(df, "empty", True):
@@ -158,11 +188,23 @@ def _safe_statement_value(df, candidate_rows):
             hit = normalized_index.get(_norm_label(row_name))
             if hit is None:
                 continue
-            series = df.loc[hit]
-            if hasattr(series, "empty") and not series.empty:
-                val = series.iloc[0]
+            selected = df.loc[hit]
+            if getattr(selected, "empty", True):
+                continue
+
+            # pandas.Series path
+            if hasattr(selected, "values") and not hasattr(selected, "iterrows"):
+                val = _first_finite_from_values(selected.values)
                 if val is not None:
-                    return float(val)
+                    return val
+                continue
+
+            # pandas.DataFrame (duplicated labels) path
+            if hasattr(selected, "iterrows"):
+                for _, row in selected.iterrows():
+                    val = _first_finite_from_values(getattr(row, "values", row))
+                    if val is not None:
+                        return val
     except Exception:
         return None
     return None
@@ -186,6 +228,15 @@ def _get_balance_sheet_fields(stock):
         except Exception:
             continue
 
+    # yfinance 버전/엔드포인트별 차이를 흡수하기 위해 함수형 getter도 병행한다.
+    for kwargs in ({"freq": "quarterly"}, {"freq": "yearly"}):
+        try:
+            df = stock.get_balance_sheet(pretty=True, **kwargs)
+            if df is not None and not df.empty:
+                statements.append(df)
+        except Exception:
+            continue
+
     if not statements:
         return result
 
@@ -194,18 +245,22 @@ def _get_balance_sheet_fields(stock):
             result["totalDebt"] = _safe_statement_value(df, [
                 "Total Debt",
                 "TotalDebt",
+                "Total Debt And Capital Lease Obligation",
+                "TotalDebtAndCapitalLeaseObligation",
             ])
         if result["longTermDebt"] is None:
             result["longTermDebt"] = _safe_statement_value(df, [
                 "Long Term Debt",
                 "LongTermDebt",
                 "Long Term Debt And Capital Lease Obligation",
+                "LongTermDebtAndCapitalLeaseObligation",
             ])
         if result["shortLongTermDebtTotal"] is None:
             result["shortLongTermDebtTotal"] = _safe_statement_value(df, [
                 "Current Debt",
                 "CurrentDebt",
                 "Current Debt And Capital Lease Obligation",
+                "CurrentDebtAndCapitalLeaseObligation",
                 "Short Long Term Debt",
                 "ShortLongTermDebt",
             ])
@@ -213,6 +268,8 @@ def _get_balance_sheet_fields(stock):
             result["totalDebtAndCapitalLeaseObligation"] = _safe_statement_value(df, [
                 "Total Debt And Capital Lease Obligation",
                 "TotalDebtAndCapitalLeaseObligation",
+                "Total Debt",
+                "TotalDebt",
             ])
         if result["totalEquity"] is None:
             result["totalEquity"] = _safe_statement_value(df, [
@@ -220,6 +277,12 @@ def _get_balance_sheet_fields(stock):
                 "StockholdersEquity",
                 "Total Equity Gross Minority Interest",
                 "TotalEquityGrossMinorityInterest",
+                "Common Stock Equity",
+                "CommonStockEquity",
+                "Total Stockholder Equity",
+                "TotalStockholderEquity",
+                "Total Stockholders Equity",
+                "TotalStockholdersEquity",
             ])
         if result["totalStockholdersEquity"] is None:
             result["totalStockholdersEquity"] = _safe_statement_value(df, [
@@ -227,6 +290,10 @@ def _get_balance_sheet_fields(stock):
                 "StockholdersEquity",
                 "Total Stockholder Equity",
                 "TotalStockholderEquity",
+                "Total Stockholders Equity",
+                "TotalStockholdersEquity",
+                "Common Stock Equity",
+                "CommonStockEquity",
             ])
 
     return result
@@ -991,20 +1058,40 @@ def run_harvester():
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
                         
                         if price:
-                            info_total_debt = info.get('totalDebt')
-                            info_long_term_debt = info.get('longTermDebt')
-                            info_short_long_debt = info.get('shortLongTermDebt')
-                            info_total_debt_lease = info.get('totalDebtAndCapitalLeaseObligation')
-                            info_total_equity = (
-                                info.get('totalEquity')
-                                or info.get('stockholdersEquity')
-                                or info.get('totalStockholderEquity')
-                            )
-                            info_total_stockholders_equity = (
-                                info.get('totalStockholdersEquity')
-                                or info.get('totalStockholderEquity')
-                                or info.get('stockholdersEquity')
-                            )
+                            info_total_debt = _first_present(info, [
+                                'totalDebt',
+                                'totalDebtAndCapitalLeaseObligation',
+                            ])
+                            info_long_term_debt = _first_present(info, [
+                                'longTermDebt',
+                                'longTermDebtAndCapitalLeaseObligation',
+                            ])
+                            info_short_long_debt = _first_present(info, [
+                                'shortLongTermDebt',
+                                'currentDebt',
+                                'currentDebtAndCapitalLeaseObligation',
+                            ])
+                            info_total_debt_lease = _first_present(info, [
+                                'totalDebtAndCapitalLeaseObligation',
+                                'totalDebt',
+                            ])
+                            info_total_equity = _first_present(info, [
+                                'totalEquity',
+                                'totalStockholdersEquity',
+                                'totalStockholderEquity',
+                                'stockholdersEquity',
+                                'commonStockEquity',
+                            ])
+                            info_total_stockholders_equity = _first_present(info, [
+                                'totalStockholdersEquity',
+                                'totalStockholderEquity',
+                                'stockholdersEquity',
+                                'commonStockEquity',
+                            ])
+                            info_peg_ratio = _first_present(info, [
+                                'pegRatio',
+                                'trailingPegRatio',
+                            ])
 
                             needs_balance_sheet = any(
                                 x is None or x == ''
@@ -1032,7 +1119,7 @@ def run_harvester():
                                 "per": info.get('trailingPE'),
                                 "pbr": info.get('priceToBook'),
                                 "psr": info.get('priceToSalesTrailing12Months'),
-                                "pegRatio": info.get('pegRatio'),
+                                "pegRatio": info_peg_ratio,
                                 "targetMeanPrice": info.get('targetMeanPrice'),
                                 "roe": info.get('returnOnEquity'),
                                 "roa": info.get('returnOnAssets'),
