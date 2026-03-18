@@ -29,20 +29,27 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
 
-STANDARD_KEYS = [
+# Raw-first policy:
+# 1) Collect source fields directly whenever possible.
+# 2) Avoid deriving core financial fields from unrelated proxies at collection time.
+CORE_REQUIRED_KEYS = [
     "symbol", "name", "price", "currency", "marketCap", "updated", "Hist",
     "per", "pbr", "psr", "pegRatio", "targetMeanPrice",
     "roe", "roa", "eps", "operatingMargins", "debtToEquity",
-    # Balance-sheet absolute debt/equity fields (for ROIC accuracy and safer fallback logic)
     "totalDebt", "longTermDebt", "shortLongTermDebtTotal",
     "totalDebtAndCapitalLeaseObligation", "totalEquity", "totalStockholdersEquity",
     "revenueGrowth", "operatingCashflow",
     "dividendRate", "dividendYield",
     "volume", "beta", "heldPercentInstitutions", "shortRatio",
-    "fiftyDayAverage", "twoHundredDayAverage", 
+    "fiftyDayAverage", "twoHundredDayAverage",
     "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
     "sector", "industry"
 ]
+
+# Extendable bucket for future additions without destabilizing core pipeline.
+EXTENDED_OPTIONAL_KEYS = []
+
+STANDARD_KEYS = CORE_REQUIRED_KEYS + EXTENDED_OPTIONAL_KEYS
 
 BENCHMARK_SPECS = [
     {"source": "^GSPC", "alias": "SP500_INDEX"},
@@ -120,6 +127,23 @@ def upload_json(filename, data, parent_id):
         except Exception as e:
             print(f"   ⚠️ 실패 ({attempt+1}/3): {str(e)}")
             time.sleep(3)
+
+def summarize_key_coverage(records, keys):
+    total = len(records)
+    summary = {}
+    for key in keys:
+        missing = 0
+        for rec in records.values():
+            if not isinstance(rec, dict):
+                missing += 1
+                continue
+            value = rec.get(key)
+            if value is None or value == '':
+                missing += 1
+        present = total - missing
+        coverage_pct = round((present / total) * 100, 1) if total > 0 else 0.0
+        summary[key] = {"present": present, "missing": missing, "coveragePct": coverage_pct}
+    return summary
 
 def get_dispatch_trigger_file():
     if not GITHUB_EVENT_PATH:
@@ -904,10 +928,7 @@ def run_harvester():
                                 "totalDebt": info.get('totalDebt'),
                                 "longTermDebt": info.get('longTermDebt'),
                                 "shortLongTermDebtTotal": info.get('shortLongTermDebt'),
-                                "totalDebtAndCapitalLeaseObligation": (
-                                    info.get('totalDebtAndCapitalLeaseObligation')
-                                    or info.get('totalDebt')
-                                ),
+                                "totalDebtAndCapitalLeaseObligation": info.get('totalDebtAndCapitalLeaseObligation'),
                                 "totalEquity": (
                                     info.get('totalEquity')
                                     or info.get('stockholdersEquity')
@@ -917,7 +938,6 @@ def run_harvester():
                                     info.get('totalStockholdersEquity')
                                     or info.get('totalStockholderEquity')
                                     or info.get('stockholdersEquity')
-                                    or info.get('totalEquity')
                                 ),
                                 "revenueGrowth": info.get('revenueGrowth'),
                                 "operatingCashflow": info.get('operatingCashflow'),
@@ -955,6 +975,17 @@ def run_harvester():
                 
                 if not success_flag:
                     g_error += 1
+
+            # Core key coverage sanity summary (raw-first policy visibility)
+            group_records = {t: daily_data.get(t, {}) for t in group_tickers.keys()}
+            coverage = summarize_key_coverage(group_records, CORE_REQUIRED_KEYS)
+            weak_keys = sorted(
+                [(k, v["coveragePct"]) for k, v in coverage.items() if v["coveragePct"] < 80],
+                key=lambda x: x[1]
+            )
+            if weak_keys:
+                preview = ", ".join([f"{k}:{pct}%" for k, pct in weak_keys[:5]])
+                print(f"   ⚠️ [{group}] Core key coverage<80%: {preview}")
 
             # 데일리 데이터와 히스토리 데이터 모두 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
