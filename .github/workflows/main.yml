@@ -5,10 +5,10 @@ on:
   repository_dispatch:
     types: [stage3_completed]
     
-  # 정기 스케줄 (KST 기준 오전 7시, 오전 10시 등)
+  # 정기 스케줄 (KST 기준 1차 07:00, 2차 12:00)
   schedule:
     - cron: '0 22 * * 1-5'
-    - cron: '0 1 * * 2-6'
+    - cron: '0 3 * * 2-6'
     
   workflow_dispatch: # 수동 실행 버튼
   
