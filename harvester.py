@@ -324,6 +324,140 @@ def _get_balance_sheet_fields(stock):
 
     return result
 
+def _normalize_period_label(value):
+    """Normalize yfinance period labels to YYYY-MM-DD."""
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    text = str(value)
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+    return m.group(1) if m else text
+
+def _get_statement_df(stock, attr_name, method_name, freq):
+    """Prefer attribute access, then fallback to method-based yfinance API."""
+    try:
+        df = getattr(stock, attr_name)
+        if df is not None and not getattr(df, "empty", True):
+            return df
+    except Exception:
+        pass
+
+    method = getattr(stock, method_name, None)
+    if not callable(method):
+        return None
+
+    for kwargs in ({"freq": freq, "pretty": True}, {"freq": freq}):
+        try:
+            df = method(**kwargs)
+            if df is not None and not getattr(df, "empty", True):
+                return df
+        except Exception:
+            continue
+    return None
+
+def _merge_statement_df(rows_map, df, period_type, statement_tag):
+    """Merge statement dataframe into period-keyed rows."""
+    if df is None or getattr(df, "empty", True):
+        return
+    try:
+        for col in getattr(df, "columns", []):
+            date_key = _normalize_period_label(col)
+            if not date_key:
+                continue
+            map_key = f"{period_type}:{date_key}"
+            row = rows_map.setdefault(map_key, {
+                "date": date_key,
+                "_periodType": period_type,
+                "_sources": []
+            })
+            if statement_tag not in row["_sources"]:
+                row["_sources"].append(statement_tag)
+
+            for idx in getattr(df, "index", []):
+                try:
+                    val = _to_finite_float(df.at[idx, col])
+                except Exception:
+                    val = None
+                if val is None:
+                    continue
+                row[str(idx)] = val
+    except Exception:
+        return
+
+def _sort_financial_rows(rows):
+    """Sort by date descending, prefer quarterly when same date exists."""
+    def _key(row):
+        date_key = str(row.get("date", ""))
+        period_weight = 1 if row.get("_periodType") == "QUARTERLY" else 0
+        return (date_key, period_weight)
+    return sorted(rows, key=_key, reverse=True)
+
+def _build_financial_history_payload(stock, updated_at):
+    """
+    Build 5-year financial history payload (quarterly + annual, multi-statement).
+    Output is compatible with Stage 3/Stage 2 consumers via `financials` array.
+    """
+    rows_map = {}
+    statement_specs = [
+        ("quarterly_financials", "get_income_stmt", "quarterly", "QUARTERLY", "INCOME"),
+        ("financials", "get_income_stmt", "yearly", "ANNUAL", "INCOME"),
+        ("quarterly_balance_sheet", "get_balance_sheet", "quarterly", "QUARTERLY", "BALANCE"),
+        ("balance_sheet", "get_balance_sheet", "yearly", "ANNUAL", "BALANCE"),
+        ("quarterly_cashflow", "get_cash_flow", "quarterly", "QUARTERLY", "CASHFLOW"),
+        ("cashflow", "get_cash_flow", "yearly", "ANNUAL", "CASHFLOW"),
+    ]
+
+    for attr_name, method_name, freq, period_type, statement_tag in statement_specs:
+        df = _get_statement_df(stock, attr_name, method_name, freq)
+        _merge_statement_df(rows_map, df, period_type, statement_tag)
+
+    if not rows_map:
+        return None
+
+    merged_rows = _sort_financial_rows(list(rows_map.values()))
+    quarterly_rows = [r for r in merged_rows if r.get("_periodType") == "QUARTERLY"][:20]
+    annual_rows = [r for r in merged_rows if r.get("_periodType") == "ANNUAL"][:5]
+    financials = _sort_financial_rows(quarterly_rows + annual_rows)
+
+    return {
+        "financials": financials,
+        "quarterlyFinancials": quarterly_rows,
+        "annualFinancials": annual_rows,
+        "_meta": {
+            "schemaVersion": "v2_5y_multi_statement",
+            "quarterlyCount": len(quarterly_rows),
+            "annualCount": len(annual_rows),
+            "totalPeriods": len(financials),
+            "updatedAt": updated_at
+        }
+    }
+
+def _history_has_financials(entry):
+    if isinstance(entry, dict):
+        f = entry.get("financials")
+        if isinstance(f, list) and len(f) > 0:
+            return True
+        # Legacy shape: { "2025-12-31 ...": {...}, ... }
+        if any(isinstance(v, dict) for v in entry.values()):
+            return True
+    elif isinstance(entry, list) and len(entry) > 0:
+        return True
+    return False
+
+def _needs_financial_history_refresh(entry):
+    """Refresh when payload is missing/legacy/non-5Y schema."""
+    if not isinstance(entry, dict):
+        return True
+    meta = entry.get("_meta") if isinstance(entry.get("_meta"), dict) else {}
+    schema = str(meta.get("schemaVersion") or "")
+    if schema == "v2_5y_multi_statement" and isinstance(entry.get("financials"), list):
+        return False
+    return True
+
 def get_dispatch_trigger_file():
     if not GITHUB_EVENT_PATH:
         return None
@@ -1074,17 +1208,23 @@ def run_harvester():
                         time.sleep(random.uniform(1.3, 1.8))
                         stock = yf.Ticker(ticker)
                         
-                        # [중요 보완] 히스토리(재무제표) 데이터 수집 로직 복구
+                        # [중요 보완] 5Y financial history (income/balance/cashflow, quarterly+annual)
                         prev_hist = daily_data.get(ticker, {}).get('Hist')
                         hist_status = prev_hist if prev_hist in ('✅', '❌') else '❌'
-                        if hist_status == '❌' or is_weekend_update:
+                        existing_hist_entry = hist_data.get(ticker)
+                        history_refresh_required = _needs_financial_history_refresh(existing_hist_entry)
+                        if hist_status == '❌' or is_weekend_update or history_refresh_required:
                             try:
-                                f_data = stock.quarterly_financials
-                                if not f_data.empty:
-                                    hist_data[ticker] = {str(k): v for k, v in f_data.to_dict().items()}
+                                history_payload = _build_financial_history_payload(stock, today_str)
+                                if history_payload and history_payload.get("financials"):
+                                    hist_data[ticker] = history_payload
                                     hist_status = '✅'
+                                elif hist_status != '✅':
+                                    hist_status = '❌'
                             except Exception as e:
                                 print(f"⚠️ 재무제표 수집 실패 [{ticker}]: {type(e).__name__}: {e}", flush=True)
+                                if hist_status != '✅' and not _history_has_financials(existing_hist_entry):
+                                    hist_status = '❌'
 
                         info = stock.info
                         price = info.get('currentPrice') or info.get('regularMarketPrice')
