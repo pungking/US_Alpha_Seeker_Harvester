@@ -9,6 +9,7 @@ import random
 import sys
 import re
 import math
+import ssl
 import traceback
 import yfinance as yf
 from google.oauth2.credentials import Credentials
@@ -80,6 +81,42 @@ def get_drive_service():
 
 drive_service = get_drive_service()
 
+DRIVE_RETRY_ATTEMPTS = 3
+DRIVE_BACKOFF_BASE_SEC = 1.5
+
+
+def _extract_http_status(exc):
+    return getattr(getattr(exc, "resp", None), "status", None)
+
+
+def _is_transient_drive_error(exc):
+    if isinstance(exc, HttpError):
+        status = _extract_http_status(exc)
+        return status in (429, 500, 502, 503, 504)
+
+    if isinstance(exc, (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError)):
+        return True
+
+    if isinstance(exc, (TimeoutError, ConnectionResetError, ConnectionAbortedError, ssl.SSLEOFError)):
+        return True
+
+    error_name = type(exc).__name__
+    error_msg = str(exc).lower()
+    return ("ssleoferror" in error_name.lower()) or ("eof occurred in violation of protocol" in error_msg)
+
+
+def _retry_backoff_sleep(attempt):
+    base = DRIVE_BACKOFF_BASE_SEC * (2 ** attempt)
+    delay_sec = base + random.uniform(0.0, 0.5)
+    time.sleep(delay_sec)
+    return delay_sec
+
+
+def _rebuild_drive_service(context):
+    global drive_service
+    drive_service = get_drive_service()
+    print(f"🔁 Drive client 재연결 완료 ({context})", flush=True)
+
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -95,26 +132,50 @@ def send_telegram(message):
 def find_file_id(name, parent_id=None):
     query = f"name = '{name}' and trashed = false"
     if parent_id: query += f" and '{parent_id}' in parents"
-    
-    for attempt in range(3): # 🎯 3번 재시도 (네트워크 지연으로 인한 중복 파일 생성 완벽 방지)
+
+    last_error = None
+    for attempt in range(DRIVE_RETRY_ATTEMPTS): # 🎯 3번 재시도 (네트워크 지연으로 인한 중복 파일 생성 완벽 방지)
         try:
             results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
             return results[0]['id'] if results else None
         except HttpError as e:
-            status = getattr(getattr(e, "resp", None), "status", None)
+            status = _extract_http_status(e)
             if status in (401, 403):
                 print(f"⛔ Drive API 인증 오류(find_file_id:{name}): {status} {e}", flush=True)
                 raise
-            print(f"⚠️ Drive 파일 조회 실패(find_file_id:{name}) [{attempt + 1}/3]: {status} {e}", flush=True)
-            time.sleep(2)
+            last_error = e
+            if _is_transient_drive_error(e):
+                if attempt < DRIVE_RETRY_ATTEMPTS - 1:
+                    print(f"⚠️ Drive 파일 조회 실패(find_file_id:{name}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}] transient={status}", flush=True)
+                    _rebuild_drive_service(f"find_file_id:{name}")
+                    slept = _retry_backoff_sleep(attempt)
+                    print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
+                    continue
+                break
+            print(f"⛔ Drive 파일 조회 비재시도 오류(find_file_id:{name}): {status} {e}", flush=True)
+            raise
         except Exception as e:
-            print(f"⚠️ Drive 파일 조회 예외(find_file_id:{name}) [{attempt + 1}/3]: {type(e).__name__}: {e}", flush=True)
-            time.sleep(2)
-    return None
+            last_error = e
+            if _is_transient_drive_error(e):
+                if attempt < DRIVE_RETRY_ATTEMPTS - 1:
+                    print(f"⚠️ Drive 파일 조회 예외(find_file_id:{name}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}]: {type(e).__name__}: {e}", flush=True)
+                    _rebuild_drive_service(f"find_file_id:{name}")
+                    slept = _retry_backoff_sleep(attempt)
+                    print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
+                    continue
+                break
+            print(f"⛔ Drive 파일 조회 비재시도 예외(find_file_id:{name}): {type(e).__name__}: {e}", flush=True)
+            raise
+
+    raise RuntimeError(
+        f"Drive 파일 조회 최종 실패(find_file_id:{name}, parent={parent_id}) "
+        f"after {DRIVE_RETRY_ATTEMPTS} attempts: {type(last_error).__name__ if last_error else 'Unknown'}: {last_error}"
+    )
 
 def download_json(file_id):
     if not file_id: return None # 반환값을 None으로 명확히 하여 메인 로직에서 타입 캐스팅 유도
-    for attempt in range(3): # 다운로드도 3번 재시도
+    last_error = None
+    for attempt in range(DRIVE_RETRY_ATTEMPTS): # 다운로드도 3번 재시도
         try:
             request = drive_service.files().get_media(fileId=file_id)
             fh = io.BytesIO()
@@ -126,20 +187,43 @@ def download_json(file_id):
             print(f"⚠️ JSON 파싱 오류(download_json:{file_id}): {e}", flush=True)
             return None
         except HttpError as e:
-            status = getattr(getattr(e, "resp", None), "status", None)
+            status = _extract_http_status(e)
             if status in (401, 403):
                 print(f"⛔ Drive API 인증 오류(download_json:{file_id}): {status} {e}", flush=True)
                 raise
-            print(f"⚠️ Drive 다운로드 실패(download_json:{file_id}) [{attempt + 1}/3]: {status} {e}", flush=True)
-            time.sleep(2)
+            last_error = e
+            if _is_transient_drive_error(e):
+                if attempt < DRIVE_RETRY_ATTEMPTS - 1:
+                    print(f"⚠️ Drive 다운로드 실패(download_json:{file_id}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}] transient={status}", flush=True)
+                    _rebuild_drive_service(f"download_json:{file_id}")
+                    slept = _retry_backoff_sleep(attempt)
+                    print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
+                    continue
+                break
+            print(f"⛔ Drive 다운로드 비재시도 오류(download_json:{file_id}): {status} {e}", flush=True)
+            raise
         except Exception as e:
-            print(f"⚠️ 다운로드 예외(download_json:{file_id}) [{attempt + 1}/3]: {type(e).__name__}: {e}", flush=True)
-            time.sleep(2)
-    return None
+            last_error = e
+            if _is_transient_drive_error(e):
+                if attempt < DRIVE_RETRY_ATTEMPTS - 1:
+                    print(f"⚠️ 다운로드 예외(download_json:{file_id}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}]: {type(e).__name__}: {e}", flush=True)
+                    _rebuild_drive_service(f"download_json:{file_id}")
+                    slept = _retry_backoff_sleep(attempt)
+                    print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
+                    continue
+                break
+            print(f"⛔ 다운로드 비재시도 예외(download_json:{file_id}): {type(e).__name__}: {e}", flush=True)
+            raise
+
+    raise RuntimeError(
+        f"Drive 다운로드 최종 실패(download_json:{file_id}) "
+        f"after {DRIVE_RETRY_ATTEMPTS} attempts: {type(last_error).__name__ if last_error else 'Unknown'}: {last_error}"
+    )
 
 def upload_json(filename, data, parent_id):
     print(f"📤 업로드 시도: {filename}...")
-    for attempt in range(3): # 🎯 업로드 중 끊김 방지
+    last_error = None
+    for attempt in range(DRIVE_RETRY_ATTEMPTS): # 🎯 업로드 중 끊김 방지
         try:
             file_id = find_file_id(filename, parent_id)
             fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
@@ -152,9 +236,33 @@ def upload_json(filename, data, parent_id):
                 drive_service.files().create(body=meta, media_body=media).execute()
             print(f"✅ 완료: {filename}")
             return # 성공하면 함수 깔끔하게 종료
+        except HttpError as e:
+            status = _extract_http_status(e)
+            if status in (401, 403):
+                print(f"⛔ Drive API 인증 오류(upload_json:{filename}): {status} {e}", flush=True)
+                raise
+            last_error = e
+            if _is_transient_drive_error(e) and attempt < DRIVE_RETRY_ATTEMPTS - 1:
+                print(f"   ⚠️ 업로드 실패(upload_json:{filename}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}] transient={status}", flush=True)
+                _rebuild_drive_service(f"upload_json:{filename}")
+                slept = _retry_backoff_sleep(attempt)
+                print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
+                continue
+            break
         except Exception as e:
-            print(f"   ⚠️ 실패 ({attempt+1}/3): {str(e)}")
-            time.sleep(3)
+            last_error = e
+            if _is_transient_drive_error(e) and attempt < DRIVE_RETRY_ATTEMPTS - 1:
+                print(f"   ⚠️ 업로드 예외(upload_json:{filename}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}]: {type(e).__name__}: {e}", flush=True)
+                _rebuild_drive_service(f"upload_json:{filename}")
+                slept = _retry_backoff_sleep(attempt)
+                print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
+                continue
+            break
+
+    raise RuntimeError(
+        f"Drive 업로드 최종 실패(upload_json:{filename}, parent={parent_id}) "
+        f"after {DRIVE_RETRY_ATTEMPTS} attempts: {type(last_error).__name__ if last_error else 'Unknown'}: {last_error}"
+    )
 
 def summarize_key_coverage(records, keys):
     total = len(records)
@@ -1367,6 +1475,9 @@ def run_harvester():
 
     except Exception as e:
         send_telegram(f"🚨 *에러 발생:* `{str(e)}` ")
+        print(f"⛔ run_harvester fatal: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        raise
 
 if __name__ == "__main__":
     run_harvester()
