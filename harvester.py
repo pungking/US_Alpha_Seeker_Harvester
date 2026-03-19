@@ -84,6 +84,20 @@ drive_service = get_drive_service()
 DRIVE_RETRY_ATTEMPTS = 3
 DRIVE_BACKOFF_BASE_SEC = 1.5
 
+# Daily split optimization (balanced runtime)
+DAILY_BATCH_FIRST_LABEL = "1차 (A-K)"
+DAILY_BATCH_SECOND_LABEL = "2차 (L-Z & 기타)"
+DAILY_BATCH_FIRST_CHARS = "ABCDEFGHIJK"
+DAILY_BATCH_SECOND_CHARS = "LMNOPQRSTUVWXYZ0123456789"
+
+# OHLCV retention policy for 5Y seasonality consumers
+OHLCV_INITIAL_PERIOD = os.getenv("OHLCV_INITIAL_PERIOD", "5y")
+OHLCV_INCREMENTAL_PERIOD = os.getenv("OHLCV_INCREMENTAL_PERIOD", "7d")
+try:
+    OHLCV_MAX_BARS = max(300, int(os.getenv("OHLCV_MAX_BARS", "1300")))
+except Exception:
+    OHLCV_MAX_BARS = 1300
+
 
 def _extract_http_status(exc):
     return getattr(getattr(exc, "resp", None), "status", None)
@@ -665,8 +679,8 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
 
     try:
         stock = yf.Ticker(source_symbol)
-        # 데이터가 없으면 2년(2y), 있으면 최근 7일(7d)만
-        period = "7d" if existing_data else "2y"
+        # 데이터가 없으면 5년(5y), 있으면 최근 7일(7d)만
+        period = OHLCV_INCREMENTAL_PERIOD if existing_data else OHLCV_INITIAL_PERIOD
         df = stock.history(period=period, interval="1d")
 
         if df.empty:
@@ -687,8 +701,8 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
 
         # 날짜 기준 중복 제거 및 합치기
         combined = {item["date"]: item for item in (existing_data + new_recs)}
-        # 최신 2년치(약 500거래일) 데이터만 유지하여 파일 크기 관리
-        final_list = sorted(combined.values(), key=lambda x: x["date"])[-500:]
+        # 최신 5년치(약 1,260거래일) 데이터 유지 (seasonality / regime 지표용)
+        final_list = sorted(combined.values(), key=lambda x: x["date"])[-OHLCV_MAX_BARS:]
         final_list, removed_tail = trim_zero_volume_flat_tail(final_list)
         if removed_tail > 0:
             print(f"🧹 {file_name}: zero-volume flat tail {removed_tail}건 제거")
@@ -1198,7 +1212,7 @@ def run_harvester():
                     
                     if s3_tickers:
                         total_count = len(s3_tickers)
-                        send_telegram(f"🚀 *수집 시작:* `{total_count}`종목 (2년치)")
+                        send_telegram(f"🚀 *수집 시작:* `{total_count}`종목 (OHLCV {OHLCV_INITIAL_PERIOD})")
                         
                         update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING", current_trigger_file)
 
@@ -1278,9 +1292,9 @@ def run_harvester():
         
         current_hour = now_kst.hour
         if 6 <= current_hour <= 11:
-            group_label, target_chars = "1차 (A-M)", "ABCDEFGHIJKLM"
+            group_label, target_chars = DAILY_BATCH_FIRST_LABEL, DAILY_BATCH_FIRST_CHARS
         else:
-            group_label, target_chars = "2차 (N-Z & 기타)", "NOPQRSTUVWXYZ0123456789"
+            group_label, target_chars = DAILY_BATCH_SECOND_LABEL, DAILY_BATCH_SECOND_CHARS
 
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         
