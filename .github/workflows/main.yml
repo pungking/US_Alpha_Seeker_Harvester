@@ -11,6 +11,17 @@ on:
     - cron: '0 3 * * 2-6'
     
   workflow_dispatch: # 수동 실행 버튼
+    inputs:
+      batch_mode:
+        description: "데일리 수집 배치 선택 (수동 실행 전용)"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - first
+          - second
+          - all
   
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -43,4 +54,5 @@ jobs:
           
           # 🎯 파이썬 코드가 웹앱 신호인지 스케줄 실행인지 판단하는 핵심 변수
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+          DAILY_BATCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_mode || 'auto' }}
         run: python harvester.py
