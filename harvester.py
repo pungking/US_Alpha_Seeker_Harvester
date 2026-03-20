@@ -1259,7 +1259,11 @@ def run_harvester():
                             regime_snapshot = build_market_regime_snapshot(current_trigger_file, today_str, s3_tickers, ohlcv_dir_id)
                             upload_json(MARKET_REGIME_FILENAME, regime_snapshot, sys_id)
                             market_regime_ready = True
-                            print(f"🧭 시장 국면 스냅샷 완료: {regime_snapshot.get('regime', {}).get('state', 'UNKNOWN')} ({regime_snapshot.get('regime', {}).get('score', 0)})")
+                            print(
+                                f"🧭 시장 국면 스냅샷 완료: "
+                                f"{regime_snapshot.get('regime', {}).get('state', 'UNKNOWN')} "
+                                f"(score={regime_snapshot.get('regime', {}).get('score', 0)})"
+                            )
                         except Exception as e:
                             print(f"⚠️ 시장 국면 스냅샷 생성 실패: {str(e)}")
 
