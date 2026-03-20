@@ -33,6 +33,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
+DAILY_BATCH_MODE = (os.getenv('DAILY_BATCH_MODE') or 'auto').strip().lower()
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -100,8 +101,10 @@ DRIVE_BACKOFF_BASE_SEC = 1.5
 # Daily split optimization (balanced runtime)
 DAILY_BATCH_FIRST_LABEL = "1차 (A-K)"
 DAILY_BATCH_SECOND_LABEL = "2차 (L-Z & 기타)"
+DAILY_BATCH_ALL_LABEL = "전체 (A-Z & 기타)"
 DAILY_BATCH_FIRST_CHARS = "ABCDEFGHIJK"
 DAILY_BATCH_SECOND_CHARS = "LMNOPQRSTUVWXYZ0123456789"
+DAILY_BATCH_ALL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 # OHLCV retention policy for 5Y seasonality consumers
 OHLCV_INITIAL_PERIOD = os.getenv("OHLCV_INITIAL_PERIOD", "5y")
@@ -143,6 +146,22 @@ def _rebuild_drive_service(context):
     global drive_service
     drive_service = get_drive_service()
     print(f"🔁 Drive client 재연결 완료 ({context})", flush=True)
+
+
+def resolve_daily_batch(now_kst):
+    mode = DAILY_BATCH_MODE
+    # workflow_dispatch 테스트 모드: 강제 1차/2차/전체 선택
+    if mode in ("first", "1", "phase1", "batch1"):
+        return DAILY_BATCH_FIRST_LABEL, DAILY_BATCH_FIRST_CHARS, "manual:first"
+    if mode in ("second", "2", "phase2", "batch2"):
+        return DAILY_BATCH_SECOND_LABEL, DAILY_BATCH_SECOND_CHARS, "manual:second"
+    if mode in ("all", "full", "both"):
+        return DAILY_BATCH_ALL_LABEL, DAILY_BATCH_ALL_CHARS, "manual:all"
+    # 기본: 기존 로직 유지 (KST 시간대에 따른 자동 분할)
+    current_hour = now_kst.hour
+    if 6 <= current_hour <= 11:
+        return DAILY_BATCH_FIRST_LABEL, DAILY_BATCH_FIRST_CHARS, "auto:hour_window_first"
+    return DAILY_BATCH_SECOND_LABEL, DAILY_BATCH_SECOND_CHARS, "auto:hour_window_second"
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1397,12 +1416,8 @@ def run_harvester():
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
         hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
-        
-        current_hour = now_kst.hour
-        if 6 <= current_hour <= 11:
-            group_label, target_chars = DAILY_BATCH_FIRST_LABEL, DAILY_BATCH_FIRST_CHARS
-        else:
-            group_label, target_chars = DAILY_BATCH_SECOND_LABEL, DAILY_BATCH_SECOND_CHARS
+        group_label, target_chars, batch_mode_source = resolve_daily_batch(now_kst)
+        print(f"🧩 데일리 배치 선택: {group_label} (mode={batch_mode_source})")
 
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
         
@@ -1412,7 +1427,11 @@ def run_harvester():
             
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
 
-        send_telegram(f"📡 *[Daily] 본계정 가동*\n🎯 *타겟:* `{group_label}` | `{len(filtered_tickers)}`종목")
+        send_telegram(
+            f"📡 *[Daily] 본계정 가동*\n"
+            f"🎯 *타겟:* `{group_label}` | `{len(filtered_tickers)}`종목\n"
+            f"🧩 mode: `{batch_mode_source}`"
+        )
 
         groups = sorted(list(set(info['group'] for info in filtered_tickers.values())))
 
