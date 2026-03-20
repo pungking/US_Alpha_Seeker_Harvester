@@ -52,7 +52,20 @@ CORE_REQUIRED_KEYS = [
 ]
 
 # Extendable bucket for future additions without destabilizing core pipeline.
-EXTENDED_OPTIONAL_KEYS = []
+# H11 prep: Distress-model inputs (Altman Z + financial safety model)
+# Keep these optional first to avoid destabilizing existing coverage alarms.
+DISTRESS_OPTIONAL_KEYS = [
+    "totalAssets",
+    "totalLiabilities",
+    "currentAssets",
+    "currentLiabilities",
+    "workingCapital",
+    "retainedEarnings",
+    "ebit",
+    "totalRevenue",
+]
+
+EXTENDED_OPTIONAL_KEYS = DISTRESS_OPTIONAL_KEYS[:]
 
 STANDARD_KEYS = CORE_REQUIRED_KEYS + EXTENDED_OPTIONAL_KEYS
 
@@ -442,6 +455,97 @@ def _get_balance_sheet_fields(stock):
                 "TotalStockholdersEquity",
                 "Common Stock Equity",
                 "CommonStockEquity",
+            ])
+
+    return result
+
+def _get_distress_statement_fields(stock):
+    """
+    Collect statement-level raw inputs required for Altman-style distress models.
+    Raw-first: no proxy derivation except workingCapital=currentAssets-currentLiabilities.
+    """
+    result = {
+        "totalAssets": None,
+        "totalLiabilities": None,
+        "currentAssets": None,
+        "currentLiabilities": None,
+        "retainedEarnings": None,
+        "ebit": None,
+        "totalRevenue": None,
+    }
+
+    # Balance Sheet fields
+    bs_frames = []
+    for attr_name, method_name, freq in (
+        ("quarterly_balance_sheet", "get_balance_sheet", "quarterly"),
+        ("balance_sheet", "get_balance_sheet", "yearly"),
+    ):
+        df = _get_statement_df(stock, attr_name, method_name, freq)
+        if df is not None and not getattr(df, "empty", True):
+            bs_frames.append(df)
+
+    for df in bs_frames:
+        if result["totalAssets"] is None:
+            result["totalAssets"] = _safe_statement_value(df, [
+                "Total Assets",
+                "TotalAssets",
+            ])
+        if result["totalLiabilities"] is None:
+            result["totalLiabilities"] = _safe_statement_value(df, [
+                "Total Liabilities Net Minority Interest",
+                "TotalLiabilitiesNetMinorityInterest",
+                "Total Liabilities",
+                "TotalLiabilities",
+                "Total Liab",
+                "TotalLiab",
+            ])
+        if result["currentAssets"] is None:
+            result["currentAssets"] = _safe_statement_value(df, [
+                "Current Assets",
+                "CurrentAssets",
+                "Total Current Assets",
+                "TotalCurrentAssets",
+            ])
+        if result["currentLiabilities"] is None:
+            result["currentLiabilities"] = _safe_statement_value(df, [
+                "Current Liabilities",
+                "CurrentLiabilities",
+                "Total Current Liabilities",
+                "TotalCurrentLiabilities",
+            ])
+        if result["retainedEarnings"] is None:
+            result["retainedEarnings"] = _safe_statement_value(df, [
+                "Retained Earnings",
+                "RetainedEarnings",
+            ])
+
+    # Income Statement fields
+    is_frames = []
+    for attr_name, method_name, freq in (
+        ("quarterly_financials", "get_income_stmt", "quarterly"),
+        ("financials", "get_income_stmt", "yearly"),
+    ):
+        df = _get_statement_df(stock, attr_name, method_name, freq)
+        if df is not None and not getattr(df, "empty", True):
+            is_frames.append(df)
+
+    for df in is_frames:
+        if result["ebit"] is None:
+            result["ebit"] = _safe_statement_value(df, [
+                "EBIT",
+                "Ebit",
+                "Operating Income",
+                "Operating Income Loss",
+                "OperatingIncome",
+            ])
+        if result["totalRevenue"] is None:
+            result["totalRevenue"] = _safe_statement_value(df, [
+                "Total Revenue",
+                "TotalRevenue",
+                "Revenue",
+                "Operating Revenue",
+                "Net Sales",
+                "Sales",
             ])
 
     return result
@@ -1386,6 +1490,31 @@ def run_harvester():
                                 'stockholdersEquity',
                                 'commonStockEquity',
                             ])
+                            info_total_assets = _first_present(info, [
+                                'totalAssets',
+                            ])
+                            info_total_liabilities = _first_present(info, [
+                                'totalLiabilitiesNetMinorityInterest',
+                                'totalLiabilities',
+                                'totalLiab',
+                            ])
+                            info_current_assets = _first_present(info, [
+                                'currentAssets',
+                            ])
+                            info_current_liabilities = _first_present(info, [
+                                'currentLiabilities',
+                            ])
+                            info_retained_earnings = _first_present(info, [
+                                'retainedEarnings',
+                            ])
+                            info_ebit = _first_present(info, [
+                                'ebit',
+                                'operatingIncome',
+                            ])
+                            info_total_revenue = _first_present(info, [
+                                'totalRevenue',
+                                'revenue',
+                            ])
                             info_peg_ratio = _first_present(info, [
                                 'pegRatio',
                                 'trailingPegRatio',
@@ -1402,7 +1531,27 @@ def run_harvester():
                                     info_total_stockholders_equity,
                                 ]
                             )
+                            needs_distress_fields = any(
+                                x is None or x == ''
+                                for x in [
+                                    info_total_assets,
+                                    info_total_liabilities,
+                                    info_current_assets,
+                                    info_current_liabilities,
+                                    info_retained_earnings,
+                                    info_ebit,
+                                    info_total_revenue,
+                                ]
+                            )
                             bs_fields = _get_balance_sheet_fields(stock) if needs_balance_sheet else {}
+                            distress_fields = _get_distress_statement_fields(stock) if needs_distress_fields else {}
+                            current_assets_raw = info_current_assets if info_current_assets not in (None, '') else distress_fields.get("currentAssets")
+                            current_liabilities_raw = info_current_liabilities if info_current_liabilities not in (None, '') else distress_fields.get("currentLiabilities")
+                            current_assets_num = _to_finite_float(current_assets_raw)
+                            current_liabilities_num = _to_finite_float(current_liabilities_raw)
+                            working_capital = None
+                            if current_assets_num is not None and current_liabilities_num is not None:
+                                working_capital = current_assets_num - current_liabilities_num
 
                             # [FIX] Restore legacy raw-record mapping so STANDARD_KEYS are filled with
                             # Yahoo source keys (trailingPE, priceToBook, returnOnEquity, etc).
@@ -1430,6 +1579,14 @@ def run_harvester():
                                 "totalDebtAndCapitalLeaseObligation": info_total_debt_lease if info_total_debt_lease not in (None, '') else bs_fields.get("totalDebtAndCapitalLeaseObligation"),
                                 "totalEquity": info_total_equity if info_total_equity not in (None, '') else bs_fields.get("totalEquity"),
                                 "totalStockholdersEquity": info_total_stockholders_equity if info_total_stockholders_equity not in (None, '') else bs_fields.get("totalStockholdersEquity"),
+                                "totalAssets": info_total_assets if info_total_assets not in (None, '') else distress_fields.get("totalAssets"),
+                                "totalLiabilities": info_total_liabilities if info_total_liabilities not in (None, '') else distress_fields.get("totalLiabilities"),
+                                "currentAssets": current_assets_raw,
+                                "currentLiabilities": current_liabilities_raw,
+                                "workingCapital": working_capital,
+                                "retainedEarnings": info_retained_earnings if info_retained_earnings not in (None, '') else distress_fields.get("retainedEarnings"),
+                                "ebit": info_ebit if info_ebit not in (None, '') else distress_fields.get("ebit"),
+                                "totalRevenue": info_total_revenue if info_total_revenue not in (None, '') else distress_fields.get("totalRevenue"),
                                 "revenueGrowth": info.get('revenueGrowth'),
                                 "operatingCashflow": info.get('operatingCashflow'),
                                 "dividendRate": info.get('dividendRate', 0),
@@ -1477,6 +1634,18 @@ def run_harvester():
             if weak_keys:
                 preview = ", ".join([f"{k}:{pct}%" for k, pct in weak_keys[:5]])
                 print(f"   ⚠️ [{group}] Core key coverage<80%: {preview}")
+
+            # Distress-model input coverage visibility (Altman + financial safety model prep)
+            distress_cov = summarize_key_coverage(group_records, DISTRESS_OPTIONAL_KEYS)
+            weak_distress = sorted(
+                [(k, v["coveragePct"]) for k, v in distress_cov.items() if v["coveragePct"] < 70],
+                key=lambda x: x[1]
+            )
+            if weak_distress:
+                preview = ", ".join([f"{k}:{pct}%" for k, pct in weak_distress[:8]])
+                print(f"   ⚠️ [{group}] Distress key coverage<70%: {preview}")
+            else:
+                print(f"   ✅ [{group}] Distress key coverage>=70% for all tracked fields")
 
             # 데일리 데이터와 히스토리 데이터 모두 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
