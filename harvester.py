@@ -79,6 +79,8 @@ RAW_FUNDAMENTAL_OPTIONAL_KEYS = [
 ]
 
 RAW_TRACE_OPTIONAL_KEYS = [
+    "instrumentType",
+    "analysisEligible",
     "quoteTimestamp",
     "quoteSource",
     "netIncomeSource",
@@ -368,6 +370,35 @@ def _first_present(mapping, keys):
 
 def _norm_label(value):
     return re.sub(r'[^a-z0-9]', '', str(value or '').lower())
+
+def _classify_instrument_type(symbol, name, quote_type=None):
+    s = str(symbol or '').strip().upper()
+    n = str(name or '').strip().lower()
+    q = str(quote_type or '').strip().upper()
+
+    if q == 'WARRANT' or s.endswith('.WS') or s.endswith('-WS') or s.endswith('WS') or ' warrant' in n:
+        return 'warrant'
+    if q == 'UNIT' or s.endswith('.U') or s.endswith('-U') or s.endswith('U') or ' unit' in n:
+        return 'unit'
+    if q == 'RIGHT' or s.endswith('.R') or s.endswith('-R') or s.endswith('R') or ' right' in n:
+        return 'right'
+
+    hybrid_keywords = [
+        'preferred',
+        'depositary',
+        'subordinat',
+        'capital security',
+        'notes',
+        'trust',
+        'etn',
+        'baby bond',
+    ]
+    if any(k in n for k in hybrid_keywords):
+        return 'hybrid'
+    if q in {'ETN', 'MUTUALFUND', 'PREFERRED', 'BOND', 'OPTION'}:
+        return 'hybrid'
+
+    return 'common'
 
 def _to_finite_float(value):
     if value is None:
@@ -1667,6 +1698,22 @@ def run_harvester():
                                 if info_net_income not in (None, '') or info_net_income_common not in (None, '')
                                 else ('HISTORY' if history_net_income is not None else 'MISSING')
                             )
+                            has_quote_payload = any(
+                                value not in (None, '')
+                                for value in [
+                                    info_previous_close,
+                                    info_regular_market_change,
+                                    info_regular_market_change_pct,
+                                    info_quote_timestamp
+                                ]
+                            )
+                            quote_source = 'YFINANCE_INFO' if has_quote_payload else 'MISSING'
+                            instrument_type = _classify_instrument_type(
+                                ticker,
+                                info.get('shortName') or info.get('longName'),
+                                info.get('quoteType')
+                            )
+                            analysis_eligible = instrument_type == 'common'
                             net_income_asof = (
                                 today_str
                                 if net_income_source == 'INFO'
@@ -1729,9 +1776,11 @@ def run_harvester():
                                 "netIncome": net_income_value,
                                 "netIncomeCommonStockholders": net_income_common_value,
                                 "quoteTimestamp": info_quote_timestamp,
-                                "quoteSource": "YFINANCE_INFO",
+                                "quoteSource": quote_source,
                                 "netIncomeSource": net_income_source,
                                 "netIncomeAsOf": net_income_asof,
+                                "instrumentType": instrument_type,
+                                "analysisEligible": analysis_eligible,
                                 "fiftyDayAverage": info.get('fiftyDayAverage'),
                                 "twoHundredDayAverage": info.get('twoHundredDayAverage'),
                                 "fiftyTwoWeekHigh": info.get('fiftyTwoWeekHigh'),
@@ -1797,6 +1846,23 @@ def run_harvester():
                     status = "REQUESTED_BUT_MISSING"
                 raw_status_preview.append(f"{key}:{status}({pct}%)")
             print(f"   🔎 [{group}] Raw request audit: {', '.join(raw_status_preview)}")
+
+            type_counts = {}
+            eligible_count = 0
+            for rec in group_records.values():
+                if not isinstance(rec, dict):
+                    continue
+                t = str(rec.get("instrumentType") or "unknown").strip().lower() or "unknown"
+                type_counts[t] = type_counts.get(t, 0) + 1
+                if bool(rec.get("analysisEligible")):
+                    eligible_count += 1
+            type_preview = ", ".join(
+                [f"{k}:{v}" for k, v in sorted(type_counts.items(), key=lambda x: x[0])]
+            ) or "none"
+            excluded_count = max(0, len(group_records) - eligible_count)
+            print(
+                f"   🧭 [{group}] Instrument profile: {type_preview} | eligible(common)={eligible_count} excluded={excluded_count}"
+            )
 
             # 데일리 데이터와 히스토리 데이터 모두 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
