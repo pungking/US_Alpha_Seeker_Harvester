@@ -66,9 +66,39 @@ DISTRESS_OPTIONAL_KEYS = [
     "totalRevenue",
 ]
 
-EXTENDED_OPTIONAL_KEYS = DISTRESS_OPTIONAL_KEYS[:]
+RAW_QUOTE_OPTIONAL_KEYS = [
+    "previousClose",
+    "regularMarketPreviousClose",
+    "regularMarketChange",
+    "regularMarketChangePercent",
+]
+
+RAW_FUNDAMENTAL_OPTIONAL_KEYS = [
+    "netIncome",
+    "netIncomeCommonStockholders",
+]
+
+RAW_TRACE_OPTIONAL_KEYS = [
+    "quoteTimestamp",
+    "quoteSource",
+    "netIncomeSource",
+    "netIncomeAsOf",
+]
+
+EXTENDED_OPTIONAL_KEYS = (
+    DISTRESS_OPTIONAL_KEYS[:]
+    + RAW_QUOTE_OPTIONAL_KEYS
+    + RAW_FUNDAMENTAL_OPTIONAL_KEYS
+    + RAW_TRACE_OPTIONAL_KEYS
+)
 
 STANDARD_KEYS = CORE_REQUIRED_KEYS + EXTENDED_OPTIONAL_KEYS
+
+FIN_HISTORY_NET_INCOME_KEYS = [
+    "Net Income",
+    "Net Income Common Stockholders",
+    "Net Income Including Noncontrolling Interests",
+]
 
 BENCHMARK_SPECS = [
     {"source": "^GSPC", "alias": "SP500_INDEX"},
@@ -702,6 +732,39 @@ def _needs_financial_history_refresh(entry):
     if schema == "v2_5y_multi_statement" and isinstance(entry.get("financials"), list):
         return False
     return True
+
+def _history_rows_from_entry(entry):
+    if not isinstance(entry, dict):
+        return []
+    if isinstance(entry.get("financials"), list):
+        return entry.get("financials") or []
+    rows = []
+    for k, v in entry.items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, dict):
+            row = dict(v)
+            row.setdefault("date", k)
+            rows.append(row)
+    return rows
+
+def _extract_latest_financial_value(entry, candidate_keys):
+    rows = _sort_financial_rows(_history_rows_from_entry(entry))
+    if not rows:
+        return None, None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized_index = {_norm_label(k): k for k in row.keys()}
+        for key in candidate_keys:
+            raw = row.get(key)
+            if raw in (None, ''):
+                hit = normalized_index.get(_norm_label(key))
+                raw = row.get(hit) if hit else None
+            num = _to_finite_float(raw)
+            if num is not None:
+                return num, row.get("date")
+    return None, None
 
 def get_dispatch_trigger_file():
     if not GITHUB_EVENT_PATH:
@@ -1538,6 +1601,30 @@ def run_harvester():
                                 'pegRatio',
                                 'trailingPegRatio',
                             ])
+                            info_previous_close = _first_present(info, [
+                                'regularMarketPreviousClose',
+                                'previousClose',
+                            ])
+                            info_regular_market_change = _first_present(info, [
+                                'regularMarketChange',
+                            ])
+                            info_regular_market_change_pct = _first_present(info, [
+                                'regularMarketChangePercent',
+                            ])
+                            info_quote_timestamp = _first_present(info, [
+                                'regularMarketTime',
+                                'postMarketTime',
+                                'preMarketTime',
+                            ])
+                            info_net_income = _first_present(info, [
+                                'netIncome',
+                                'netIncomeToCommon',
+                            ])
+                            info_net_income_common = _first_present(info, [
+                                'netIncomeCommonStockholders',
+                                'netIncomeToCommon',
+                                'netIncome',
+                            ])
 
                             needs_balance_sheet = any(
                                 x is None or x == ''
@@ -1564,6 +1651,27 @@ def run_harvester():
                             )
                             bs_fields = _get_balance_sheet_fields(stock) if needs_balance_sheet else {}
                             distress_fields = _get_distress_statement_fields(stock) if needs_distress_fields else {}
+                            history_entry = hist_data.get(ticker)
+                            history_net_income, history_net_income_asof = _extract_latest_financial_value(
+                                history_entry,
+                                FIN_HISTORY_NET_INCOME_KEYS
+                            )
+                            net_income_value = info_net_income if info_net_income not in (None, '') else history_net_income
+                            net_income_common_value = (
+                                info_net_income_common
+                                if info_net_income_common not in (None, '')
+                                else history_net_income
+                            )
+                            net_income_source = (
+                                'INFO'
+                                if info_net_income not in (None, '') or info_net_income_common not in (None, '')
+                                else ('HISTORY' if history_net_income is not None else 'MISSING')
+                            )
+                            net_income_asof = (
+                                today_str
+                                if net_income_source == 'INFO'
+                                else (history_net_income_asof or None)
+                            )
                             current_assets_raw = info_current_assets if info_current_assets not in (None, '') else distress_fields.get("currentAssets")
                             current_liabilities_raw = info_current_liabilities if info_current_liabilities not in (None, '') else distress_fields.get("currentLiabilities")
                             current_assets_num = _to_finite_float(current_assets_raw)
@@ -1614,6 +1722,16 @@ def run_harvester():
                                 "beta": info.get('beta'),
                                 "heldPercentInstitutions": info.get('heldPercentInstitutions'),
                                 "shortRatio": info.get('shortRatio'),
+                                "previousClose": info_previous_close,
+                                "regularMarketPreviousClose": info_previous_close,
+                                "regularMarketChange": info_regular_market_change,
+                                "regularMarketChangePercent": info_regular_market_change_pct,
+                                "netIncome": net_income_value,
+                                "netIncomeCommonStockholders": net_income_common_value,
+                                "quoteTimestamp": info_quote_timestamp,
+                                "quoteSource": "YFINANCE_INFO",
+                                "netIncomeSource": net_income_source,
+                                "netIncomeAsOf": net_income_asof,
                                 "fiftyDayAverage": info.get('fiftyDayAverage'),
                                 "twoHundredDayAverage": info.get('twoHundredDayAverage'),
                                 "fiftyTwoWeekHigh": info.get('fiftyTwoWeekHigh'),
@@ -1665,6 +1783,20 @@ def run_harvester():
                 print(f"   ⚠️ [{group}] Distress key coverage<70%: {preview}")
             else:
                 print(f"   ✅ [{group}] Distress key coverage>=70% for all tracked fields")
+
+            requested_raw_keys = RAW_QUOTE_OPTIONAL_KEYS + RAW_FUNDAMENTAL_OPTIONAL_KEYS
+            raw_cov = summarize_key_coverage(group_records, requested_raw_keys)
+            raw_status_preview = []
+            for key in requested_raw_keys:
+                pct = raw_cov.get(key, {}).get("coveragePct", 0.0)
+                if pct >= 95:
+                    status = "RECEIVED"
+                elif pct > 0:
+                    status = "REQUESTED_BUT_PARTIAL"
+                else:
+                    status = "REQUESTED_BUT_MISSING"
+                raw_status_preview.append(f"{key}:{status}({pct}%)")
+            print(f"   🔎 [{group}] Raw request audit: {', '.join(raw_status_preview)}")
 
             # 데일리 데이터와 히스토리 데이터 모두 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
