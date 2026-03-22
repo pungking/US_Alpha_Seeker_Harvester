@@ -87,11 +87,22 @@ RAW_TRACE_OPTIONAL_KEYS = [
     "netIncomeAsOf",
 ]
 
+STATE_TRACE_OPTIONAL_KEYS = [
+    "historyPeriods",
+    "historyTier",
+    "symbolLifecycleState",
+    "stateUpdatedAt",
+    "historyMissingStreak",
+    "quoteMissingStreak",
+    "stateReason",
+]
+
 EXTENDED_OPTIONAL_KEYS = (
     DISTRESS_OPTIONAL_KEYS[:]
     + RAW_QUOTE_OPTIONAL_KEYS
     + RAW_FUNDAMENTAL_OPTIONAL_KEYS
     + RAW_TRACE_OPTIONAL_KEYS
+    + STATE_TRACE_OPTIONAL_KEYS
 )
 
 STANDARD_KEYS = CORE_REQUIRED_KEYS + EXTENDED_OPTIONAL_KEYS
@@ -110,8 +121,25 @@ BENCHMARK_SPECS = [
 
 MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
 EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
+HARVESTER_SYMBOL_STATE_FILENAME = "HARVESTER_SYMBOL_STATE.json"
 FMP_API_KEY = os.getenv("FMP_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_KEY") or os.getenv("FINNHUB_API_KEY")
+
+
+def _read_positive_int_env(name, default):
+    try:
+        raw = int(os.getenv(name, str(default)))
+        if raw > 0:
+            return raw
+    except Exception:
+        pass
+    return default
+
+
+SYMBOL_STATE_HISTORY_FULL_MIN_PERIODS = _read_positive_int_env("HARVESTER_HISTORY_FULL_MIN_PERIODS", 8)
+SYMBOL_STATE_STALE_HISTORY_STREAK = _read_positive_int_env("HARVESTER_STALE_HISTORY_STREAK", 3)
+SYMBOL_STATE_STALE_QUOTE_STREAK = _read_positive_int_env("HARVESTER_STALE_QUOTE_STREAK", 3)
+SYMBOL_STATE_RETIRE_DAYS = _read_positive_int_env("HARVESTER_RETIRE_DAYS", 45)
 
 def get_drive_service():
     creds_data = {
@@ -796,6 +824,113 @@ def _extract_latest_financial_value(entry, candidate_keys):
             if num is not None:
                 return num, row.get("date")
     return None, None
+
+
+def _parse_kst_datetime(text):
+    if not text:
+        return None
+    if isinstance(text, datetime.datetime):
+        return text
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(str(text), fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _derive_history_tier(periods):
+    if periods <= 0:
+        return "ONBOARDING"
+    if periods < SYMBOL_STATE_HISTORY_FULL_MIN_PERIODS:
+        return "PROVISIONAL"
+    return "FULL"
+
+
+def _derive_symbol_lifecycle_state(prev_state, analysis_eligible, history_tier, missing_history_streak, missing_quote_streak):
+    if not analysis_eligible:
+        return "EXCLUDED", "instrument_type_ineligible"
+
+    if missing_history_streak >= SYMBOL_STATE_STALE_HISTORY_STREAK:
+        return "STALE", "history_missing_streak"
+    if missing_quote_streak >= SYMBOL_STATE_STALE_QUOTE_STREAK:
+        return "STALE", "quote_missing_streak"
+
+    base_state = "ACTIVE"
+    base_reason = "ready"
+    if history_tier == "ONBOARDING":
+        base_state = "ONBOARDING"
+        base_reason = "history_missing"
+    elif history_tier == "PROVISIONAL":
+        base_state = "PROVISIONAL"
+        base_reason = "history_partial"
+
+    if prev_state in {"ONBOARDING", "PROVISIONAL", "STALE"} and base_state == "ACTIVE":
+        return "RECOVERED", "history_recovered"
+    if prev_state == "RECOVERED" and base_state == "ACTIVE":
+        return "ACTIVE", "recovery_warmup_passed"
+
+    return base_state, base_reason
+
+
+def _update_symbol_state_entry(state_map, ticker, payload, touched_set, now_text):
+    prev = state_map.get(ticker, {}) if isinstance(state_map.get(ticker), dict) else {}
+    prev_state = str(prev.get("state") or "UNKNOWN").upper()
+    missing_history_streak_prev = int(prev.get("missingHistoryStreak") or 0)
+    missing_quote_streak_prev = int(prev.get("missingQuoteStreak") or 0)
+
+    history_periods = max(0, int(payload.get("historyPeriods") or 0))
+    history_tier = str(payload.get("historyTier") or "ONBOARDING").upper()
+    analysis_eligible = bool(payload.get("analysisEligible"))
+    quote_available = bool(payload.get("hasQuotePayload"))
+    missing_history_now = history_periods <= 0
+    missing_quote_now = not quote_available
+
+    missing_history_streak = missing_history_streak_prev + 1 if missing_history_now else 0
+    missing_quote_streak = missing_quote_streak_prev + 1 if missing_quote_now else 0
+
+    lifecycle_state, reason = _derive_symbol_lifecycle_state(
+        prev_state, analysis_eligible, history_tier, missing_history_streak, missing_quote_streak
+    )
+
+    recovered_at = prev.get("recoveredAt")
+    if lifecycle_state == "RECOVERED":
+        recovered_at = now_text
+
+    first_seen_at = prev.get("firstSeenAt") or now_text
+    state_map[ticker] = {
+        "state": lifecycle_state,
+        "reason": reason,
+        "instrumentType": payload.get("instrumentType") or "unknown",
+        "analysisEligible": analysis_eligible,
+        "historyTier": history_tier,
+        "historyPeriods": history_periods,
+        "missingHistoryStreak": missing_history_streak,
+        "missingQuoteStreak": missing_quote_streak,
+        "lastSeenAt": now_text,
+        "firstSeenAt": first_seen_at,
+        "recoveredAt": recovered_at,
+    }
+    touched_set.add(ticker)
+    return state_map[ticker]
+
+
+def _apply_symbol_retire_policy(state_map, touched_set, now_text):
+    now_dt = _parse_kst_datetime(now_text)
+    if now_dt is None:
+        return
+    retire_cutoff = now_dt - datetime.timedelta(days=SYMBOL_STATE_RETIRE_DAYS)
+    for ticker, entry in state_map.items():
+        if not isinstance(entry, dict):
+            continue
+        if ticker in touched_set:
+            continue
+        last_seen_dt = _parse_kst_datetime(entry.get("lastSeenAt"))
+        if last_seen_dt is None:
+            continue
+        if last_seen_dt <= retire_cutoff:
+            entry["state"] = "RETIRED"
+            entry["reason"] = f"retire_timeout_{SYMBOL_STATE_RETIRE_DAYS}d"
 
 def get_dispatch_trigger_file():
     if not GITHUB_EVENT_PATH:
@@ -1510,6 +1645,11 @@ def run_harvester():
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
         daily_dir_id = find_file_id("Financial_Data_Daily", sys_id)
         hist_dir_id = find_file_id("Financial_Data_History_5Y", sys_id)
+        symbol_state_file_id = find_file_id(HARVESTER_SYMBOL_STATE_FILENAME, sys_id)
+        symbol_state = download_json(symbol_state_file_id) if symbol_state_file_id else {}
+        if not isinstance(symbol_state, dict):
+            symbol_state = {}
+        symbol_state_touched = set()
         group_label, target_chars, batch_mode_source = resolve_daily_batch(now_kst)
         print(f"🧩 데일리 배치 선택: {group_label} (mode={batch_mode_source})")
 
@@ -1719,6 +1859,26 @@ def run_harvester():
                                 if net_income_source == 'INFO'
                                 else (history_net_income_asof or None)
                             )
+                            history_rows = _history_rows_from_entry(history_entry)
+                            history_periods = len(history_rows)
+                            history_tier = _derive_history_tier(history_periods)
+                            symbol_state_entry = _update_symbol_state_entry(
+                                symbol_state,
+                                ticker,
+                                {
+                                    "analysisEligible": analysis_eligible,
+                                    "instrumentType": instrument_type,
+                                    "historyTier": history_tier,
+                                    "historyPeriods": history_periods,
+                                    "hasQuotePayload": has_quote_payload,
+                                },
+                                symbol_state_touched,
+                                today_str
+                            )
+                            symbol_lifecycle_state = str(symbol_state_entry.get("state") or "UNKNOWN").upper()
+                            symbol_state_reason = str(symbol_state_entry.get("reason") or "unknown")
+                            history_missing_streak = int(symbol_state_entry.get("missingHistoryStreak") or 0)
+                            quote_missing_streak = int(symbol_state_entry.get("missingQuoteStreak") or 0)
                             current_assets_raw = info_current_assets if info_current_assets not in (None, '') else distress_fields.get("currentAssets")
                             current_liabilities_raw = info_current_liabilities if info_current_liabilities not in (None, '') else distress_fields.get("currentLiabilities")
                             current_assets_num = _to_finite_float(current_assets_raw)
@@ -1781,6 +1941,13 @@ def run_harvester():
                                 "netIncomeAsOf": net_income_asof,
                                 "instrumentType": instrument_type,
                                 "analysisEligible": analysis_eligible,
+                                "historyPeriods": history_periods,
+                                "historyTier": history_tier,
+                                "symbolLifecycleState": symbol_lifecycle_state,
+                                "stateUpdatedAt": today_str,
+                                "historyMissingStreak": history_missing_streak,
+                                "quoteMissingStreak": quote_missing_streak,
+                                "stateReason": symbol_state_reason,
                                 "fiftyDayAverage": info.get('fiftyDayAverage'),
                                 "twoHundredDayAverage": info.get('twoHundredDayAverage'),
                                 "fiftyTwoWeekHigh": info.get('fiftyTwoWeekHigh'),
@@ -1863,6 +2030,16 @@ def run_harvester():
             print(
                 f"   🧭 [{group}] Instrument profile: {type_preview} | eligible(common)={eligible_count} excluded={excluded_count}"
             )
+            lifecycle_counts = {}
+            for rec in group_records.values():
+                if not isinstance(rec, dict):
+                    continue
+                state = str(rec.get("symbolLifecycleState") or "UNKNOWN").strip().upper() or "UNKNOWN"
+                lifecycle_counts[state] = lifecycle_counts.get(state, 0) + 1
+            lifecycle_preview = ", ".join(
+                [f"{k}:{v}" for k, v in sorted(lifecycle_counts.items(), key=lambda x: x[0])]
+            ) or "none"
+            print(f"   🛡️ [{group}] Symbol lifecycle: {lifecycle_preview}")
 
             # 데일리 데이터와 히스토리 데이터 모두 업로드
             upload_json(daily_name, daily_data, daily_dir_id)
@@ -1873,6 +2050,9 @@ def run_harvester():
             
             print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error}")
             send_telegram(f"📦 *그룹 [{group}] 완료*\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`")
+
+        _apply_symbol_retire_policy(symbol_state, symbol_state_touched, today_str)
+        upload_json(HARVESTER_SYMBOL_STATE_FILENAME, symbol_state, sys_id)
 
         duration = (time.time() - start_time) / 60
         send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
