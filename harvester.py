@@ -1526,7 +1526,7 @@ def run_harvester():
     total_success, total_error = 0, 0
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
-    is_weekend_update = (now_kst.weekday() == 5)
+    is_weekend_update = (now_kst.weekday() in (5, 6))
 
     try:
         print(f"🔍 시스템 가동: {today_str} (Event: {GITHUB_EVENT_NAME})")
@@ -1558,9 +1558,11 @@ def run_harvester():
                     s3_data = download_json(target_s3['id'])
                     current_trigger_file = target_s3['name']
                     
-                    # 티커 리스트 추출 및 중복 제거 (무한루프 방지)
+                    # 티커 리스트 추출 및 중복 제거 (순서 보존: 재현성 유지)
                     t_list = s3_data.get('fundamental_universe') or s3_data.get('stocks') or (s3_data if isinstance(s3_data, list) else [])
-                    s3_tickers = list(set([item['symbol'] for item in t_list if isinstance(item, dict) and 'symbol' in item]))
+                    s3_tickers = list(dict.fromkeys(
+                        item['symbol'] for item in t_list if isinstance(item, dict) and 'symbol' in item
+                    ))
                     
                     if s3_tickers:
                         total_count = len(s3_tickers)
