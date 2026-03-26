@@ -387,6 +387,14 @@ def summarize_key_coverage(records, keys):
         summary[key] = {"present": present, "missing": missing, "coveragePct": coverage_pct}
     return summary
 
+def merge_standard_record(prev_record, raw_record):
+    merged = {}
+    for key in STANDARD_KEYS:
+        new_v = raw_record.get(key, None) if isinstance(raw_record, dict) else None
+        old_v = prev_record.get(key, None) if isinstance(prev_record, dict) else None
+        merged[key] = new_v if new_v is not None else old_v
+    return merged
+
 def _first_present(mapping, keys):
     if not isinstance(mapping, dict):
         return None
@@ -1958,19 +1966,67 @@ def run_harvester():
                                 "industry": info.get('industry')
                             }
 
-                            # 신규 값이 None일 때 기존 값을 덮어쓰지 않도록 보존
                             prev_record = daily_data.get(ticker, {}) if isinstance(daily_data.get(ticker), dict) else {}
-                            merged_record = {}
-                            for k in STANDARD_KEYS:
-                                new_v = raw_record.get(k, None)
-                                old_v = prev_record.get(k, None)
-                                merged_record[k] = new_v if new_v is not None else old_v
-                            daily_data[ticker] = merged_record
+                            daily_data[ticker] = merge_standard_record(prev_record, raw_record)
                             
                             g_success += 1
                             success_flag = True
                             break
                         else:
+                            history_entry = hist_data.get(ticker)
+                            history_rows = _history_rows_from_entry(history_entry)
+                            history_periods = len(history_rows)
+                            history_tier = _derive_history_tier(history_periods)
+                            instrument_type = _classify_instrument_type(
+                                ticker,
+                                info.get('shortName') or info.get('longName'),
+                                info.get('quoteType')
+                            )
+                            analysis_eligible = instrument_type == 'common'
+                            symbol_state_entry = _update_symbol_state_entry(
+                                symbol_state,
+                                ticker,
+                                {
+                                    "analysisEligible": analysis_eligible,
+                                    "instrumentType": instrument_type,
+                                    "historyTier": history_tier,
+                                    "historyPeriods": history_periods,
+                                    "hasQuotePayload": False,
+                                },
+                                symbol_state_touched,
+                                today_str
+                            )
+                            symbol_lifecycle_state = str(symbol_state_entry.get("state") or "UNKNOWN").upper()
+                            symbol_state_reason = str(symbol_state_entry.get("reason") or "unknown")
+                            history_missing_streak = int(symbol_state_entry.get("missingHistoryStreak") or 0)
+                            quote_missing_streak = int(symbol_state_entry.get("missingQuoteStreak") or 0)
+
+                            prev_record = daily_data.get(ticker, {}) if isinstance(daily_data.get(ticker), dict) else {}
+                            quote_missing_record = {
+                                "symbol": ticker,
+                                "name": info.get('shortName') or info.get('longName') or prev_record.get("name"),
+                                "updated": today_str,
+                                "Hist": hist_status,
+                                "instrumentType": instrument_type,
+                                "analysisEligible": analysis_eligible,
+                                "historyPeriods": history_periods,
+                                "historyTier": history_tier,
+                                "symbolLifecycleState": symbol_lifecycle_state,
+                                "stateUpdatedAt": today_str,
+                                "historyMissingStreak": history_missing_streak,
+                                "quoteMissingStreak": quote_missing_streak,
+                                "stateReason": symbol_state_reason,
+                                "quoteSource": "MISSING",
+                            }
+                            daily_data[ticker] = merge_standard_record(prev_record, quote_missing_record)
+
+                            print(
+                                f"⚠️ QUOTE_MISSING [{ticker}] price unavailable | "
+                                f"state={symbol_lifecycle_state} reason={symbol_state_reason} "
+                                f"quoteMissingStreak={quote_missing_streak} "
+                                f"historyTier={history_tier} periods={history_periods}",
+                                flush=True
+                            )
                             break
                     except Exception as e:
                         if "SSL" in str(e) or "EOF" in str(e):
