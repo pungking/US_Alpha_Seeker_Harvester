@@ -34,6 +34,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
 DAILY_BATCH_MODE = (os.getenv('DAILY_BATCH_MODE') or 'auto').strip().lower()
+HARVESTER_RUN_SUMMARY_PATH = (os.getenv("HARVESTER_RUN_SUMMARY_PATH") or "state/last-harvester-run.json").strip()
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -140,6 +141,17 @@ SYMBOL_STATE_HISTORY_FULL_MIN_PERIODS = _read_positive_int_env("HARVESTER_HISTOR
 SYMBOL_STATE_STALE_HISTORY_STREAK = _read_positive_int_env("HARVESTER_STALE_HISTORY_STREAK", 3)
 SYMBOL_STATE_STALE_QUOTE_STREAK = _read_positive_int_env("HARVESTER_STALE_QUOTE_STREAK", 3)
 SYMBOL_STATE_RETIRE_DAYS = _read_positive_int_env("HARVESTER_RETIRE_DAYS", 45)
+
+
+def write_harvester_run_summary(payload):
+    path = HARVESTER_RUN_SUMMARY_PATH or "state/last-harvester-run.json"
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=True, indent=2)
+        fp.write("\n")
+    print(f"🧾 Harvester summary saved: {path}", flush=True)
 
 def get_drive_service():
     creds_data = {
@@ -1531,10 +1543,23 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
 # --- [4. 메인 엔진] ---
 def run_harvester():
     start_time = time.time()
+    started_at_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     total_success, total_error = 0, 0
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
     is_weekend_update = (now_kst.weekday() in (5, 6))
+    run_mode = "dispatch" if GITHUB_EVENT_NAME == 'repository_dispatch' else "daily"
+    dispatch_trigger_file = None
+    dispatch_total_symbols = 0
+    dispatch_benchmark_success = 0
+    dispatch_benchmark_fail = 0
+    dispatch_benchmark_skipped = 0
+    dispatch_market_regime_ready = False
+    dispatch_earnings_event_ready = False
+    dispatch_earnings_event_count = 0
+    daily_group_label = "N/A"
+    daily_batch_mode = DAILY_BATCH_MODE or "auto"
+    daily_target_count = 0
 
     try:
         print(f"🔍 시스템 가동: {today_str} (Event: {GITHUB_EVENT_NAME})")
@@ -1565,6 +1590,7 @@ def run_harvester():
                     
                     s3_data = download_json(target_s3['id'])
                     current_trigger_file = target_s3['name']
+                    dispatch_trigger_file = current_trigger_file
                     
                     # 티커 리스트 추출 및 중복 제거 (순서 보존: 재현성 유지)
                     t_list = s3_data.get('fundamental_universe') or s3_data.get('stocks') or (s3_data if isinstance(s3_data, list) else [])
@@ -1574,6 +1600,7 @@ def run_harvester():
                     
                     if s3_tickers:
                         total_count = len(s3_tickers)
+                        dispatch_total_symbols = total_count
                         send_telegram(f"🚀 *수집 시작:* `{total_count}`종목 (OHLCV {OHLCV_INITIAL_PERIOD})")
                         
                         update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING", current_trigger_file)
@@ -1615,6 +1642,9 @@ def run_harvester():
                             else:
                                 benchmark_fail += 1
                                 print(f"⚠️ 벤치마크 수집 실패: {alias}")
+                        dispatch_benchmark_success = benchmark_success
+                        dispatch_benchmark_fail = benchmark_fail
+                        dispatch_benchmark_skipped = benchmark_skipped
 
                         market_regime_ready = False
                         try:
@@ -1628,6 +1658,7 @@ def run_harvester():
                             )
                         except Exception as e:
                             print(f"⚠️ 시장 국면 스냅샷 생성 실패: {str(e)}")
+                        dispatch_market_regime_ready = market_regime_ready
 
                         earnings_event_ready = False
                         earnings_event_count = 0
@@ -1643,6 +1674,8 @@ def run_harvester():
                             print(f"📅 실적 이벤트 맵 완료: {earnings_event_count}건 (source: {earnings_event_source}, missing: {earnings_event_missing})")
                         except Exception as e:
                             print(f"⚠️ 실적 이벤트 맵 업로드 실패: {str(e)}")
+                        dispatch_earnings_event_ready = earnings_event_ready
+                        dispatch_earnings_event_count = earnings_event_count
 
                         update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
 
@@ -1650,6 +1683,27 @@ def run_harvester():
                         regime_status = "READY" if market_regime_ready else "SKIPPED"
                         earnings_status = "READY" if earnings_event_ready else "SKIPPED"
                         send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` (skip `{ohlcv_skipped}`) | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 (skip `{benchmark_skipped}`) / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`\n실적이벤트: `{earnings_status}` ({earnings_event_count})")
+            duration = (time.time() - start_time) / 60
+            write_harvester_run_summary({
+                "status": "success",
+                "startedAt": started_at_utc,
+                "completedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                "eventName": GITHUB_EVENT_NAME or "unknown",
+                "mode": run_mode,
+                "triggerFile": dispatch_trigger_file,
+                "targetSymbols": dispatch_total_symbols,
+                "batchLabel": "dispatch_stage4",
+                "batchMode": "repository_dispatch",
+                "marketRegimeReady": dispatch_market_regime_ready,
+                "earningsEventReady": dispatch_earnings_event_ready,
+                "earningsEventCount": dispatch_earnings_event_count,
+                "benchmarkSuccess": dispatch_benchmark_success,
+                "benchmarkSkipped": dispatch_benchmark_skipped,
+                "benchmarkFailed": dispatch_benchmark_fail,
+                "successCount": total_success,
+                "errorCount": total_error,
+                "durationMinutes": round(duration, 2),
+            })
             return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
@@ -1661,6 +1715,8 @@ def run_harvester():
             symbol_state = {}
         symbol_state_touched = set()
         group_label, target_chars, batch_mode_source = resolve_daily_batch(now_kst)
+        daily_group_label = group_label
+        daily_batch_mode = batch_mode_source
         print(f"🧩 데일리 배치 선택: {group_label} (mode={batch_mode_source})")
 
         full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
@@ -1670,6 +1726,7 @@ def run_harvester():
             full_map = {}
             
         filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
+        daily_target_count = len(filtered_tickers)
 
         send_telegram(
             f"📡 *[Daily] 본계정 가동*\n"
@@ -2114,9 +2171,39 @@ def run_harvester():
 
         duration = (time.time() - start_time) / 60
         send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
+        write_harvester_run_summary({
+            "status": "success",
+            "startedAt": started_at_utc,
+            "completedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "eventName": GITHUB_EVENT_NAME or "unknown",
+            "mode": run_mode,
+            "batchLabel": daily_group_label,
+            "batchMode": daily_batch_mode,
+            "targetSymbols": daily_target_count,
+            "weekendUpdate": bool(is_weekend_update),
+            "successCount": total_success,
+            "errorCount": total_error,
+            "durationMinutes": round(duration, 2),
+        })
 
     except Exception as e:
         send_telegram(f"🚨 *에러 발생:* `{str(e)}` ")
+        duration = (time.time() - start_time) / 60
+        write_harvester_run_summary({
+            "status": "failed",
+            "startedAt": started_at_utc,
+            "completedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "eventName": GITHUB_EVENT_NAME or "unknown",
+            "mode": run_mode,
+            "batchLabel": daily_group_label,
+            "batchMode": daily_batch_mode,
+            "targetSymbols": daily_target_count,
+            "successCount": total_success,
+            "errorCount": total_error,
+            "durationMinutes": round(duration, 2),
+            "errorType": type(e).__name__,
+            "errorMessage": str(e),
+        })
         print(f"⛔ run_harvester fatal: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
         raise
