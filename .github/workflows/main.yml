@@ -55,4 +55,31 @@ jobs:
           # 🎯 파이썬 코드가 웹앱 신호인지 스케줄 실행인지 판단하는 핵심 변수
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           DAILY_BATCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_mode || 'auto' }}
-        run: python harvester.py
+          HARVESTER_RUN_SUMMARY_PATH: state/last-harvester-run.json
+        run: |
+          mkdir -p state
+          python harvester.py | tee state/harvester-output.log
+
+      - name: Sync Harvester summary to Notion
+        if: always()
+        continue-on-error: ${{ vars.NOTION_HARVESTER_SYNC_REQUIRED != 'true' }}
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_DAILY_SNAPSHOT: ${{ vars.NOTION_DB_DAILY_SNAPSHOT }}
+          NOTION_HARVESTER_SYNC_ENABLED: ${{ vars.NOTION_HARVESTER_SYNC_ENABLED }}
+          NOTION_HARVESTER_SYNC_REQUIRED: ${{ vars.NOTION_HARVESTER_SYNC_REQUIRED }}
+          HARVESTER_RUN_SUMMARY_PATH: state/last-harvester-run.json
+          GHA_JOB_STATUS: ${{ job.status }}
+        run: python scripts/sync_notion_summary.py
+
+      - name: Upload Harvester state artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: harvester-state-${{ github.run_id }}
+          path: |
+            state/last-harvester-run.json
+            state/harvester-output.log
+          if-no-files-found: warn
+
+         
