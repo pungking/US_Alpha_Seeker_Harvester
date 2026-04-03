@@ -31,6 +31,7 @@ REFRESH_TOKEN = os.getenv('GDRIVE_REFRESH_TOKEN')
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_ALERT_CHAT_ID = os.getenv('TELEGRAM_ALERT_CHAT_ID')
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
 DAILY_BATCH_MODE = (os.getenv('DAILY_BATCH_MODE') or 'auto').strip().lower()
@@ -235,11 +236,18 @@ def resolve_daily_batch(now_kst):
         return DAILY_BATCH_FIRST_LABEL, DAILY_BATCH_FIRST_CHARS, "auto:hour_window_first"
     return DAILY_BATCH_SECOND_LABEL, DAILY_BATCH_SECOND_CHARS, "auto:hour_window_second"
 
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+def _resolve_telegram_chat_id(channel="ops"):
+    if channel == "alert":
+        return TELEGRAM_ALERT_CHAT_ID or TELEGRAM_CHAT_ID
+    return TELEGRAM_CHAT_ID
+
+
+def send_telegram(message, channel="ops"):
+    chat_id = _resolve_telegram_chat_id(channel)
+    if not TELEGRAM_TOKEN or not chat_id:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
@@ -2187,7 +2195,7 @@ def run_harvester():
         })
 
     except Exception as e:
-        send_telegram(f"🚨 *에러 발생:* `{str(e)}` ")
+        send_telegram(f"🚨 *에러 발생:* `{str(e)}` ", channel="alert")
         duration = (time.time() - start_time) / 60
         write_harvester_run_summary({
             "status": "failed",
