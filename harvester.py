@@ -1476,23 +1476,54 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
 
     # 1) FMP 캘린더 (단일 호출)
     if FMP_API_KEY:
-        try:
-            url = f"https://financialmodelingprep.com/api/v3/earning_calendar?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
-            response = requests.get(url, timeout=20)
-            response.raise_for_status()
-            calendar = response.json()
+        endpoint_candidates = [
+            (
+                "stable/earnings-calendar",
+                f"https://financialmodelingprep.com/stable/earnings-calendar?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
+            ),
+            (
+                "stable/earning-calendar",
+                f"https://financialmodelingprep.com/stable/earning-calendar?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
+            ),
+            # Legacy fallback: keep for older plans only.
+            (
+                "api/v3/earning_calendar",
+                f"https://financialmodelingprep.com/api/v3/earning_calendar?from={start_date}&to={end_date}&apikey={FMP_API_KEY}"
+            ),
+        ]
 
-            for event in calendar if isinstance(calendar, list) else []:
+        calendar = None
+        used_endpoint = None
+        endpoint_errors = []
+        for endpoint_name, url in endpoint_candidates:
+            try:
+                response = requests.get(url, timeout=20)
+                response.raise_for_status()
+                payload_json = response.json() if response.content else []
+
+                if isinstance(payload_json, dict) and payload_json.get("Error Message"):
+                    endpoint_errors.append(f"{endpoint_name}: {payload_json.get('Error Message')}")
+                    continue
+
+                calendar = payload_json if isinstance(payload_json, list) else []
+                used_endpoint = endpoint_name
+                break
+            except Exception as e:
+                endpoint_errors.append(f"{endpoint_name}: {e}")
+
+        if isinstance(calendar, list):
+            for event in calendar:
                 symbol = str(event.get('symbol') or '').upper()
                 if symbol not in target_set:
                     continue
                 date_str = normalize_event_date(event.get('date'))
                 upsert_earnings_event(event_map, symbol, date_str, now_date, 'fmp', 'HIGH')
 
-            if event_map:
+            if any(v.get('source') == 'fmp' for v in event_map.values()):
                 source_labels.append('fmp')
-        except Exception as e:
-            print(f"⚠️ FMP earnings calendar 실패: {str(e)}")
+                print(f"✅ FMP earnings calendar 사용: {used_endpoint}")
+        else:
+            print(f"⚠️ FMP earnings calendar 실패: {' | '.join(endpoint_errors) if endpoint_errors else 'unknown'}")
 
     # 2) Finnhub 캘린더 (단일 호출)
     missing_symbols = sorted(target_set - set(event_map.keys()))
