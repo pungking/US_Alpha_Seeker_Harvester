@@ -1005,11 +1005,66 @@ def trim_zero_volume_flat_tail(records):
     return trimmed, removed
 
 
+def _normalize_ohlcv_record(record):
+    if not isinstance(record, dict):
+        return None
+    date_raw = str(record.get("date") or "").strip()
+    if not date_raw:
+        return None
+    open_price = _to_finite_float(record.get("open"))
+    high_price = _to_finite_float(record.get("high"))
+    low_price = _to_finite_float(record.get("low"))
+    close_price = _to_finite_float(record.get("close"))
+    if (
+        open_price is None
+        or high_price is None
+        or low_price is None
+        or close_price is None
+        or open_price <= 0
+        or high_price <= 0
+        or low_price <= 0
+        or close_price <= 0
+    ):
+        return None
+    if high_price < low_price:
+        return None
+    volume_raw = _to_finite_float(record.get("volume"))
+    volume = int(max(0, round(volume_raw))) if volume_raw is not None else 0
+    symbol = str(record.get("symbol") or "").strip()
+    return {
+        "symbol": symbol,
+        "date": date_raw,
+        "open": round(open_price, 2),
+        "high": round(high_price, 2),
+        "low": round(low_price, 2),
+        "close": round(close_price, 2),
+        "volume": volume,
+    }
+
+
+def sanitize_ohlcv_records(records):
+    if not isinstance(records, list):
+        return []
+    cleaned = []
+    removed = 0
+    for row in records:
+        normalized = _normalize_ohlcv_record(row)
+        if normalized is None:
+            removed += 1
+            continue
+        cleaned.append(normalized)
+    return cleaned, removed
+
+
 def get_latest_ohlcv_date(records):
     if not isinstance(records, list) or not records:
         return None
     try:
-        latest = max(str(item.get("date", "")) for item in records if isinstance(item, dict) and item.get("date"))
+        latest = max(
+            str(item.get("date", ""))
+            for item in records
+            if _normalize_ohlcv_record(item) is not None and item.get("date")
+        )
         return latest if latest else None
     except Exception:
         return None
@@ -1055,9 +1110,14 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
     # OHLCV는 리스트 형태이므로 리스트로 변환 보장
     existing_data = download_json(file_id)
     if not isinstance(existing_data, list): existing_data = []
+    existing_data, removed_invalid_existing = sanitize_ohlcv_records(existing_data)
+    if removed_invalid_existing > 0:
+        print(f"🧹 {file_name}: invalid OHLCV rows {removed_invalid_existing}건 제거")
 
     # [최적화] 최신 거래일까지 이미 수집된 종목은 재호출 스킵
     if existing_data and is_ohlcv_fresh(existing_data):
+        if removed_invalid_existing > 0:
+            upload_json(file_name, existing_data, ohlcv_dir_id)
         return "SKIPPED"
 
     try:
@@ -1070,17 +1130,42 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
             return "FAILED"
 
         # 각 레코드마다 symbol 필드를 강제로 추가
-        new_recs = [
-            {
-                "symbol": record_symbol,
-                "date": d.strftime('%Y-%m-%d'),
-                "open": round(r["Open"], 2),
-                "high": round(r["High"], 2),
-                "low": round(r["Low"], 2),
-                "close": round(r["Close"], 2),
-                "volume": int(r["Volume"])
-            } for d, r in df.iterrows()
-        ]
+        new_recs = []
+        skipped_invalid_new = 0
+        for d, r in df.iterrows():
+            open_price = _to_finite_float(r.get("Open"))
+            high_price = _to_finite_float(r.get("High"))
+            low_price = _to_finite_float(r.get("Low"))
+            close_price = _to_finite_float(r.get("Close"))
+            if (
+                open_price is None
+                or high_price is None
+                or low_price is None
+                or close_price is None
+                or open_price <= 0
+                or high_price <= 0
+                or low_price <= 0
+                or close_price <= 0
+                or high_price < low_price
+            ):
+                skipped_invalid_new += 1
+                continue
+            volume_raw = _to_finite_float(r.get("Volume"))
+            volume = int(max(0, round(volume_raw))) if volume_raw is not None else 0
+            new_recs.append(
+                {
+                    "symbol": record_symbol,
+                    "date": d.strftime('%Y-%m-%d'),
+                    "open": round(open_price, 2),
+                    "high": round(high_price, 2),
+                    "low": round(low_price, 2),
+                    "close": round(close_price, 2),
+                    "volume": volume,
+                }
+            )
+
+        if skipped_invalid_new > 0:
+            print(f"🧹 {file_name}: fetched invalid OHLCV rows {skipped_invalid_new}건 제외")
 
         # 날짜 기준 중복 제거 및 합치기
         combined = {item["date"]: item for item in (existing_data + new_recs)}
