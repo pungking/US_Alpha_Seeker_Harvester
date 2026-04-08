@@ -245,14 +245,17 @@ def _resolve_telegram_chat_id(channel="ops"):
 def send_telegram(message, channel="ops"):
     chat_id = _resolve_telegram_chat_id(channel)
     if not TELEGRAM_TOKEN or not chat_id:
+        print(f"ℹ️ Telegram skip: token/chat missing (channel={channel})", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    chat_mask = f"{str(chat_id)[:3]}***{str(chat_id)[-3:]}" if len(str(chat_id)) >= 7 else str(chat_id)
     try:
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
+        print(f"📨 Telegram sent (channel={channel}, chat={chat_mask})", flush=True)
     except requests.RequestException as e:
-        print(f"⚠️ Telegram 알림 실패: {type(e).__name__}: {e}", flush=True)
+        print(f"⚠️ Telegram 알림 실패 (channel={channel}, chat={chat_mask}): {type(e).__name__}: {e}", flush=True)
 
 # --- [2. 드라이브 유틸리티] ---
 def find_file_id(name, parent_id=None):
