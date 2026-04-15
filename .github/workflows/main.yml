@@ -40,7 +40,7 @@ jobs:
           python-version: '3.11'
           
       - name: Install Dependencies
-        run: pip install google-api-python-client google-auth requests yfinance pandas
+        run: pip install --upgrade google-api-python-client google-auth requests yfinance pandas
         
       - name: Run Master Harvester
         env:
