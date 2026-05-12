@@ -12,6 +12,7 @@ import math
 import ssl
 import traceback
 import yfinance as yf
+from collections import Counter
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -36,6 +37,7 @@ GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
 DAILY_BATCH_MODE = (os.getenv('DAILY_BATCH_MODE') or 'auto').strip().lower()
 HARVESTER_RUN_SUMMARY_PATH = (os.getenv("HARVESTER_RUN_SUMMARY_PATH") or "state/last-harvester-run.json").strip()
+HARVESTER_FAILURE_REPORT_PATH = (os.getenv("HARVESTER_FAILURE_REPORT_PATH") or "state/harvester-failure-report.json").strip()
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -142,6 +144,8 @@ SYMBOL_STATE_HISTORY_FULL_MIN_PERIODS = _read_positive_int_env("HARVESTER_HISTOR
 SYMBOL_STATE_STALE_HISTORY_STREAK = _read_positive_int_env("HARVESTER_STALE_HISTORY_STREAK", 3)
 SYMBOL_STATE_STALE_QUOTE_STREAK = _read_positive_int_env("HARVESTER_STALE_QUOTE_STREAK", 3)
 SYMBOL_STATE_RETIRE_DAYS = _read_positive_int_env("HARVESTER_RETIRE_DAYS", 45)
+HARVESTER_FAILURE_SAMPLE_LIMIT = _read_positive_int_env("HARVESTER_FAILURE_SAMPLE_LIMIT", 20)
+RUN_FAILURE_DETAILS = []
 
 
 def write_harvester_run_summary(payload):
@@ -153,6 +157,81 @@ def write_harvester_run_summary(payload):
         json.dump(payload, fp, ensure_ascii=True, indent=2)
         fp.write("\n")
     print(f"🧾 Harvester summary saved: {path}", flush=True)
+
+
+def _short_failure_text(value, max_len=240):
+    text = str(value if value is not None else "").replace("\n", " ").replace("`", "'").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def record_symbol_failure(symbol, stage, category, reason, **context):
+    clean_context = {}
+    for key, value in context.items():
+        if value is None or value == "":
+            continue
+        clean_context[key] = _short_failure_text(value, 220)
+    RUN_FAILURE_DETAILS.append(
+        {
+            "symbol": str(symbol or "UNKNOWN").strip().upper() or "UNKNOWN",
+            "stage": str(stage or "unknown").strip(),
+            "category": str(category or "UNKNOWN").strip().upper(),
+            "reason": _short_failure_text(reason or "unknown"),
+            "context": clean_context,
+        }
+    )
+
+
+def build_failure_snapshot():
+    category_counts = Counter(item.get("category") or "UNKNOWN" for item in RUN_FAILURE_DETAILS)
+    stage_counts = Counter(item.get("stage") or "unknown" for item in RUN_FAILURE_DETAILS)
+    samples = RUN_FAILURE_DETAILS[:HARVESTER_FAILURE_SAMPLE_LIMIT]
+    return {
+        "total": len(RUN_FAILURE_DETAILS),
+        "categoryCounts": dict(sorted(category_counts.items())),
+        "stageCounts": dict(sorted(stage_counts.items())),
+        "samples": samples,
+    }
+
+
+def write_harvester_failure_report(payload):
+    path = HARVESTER_FAILURE_REPORT_PATH or "state/harvester-failure-report.json"
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=True, indent=2)
+        fp.write("\n")
+    print(f"🧾 Harvester failure report saved: {path}", flush=True)
+
+
+def build_harvester_failure_report(summary):
+    snapshot = build_failure_snapshot()
+    return {
+        "schemaVersion": 1,
+        "generatedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "summary": summary,
+        "failureSummary": {
+            "total": snapshot["total"],
+            "categoryCounts": snapshot["categoryCounts"],
+            "stageCounts": snapshot["stageCounts"],
+            "sampleLimit": HARVESTER_FAILURE_SAMPLE_LIMIT,
+        },
+        "failures": RUN_FAILURE_DETAILS,
+    }
+
+
+def failure_telegram_summary():
+    if not RUN_FAILURE_DETAILS:
+        return "실패 상세: `none`"
+    snapshot = build_failure_snapshot()
+    count_preview = ", ".join(f"{k}:{v}" for k, v in snapshot["categoryCounts"].items()) or "unknown"
+    sample_preview = ", ".join(
+        f"{item.get('symbol')}:{item.get('category')}/{item.get('reason')}"
+        for item in snapshot["samples"][:5]
+    )
+    return f"실패상세: `{count_preview}`\n샘플: `{_short_failure_text(sample_preview, 900)}`"
 
 def get_drive_service():
     creds_data = {
@@ -1127,6 +1206,15 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
         df = stock.history(period=period, interval="1d")
 
         if df.empty:
+            record_symbol_failure(
+                record_symbol,
+                "ohlcv",
+                "OHLCV_EMPTY",
+                "yfinance_history_empty",
+                sourceSymbol=source_symbol,
+                requestedPeriod=period,
+                existingRows=len(existing_data),
+            )
             return "FAILED"
 
         # 각 레코드마다 symbol 필드를 강제로 추가
@@ -1175,11 +1263,28 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
         if removed_tail > 0:
             print(f"🧹 {file_name}: zero-volume flat tail {removed_tail}건 제거")
         if not final_list:
+            record_symbol_failure(
+                record_symbol,
+                "ohlcv",
+                "OHLCV_NO_VALID_ROWS",
+                "no_valid_ohlcv_rows_after_sanitize",
+                sourceSymbol=source_symbol,
+                requestedPeriod=period,
+                fetchedRows=len(new_recs),
+                skippedInvalidRows=skipped_invalid_new,
+            )
             return "FAILED"
 
         upload_json(file_name, final_list, ohlcv_dir_id)
         return "UPDATED"
     except Exception as e:
+        record_symbol_failure(
+            record_symbol,
+            "ohlcv",
+            "OHLCV_EXCEPTION",
+            f"{type(e).__name__}: {e}",
+            sourceSymbol=source_symbol,
+        )
         print(
             f"⚠️ OHLCV sync 실패 [{record_symbol}] source={source_symbol}: "
             f"{type(e).__name__}: {e}",
@@ -1809,9 +1914,10 @@ def run_harvester():
                         upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": current_trigger_file, "timestamp": today_str}, sys_id)
                         regime_status = "READY" if market_regime_ready else "SKIPPED"
                         earnings_status = "READY" if earnings_event_ready else "SKIPPED"
-                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` (skip `{ohlcv_skipped}`) | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 (skip `{benchmark_skipped}`) / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`\n실적이벤트: `{earnings_status}` ({earnings_event_count})")
+                        failure_line = failure_telegram_summary()
+                        send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` (skip `{ohlcv_skipped}`) | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 (skip `{benchmark_skipped}`) / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`\n실적이벤트: `{earnings_status}` ({earnings_event_count})\n{failure_line}")
             duration = (time.time() - start_time) / 60
-            write_harvester_run_summary({
+            summary_payload = {
                 "status": "success",
                 "startedAt": started_at_utc,
                 "completedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
@@ -1830,7 +1936,13 @@ def run_harvester():
                 "successCount": total_success,
                 "errorCount": total_error,
                 "durationMinutes": round(duration, 2),
-            })
+            }
+            failure_report = build_harvester_failure_report(summary_payload)
+            write_harvester_failure_report(failure_report)
+            summary_payload["failureReportPath"] = HARVESTER_FAILURE_REPORT_PATH
+            summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
+            summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
+            write_harvester_run_summary(summary_payload)
             return # dispatch 작업이 끝났으므로 여기서 명시적으로 종료
 
         # 🎯 2. [데일리 수집 모드] (스케줄러로 실행될 때 여기로 옴)
@@ -1878,6 +1990,8 @@ def run_harvester():
 
             for i, ticker in enumerate(group_tickers, 1):
                 success_flag = False
+                failure_recorded = False
+                last_attempt_error = None
                 for attempt in range(3): # 수집 재시도
                     try:
                         if i % 50 == 0:
@@ -2203,6 +2317,19 @@ def run_harvester():
                                 "quoteSource": "MISSING",
                             }
                             daily_data[ticker] = merge_standard_record(prev_record, quote_missing_record)
+                            record_symbol_failure(
+                                ticker,
+                                "daily_quote",
+                                "QUOTE_MISSING",
+                                symbol_state_reason,
+                                group=group,
+                                instrumentType=instrument_type,
+                                historyTier=history_tier,
+                                historyPeriods=history_periods,
+                                quoteMissingStreak=quote_missing_streak,
+                                historyMissingStreak=history_missing_streak,
+                            )
+                            failure_recorded = True
 
                             print(
                                 f"⚠️ QUOTE_MISSING [{ticker}] price unavailable | "
@@ -2213,11 +2340,36 @@ def run_harvester():
                             )
                             break
                     except Exception as e:
+                        last_attempt_error = {
+                            "type": type(e).__name__,
+                            "message": _short_failure_text(e),
+                            "attempt": attempt + 1,
+                        }
                         if "SSL" in str(e) or "EOF" in str(e):
                             time.sleep(5)
+                        elif attempt == 2:
+                            print(f"⚠️ 수집 재시도 소진 [{ticker}]: {type(e).__name__}: {e}", flush=True)
                 
                 if not success_flag:
                     g_error += 1
+                    if not failure_recorded:
+                        if last_attempt_error:
+                            record_symbol_failure(
+                                ticker,
+                                "daily_quote",
+                                "DAILY_EXCEPTION_RETRY_EXHAUSTED",
+                                f"{last_attempt_error.get('type')}: {last_attempt_error.get('message')}",
+                                group=group,
+                                attempts=last_attempt_error.get("attempt"),
+                            )
+                        else:
+                            record_symbol_failure(
+                                ticker,
+                                "daily_quote",
+                                "DAILY_NO_SUCCESS",
+                                "quote_or_history_unclassified_failure",
+                                group=group,
+                            )
 
             # Core key coverage sanity summary (raw-first policy visibility)
             group_records = {t: daily_data.get(t, {}) for t in group_tickers.keys()}
@@ -2297,8 +2449,9 @@ def run_harvester():
         upload_json(HARVESTER_SYMBOL_STATE_FILENAME, symbol_state, sys_id)
 
         duration = (time.time() - start_time) / 60
-        send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`")
-        write_harvester_run_summary({
+        failure_line = failure_telegram_summary()
+        send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`\n{failure_line}")
+        summary_payload = {
             "status": "success",
             "startedAt": started_at_utc,
             "completedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
@@ -2311,12 +2464,19 @@ def run_harvester():
             "successCount": total_success,
             "errorCount": total_error,
             "durationMinutes": round(duration, 2),
-        })
+        }
+        failure_report = build_harvester_failure_report(summary_payload)
+        write_harvester_failure_report(failure_report)
+        summary_payload["failureReportPath"] = HARVESTER_FAILURE_REPORT_PATH
+        summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
+        summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
+        write_harvester_run_summary(summary_payload)
 
     except Exception as e:
+        record_symbol_failure("RUN", "fatal", "RUN_FATAL", f"{type(e).__name__}: {e}")
         send_telegram(f"🚨 *에러 발생:* `{str(e)}` ", channel="alert")
         duration = (time.time() - start_time) / 60
-        write_harvester_run_summary({
+        summary_payload = {
             "status": "failed",
             "startedAt": started_at_utc,
             "completedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
@@ -2330,7 +2490,13 @@ def run_harvester():
             "durationMinutes": round(duration, 2),
             "errorType": type(e).__name__,
             "errorMessage": str(e),
-        })
+        }
+        failure_report = build_harvester_failure_report(summary_payload)
+        write_harvester_failure_report(failure_report)
+        summary_payload["failureReportPath"] = HARVESTER_FAILURE_REPORT_PATH
+        summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
+        summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
+        write_harvester_run_summary(summary_payload)
         print(f"⛔ run_harvester fatal: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
         raise

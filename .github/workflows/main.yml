@@ -82,6 +82,7 @@ jobs:
           name: harvester-state-${{ github.run_id }}
           path: |
             state/last-harvester-run.json
+            state/harvester-failure-report.json
             state/harvester-output.log
           if-no-files-found: warn
 
