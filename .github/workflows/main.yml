@@ -70,6 +70,7 @@ jobs:
           NOTION_DB_DAILY_SNAPSHOT: ${{ vars.NOTION_DB_DAILY_SNAPSHOT }}
           NOTION_HARVESTER_SYNC_ENABLED: ${{ vars.NOTION_HARVESTER_SYNC_ENABLED }}
           NOTION_HARVESTER_SYNC_REQUIRED: ${{ vars.NOTION_HARVESTER_SYNC_REQUIRED }}
+          NOTION_HARVESTER_WRITE_MODE: ${{ vars.NOTION_HARVESTER_WRITE_MODE || 'create_only' }}
           HARVESTER_RUN_SUMMARY_PATH: state/last-harvester-run.json
           GHA_JOB_STATUS: ${{ job.status }}
         run: python scripts/sync_notion_summary.py
