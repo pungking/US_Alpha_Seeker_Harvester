@@ -2,10 +2,16 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 
 import requests
 
 NOTION_VERSION = "2022-06-28"
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+class NotionRequestError(RuntimeError):
+    pass
 
 
 def env(name, default=""):
@@ -24,6 +30,17 @@ def bool_from_env(name, default=True):
     return default
 
 
+def int_from_env(name, default):
+    raw = env(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def short_text(value, max_len=1800):
     return str(value if value is not None else "").strip()[:max_len]
 
@@ -38,21 +55,42 @@ def notion_headers(token):
 
 def notion_request(token, path, method="GET", payload=None):
     url = f"https://api.notion.com{path}"
-    response = requests.request(
-        method,
-        url,
-        headers=notion_headers(token),
-        data=json.dumps(payload) if payload is not None else None,
-        timeout=15,
-    )
-    text = response.text or ""
-    try:
-        data = json.loads(text) if text else {}
-    except Exception:
-        data = {}
-    if not response.ok:
-        raise RuntimeError(f"Notion {path} failed ({response.status_code}): {json.dumps(data)[:400]}")
-    return data
+    timeout_seconds = int_from_env("NOTION_REQUEST_TIMEOUT_SEC", 30)
+    max_attempts = int_from_env("NOTION_REQUEST_MAX_ATTEMPTS", 4)
+    backoff_seconds = int_from_env("NOTION_REQUEST_BACKOFF_SEC", 3)
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=notion_headers(token),
+                data=json.dumps(payload) if payload is not None else None,
+                timeout=timeout_seconds,
+            )
+            text = response.text or ""
+            try:
+                data = json.loads(text) if text else {}
+            except ValueError:
+                data = {}
+            if response.ok:
+                return data
+            message = f"Notion {path} failed ({response.status_code}): {json.dumps(data)[:400]}"
+            last_error = NotionRequestError(message)
+            if response.status_code not in RETRYABLE_STATUS_CODES or attempt >= max_attempts:
+                raise last_error
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+            last_error = error
+            if attempt >= max_attempts:
+                break
+        sleep_seconds = backoff_seconds * attempt
+        print(
+            f"[NOTION_HARVESTER_SYNC] retry attempt={attempt}/{max_attempts} "
+            f"path={path} wait={sleep_seconds}s reason={last_error}",
+            file=sys.stderr,
+        )
+        time.sleep(sleep_seconds)
+    raise NotionRequestError(f"Notion {path} failed after {max_attempts} attempts: {last_error}")
 
 
 def read_summary(path):
@@ -182,42 +220,49 @@ def main():
         f"ok={summary.get('successCount', 'N/A')} err={summary.get('errorCount', 'N/A')}"
     )
 
-    db = notion_request(token, f"/v1/databases/{db_daily}", method="GET")
-    schema = db.get("properties") if isinstance(db, dict) else {}
-    title_name = find_title_property(schema) or "Run Date"
+    try:
+        db = notion_request(token, f"/v1/databases/{db_daily}", method="GET")
+        schema = db.get("properties") if isinstance(db, dict) else {}
+        title_name = find_title_property(schema) or "Run Date"
 
-    properties = {title_name: title_prop(run_key)}
-    set_property_if_supported(
-        properties,
-        schema,
-        "Date",
-        {
-            "date": lambda: date_prop(summary.get("completedAt") or dt.datetime.utcnow().isoformat() + "Z"),
-            "rich_text": lambda: text_prop(dt.datetime.utcnow().date().isoformat()),
-        },
-    )
-    set_property_if_supported(
-        properties,
-        schema,
-        "Status",
-        {
-            "select": lambda: select_prop(status),
-            "rich_text": lambda: text_prop(status),
-        },
-    )
-    set_property_if_supported(properties, schema, "Summary", {"rich_text": lambda: text_prop(summary_text)})
-    set_property_if_supported(properties, schema, "Top Tickers", {"rich_text": lambda: text_prop(top_tickers)})
-    set_property_if_supported(
-        properties,
-        schema,
-        "Engine",
-        {
-            "select": lambda: select_prop("harvester"),
-            "rich_text": lambda: text_prop("harvester"),
-        },
-    )
+        properties = {title_name: title_prop(run_key)}
+        set_property_if_supported(
+            properties,
+            schema,
+            "Date",
+            {
+                "date": lambda: date_prop(summary.get("completedAt") or dt.datetime.utcnow().isoformat() + "Z"),
+                "rich_text": lambda: text_prop(dt.datetime.utcnow().date().isoformat()),
+            },
+        )
+        set_property_if_supported(
+            properties,
+            schema,
+            "Status",
+            {
+                "select": lambda: select_prop(status),
+                "rich_text": lambda: text_prop(status),
+            },
+        )
+        set_property_if_supported(properties, schema, "Summary", {"rich_text": lambda: text_prop(summary_text)})
+        set_property_if_supported(properties, schema, "Top Tickers", {"rich_text": lambda: text_prop(top_tickers)})
+        set_property_if_supported(
+            properties,
+            schema,
+            "Engine",
+            {
+                "select": lambda: select_prop("harvester"),
+                "rich_text": lambda: text_prop("harvester"),
+            },
+        )
 
-    upsert_status = upsert_page(token, db_daily, title_name, run_key, properties)
+        upsert_status = upsert_page(token, db_daily, title_name, run_key, properties)
+    except Exception as error:
+        message = f"[NOTION_HARVESTER_SYNC] soft_fail key={run_key} reason={error}"
+        if required:
+            raise RuntimeError(message) from error
+        print(message, file=sys.stderr)
+        return 0
     print(
         f"[NOTION_HARVESTER_SYNC] {upsert_status} key={run_key} status={status_raw} "
         f"mode={mode} success={summary.get('successCount', 'N/A')} errors={summary.get('errorCount', 'N/A')}"
