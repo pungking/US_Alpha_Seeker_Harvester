@@ -146,16 +146,7 @@ def query_existing_by_title(token, database_id, title_name, title_value):
     return None
 
 
-def upsert_page(token, database_id, title_name, title_value, properties):
-    existing = query_existing_by_title(token, database_id, title_name, title_value)
-    if existing and existing.get("id"):
-        notion_request(
-            token,
-            f"/v1/pages/{existing['id']}",
-            method="PATCH",
-            payload={"properties": properties},
-        )
-        return "updated"
+def create_page(token, database_id, properties):
     notion_request(
         token,
         "/v1/pages",
@@ -166,6 +157,23 @@ def upsert_page(token, database_id, title_name, title_value, properties):
         },
     )
     return "created"
+
+
+def upsert_page(token, database_id, title_name, title_value, properties, write_mode="create_only"):
+    normalized_mode = str(write_mode or "create_only").strip().lower()
+    if normalized_mode in ("create", "create_only", "append", "append_only"):
+        return create_page(token, database_id, properties)
+
+    existing = query_existing_by_title(token, database_id, title_name, title_value)
+    if existing and existing.get("id"):
+        notion_request(
+            token,
+            f"/v1/pages/{existing['id']}",
+            method="PATCH",
+            payload={"properties": properties},
+        )
+        return "updated"
+    return create_page(token, database_id, properties)
 
 
 def set_property_if_supported(target, schema, name, handlers):
@@ -194,6 +202,7 @@ def main():
 
     summary_path = env("HARVESTER_RUN_SUMMARY_PATH", "state/last-harvester-run.json")
     summary = read_summary(summary_path)
+    write_mode = env("NOTION_HARVESTER_WRITE_MODE", "create_only").lower()
 
     run_id = env("GITHUB_RUN_ID", "local")
     run_attempt = env("GITHUB_RUN_ATTEMPT", "1")
@@ -256,7 +265,7 @@ def main():
             },
         )
 
-        upsert_status = upsert_page(token, db_daily, title_name, run_key, properties)
+        upsert_status = upsert_page(token, db_daily, title_name, run_key, properties, write_mode=write_mode)
     except Exception as error:
         message = f"[NOTION_HARVESTER_SYNC] soft_fail key={run_key} reason={error}"
         if required:
@@ -265,7 +274,8 @@ def main():
         return 0
     print(
         f"[NOTION_HARVESTER_SYNC] {upsert_status} key={run_key} status={status_raw} "
-        f"mode={mode} success={summary.get('successCount', 'N/A')} errors={summary.get('errorCount', 'N/A')}"
+        f"mode={mode} writeMode={write_mode} "
+        f"success={summary.get('successCount', 'N/A')} errors={summary.get('errorCount', 'N/A')}"
     )
     return 0
 
