@@ -41,6 +41,9 @@ jobs:
           
       - name: Install Dependencies
         run: pip install --upgrade google-api-python-client google-auth requests yfinance pandas
+
+      - name: Symbol-agnostic runtime guard
+        run: python scripts/check_symbol_agnostic_runtime.py
         
       - name: Run Master Harvester
         env:
@@ -83,6 +86,8 @@ jobs:
           path: |
             state/last-harvester-run.json
             state/harvester-failure-report.json
+            state/symbol-agnostic-runtime-check.json
+            state/symbol-agnostic-runtime-check.md
             state/harvester-output.log
           if-no-files-found: warn
 
