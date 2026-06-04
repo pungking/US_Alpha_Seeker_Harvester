@@ -44,6 +44,8 @@ jobs:
 
       - name: Symbol-agnostic runtime guard
         run: python scripts/check_symbol_agnostic_runtime.py
+      - name: Telegram routing policy audit
+        run: python scripts/check_telegram_routing_policy.py
         
       - name: Run Master Harvester
         env:
@@ -53,9 +55,9 @@ jobs:
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          # Harvester collection notifications must go to simulation/private channel (12***).
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_SIMULATION_CHAT_ID || vars.TELEGRAM_SIMULATION_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_ALERT_CHAT_ID || vars.TELEGRAM_ALERT_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+          # Harvester collection notifications must go to simulation/private channel.
+          TELEGRAM_SIMULATION_CHAT_ID: ${{ secrets.TELEGRAM_SIMULATION_CHAT_ID || vars.TELEGRAM_SIMULATION_CHAT_ID }}
+          TELEGRAM_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_ALERT_CHAT_ID || vars.TELEGRAM_ALERT_CHAT_ID || secrets.TELEGRAM_SIMULATION_CHAT_ID || vars.TELEGRAM_SIMULATION_CHAT_ID }}
           
           # 🎯 파이썬 코드가 웹앱 신호인지 스케줄 실행인지 판단하는 핵심 변수
           GITHUB_EVENT_NAME: ${{ github.event_name }}
@@ -88,6 +90,7 @@ jobs:
             state/harvester-failure-report.json
             state/symbol-agnostic-runtime-check.json
             state/symbol-agnostic-runtime-check.md
+            state/telegram-routing-policy-audit.*
             state/harvester-output.log
           if-no-files-found: warn
 

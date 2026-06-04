@@ -31,7 +31,7 @@ CLIENT_SECRET = os.getenv('GDRIVE_CLIENT_SECRET')
 REFRESH_TOKEN = os.getenv('GDRIVE_REFRESH_TOKEN')
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_SIMULATION_CHAT_ID = os.getenv('TELEGRAM_SIMULATION_CHAT_ID')
 TELEGRAM_ALERT_CHAT_ID = os.getenv('TELEGRAM_ALERT_CHAT_ID')
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
@@ -317,8 +317,8 @@ def resolve_daily_batch(now_kst):
 
 def _resolve_telegram_chat_id(channel="ops"):
     if channel == "alert":
-        return TELEGRAM_ALERT_CHAT_ID or TELEGRAM_CHAT_ID
-    return TELEGRAM_CHAT_ID
+        return TELEGRAM_ALERT_CHAT_ID or TELEGRAM_SIMULATION_CHAT_ID
+    return TELEGRAM_SIMULATION_CHAT_ID
 
 
 def send_telegram(message, channel="ops"):
