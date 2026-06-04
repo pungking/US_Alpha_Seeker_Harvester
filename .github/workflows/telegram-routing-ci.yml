@@ -1,0 +1,35 @@
+name: harvester-telegram-routing-ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  telegram-routing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Symbol-agnostic runtime guard
+        run: python scripts/check_symbol_agnostic_runtime.py
+      - name: Telegram routing policy audit
+        run: python scripts/check_telegram_routing_policy.py
+      - name: Python compile check
+        run: python -m py_compile harvester.py scripts/check_symbol_agnostic_runtime.py scripts/check_telegram_routing_policy.py
+      - name: Upload routing report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: harvester-telegram-routing-policy
+          path: state/telegram-routing-policy-audit.*
+          if-no-files-found: warn
