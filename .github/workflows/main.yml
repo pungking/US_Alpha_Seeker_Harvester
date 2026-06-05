@@ -59,6 +59,9 @@ jobs:
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          # Earnings event map vendor lineage. Missing keys degrade to yfinance-only coverage.
+          FMP_KEY: ${{ secrets.FMP_KEY || secrets.FMP_API_KEY }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY || secrets.FINNHUB_API_KEY }}
           
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           # Harvester collection notifications must go to simulation/private channel.
