@@ -63,6 +63,7 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           DAILY_BATCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_mode || 'auto' }}
           HARVESTER_RUN_SUMMARY_PATH: state/last-harvester-run.json
+          HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH: state/stage4-earnings-event-coverage-audit.json
         run: |
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
@@ -88,6 +89,7 @@ jobs:
           path: |
             state/last-harvester-run.json
             state/harvester-failure-report.json
+            state/stage4-earnings-event-coverage-audit.json
             state/symbol-agnostic-runtime-check.json
             state/symbol-agnostic-runtime-check.md
             state/telegram-routing-policy-audit.*

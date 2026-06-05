@@ -38,6 +38,10 @@ GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
 DAILY_BATCH_MODE = (os.getenv('DAILY_BATCH_MODE') or 'auto').strip().lower()
 HARVESTER_RUN_SUMMARY_PATH = (os.getenv("HARVESTER_RUN_SUMMARY_PATH") or "state/last-harvester-run.json").strip()
 HARVESTER_FAILURE_REPORT_PATH = (os.getenv("HARVESTER_FAILURE_REPORT_PATH") or "state/harvester-failure-report.json").strip()
+HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH = (
+    os.getenv("HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH")
+    or "state/stage4-earnings-event-coverage-audit.json"
+).strip()
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -147,6 +151,18 @@ SYMBOL_STATE_STALE_QUOTE_STREAK = _read_positive_int_env("HARVESTER_STALE_QUOTE_
 SYMBOL_STATE_RETIRE_DAYS = _read_positive_int_env("HARVESTER_RETIRE_DAYS", 45)
 HARVESTER_FAILURE_SAMPLE_LIMIT = _read_positive_int_env("HARVESTER_FAILURE_SAMPLE_LIMIT", 20)
 RUN_FAILURE_DETAILS = []
+
+
+def write_json_report(path, payload, label):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=True, indent=2)
+        fp.write("\n")
+    os.replace(tmp_path, path)
+    print(f"🧾 {label} saved: {path}", flush=True)
 
 
 def write_harvester_run_summary(payload):
@@ -2048,6 +2064,11 @@ def run_harvester():
                             earnings_event_count = len(earnings_event_map.get('events', {}))
                             earnings_event_source = earnings_event_map.get('source', 'unavailable')
                             earnings_event_missing = int(earnings_event_map.get('missing_count', max(0, total_count - earnings_event_count)))
+                            write_json_report(
+                                HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH,
+                                earnings_event_audit,
+                                "Stage4 earnings event coverage audit"
+                            )
                             upload_json(EARNINGS_EVENT_FILENAME, earnings_event_map, sys_id)
                             upload_json(EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME, earnings_event_audit, sys_id)
                             earnings_event_ready = True
@@ -2088,6 +2109,7 @@ def run_harvester():
                 "earningsEventMissing": dispatch_earnings_event_missing,
                 "earningsEventSource": dispatch_earnings_event_source,
                 "earningsEventCoverageAudit": EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME,
+                "earningsEventCoverageAuditPath": HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH,
                 "benchmarkSuccess": dispatch_benchmark_success,
                 "benchmarkSkipped": dispatch_benchmark_skipped,
                 "benchmarkFailed": dispatch_benchmark_fail,
