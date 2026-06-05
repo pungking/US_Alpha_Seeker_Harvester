@@ -125,6 +125,7 @@ BENCHMARK_SPECS = [
 
 MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
 EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
+EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME = "STAGE4_EARNINGS_EVENT_COVERAGE_AUDIT.json"
 HARVESTER_SYMBOL_STATE_FILENAME = "HARVESTER_SYMBOL_STATE.json"
 FMP_API_KEY = os.getenv("FMP_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_KEY") or os.getenv("FINNHUB_API_KEY")
@@ -164,6 +165,12 @@ def _short_failure_text(value, max_len=240):
     if len(text) <= max_len:
         return text
     return text[: max_len - 3] + "..."
+
+
+def redact_secret_text(value):
+    text = str(value if value is not None else "")
+    text = re.sub(r"(?i)(apikey|api_key|token|key)=([^&\s]+)", r"\1=***", text)
+    return text
 
 
 def record_symbol_failure(symbol, stage, category, reason, **context):
@@ -1594,6 +1601,52 @@ def upsert_earnings_event(event_map, symbol, date_str, now_date, source, confide
         event_map[symbol] = new_payload
 
 
+def _count_event_field(events, key):
+    return dict(Counter(str(event.get(key) or "unknown") for event in events.values()))
+
+
+def build_earnings_event_coverage_audit(tickers, trigger_file, timestamp, event_payload):
+    target_symbols = sorted({str(ticker).upper() for ticker in tickers if ticker})
+    events = event_payload.get("events", {}) if isinstance(event_payload, dict) else {}
+    matched_symbols = sorted(set(events.keys()) & set(target_symbols))
+    missing_symbols = sorted(set(target_symbols) - set(events.keys()))
+    event_count = len(events)
+    target_count = len(target_symbols)
+    coverage_pct = round((len(matched_symbols) / target_count) * 100, 2) if target_count else 0.0
+    return {
+        "generated_at_utc": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "scope": "stage4_earnings_event_map_coverage_audit",
+        "trigger_file": trigger_file,
+        "source_timestamp": timestamp,
+        "event_map_source": event_payload.get("source", "unavailable") if isinstance(event_payload, dict) else "unavailable",
+        "window": event_payload.get("window", {}) if isinstance(event_payload, dict) else {},
+        "universe_count": target_count,
+        "events_count": event_count,
+        "matched_count": len(matched_symbols),
+        "missing_count": len(missing_symbols),
+        "coverage_pct": coverage_pct,
+        "matched_symbols": matched_symbols,
+        "missing_symbols": missing_symbols,
+        "sample_missing_symbols": missing_symbols[:50],
+        "source_counts": _count_event_field(events, "source"),
+        "confidence_counts": _count_event_field(events, "confidence"),
+        "event_risk_counts": _count_event_field(events, "event_risk"),
+        "source_attempts": event_payload.get("source_attempts", []) if isinstance(event_payload, dict) else [],
+        "done_when": {
+            "eventsCountAvailable": event_count >= 0,
+            "matchedSymbolsAvailable": True,
+            "missingSymbolsAvailable": True,
+            "triggerFileRecorded": bool(trigger_file),
+            "sourceTimestampRecorded": bool(timestamp)
+        },
+        "safety": {
+            "brokerMutationAuthorized": False,
+            "executionPolicyChanged": False,
+            "reason": "harvester report-only coverage audit"
+        }
+    }
+
+
 def extract_yf_earnings_date(stock):
     # 1) get_earnings_dates (가장 신뢰도 높음)
     try:
@@ -1644,11 +1697,15 @@ def extract_yf_earnings_date(stock):
 def fetch_earnings_event_map(tickers, trigger_file, timestamp):
     payload = {
         "timestamp": timestamp,
+        "source_timestamp": timestamp,
         "trigger_file": trigger_file,
         "source": "unavailable",
         "universe_count": len(tickers),
         "covered_count": 0,
         "missing_count": len(tickers),
+        "matched_symbols": [],
+        "missing_symbols": sorted({ticker.upper() for ticker in tickers if ticker}),
+        "source_attempts": [],
         "events": {}
     }
 
@@ -1663,6 +1720,7 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
     target_set = {ticker.upper() for ticker in tickers if ticker}
     event_map = {}
     source_labels = []
+    source_attempts = []
 
     # 1) FMP 캘린더 (단일 호출)
     if FMP_API_KEY:
@@ -1685,6 +1743,7 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
         calendar = None
         used_endpoint = None
         endpoint_errors = []
+        fmp_before = len(event_map)
         for endpoint_name, url in endpoint_candidates:
             try:
                 response = requests.get(url, timeout=20)
@@ -1692,14 +1751,14 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
                 payload_json = response.json() if response.content else []
 
                 if isinstance(payload_json, dict) and payload_json.get("Error Message"):
-                    endpoint_errors.append(f"{endpoint_name}: {payload_json.get('Error Message')}")
+                    endpoint_errors.append(f"{endpoint_name}: {redact_secret_text(payload_json.get('Error Message'))}")
                     continue
 
                 calendar = payload_json if isinstance(payload_json, list) else []
                 used_endpoint = endpoint_name
                 break
             except Exception as e:
-                endpoint_errors.append(f"{endpoint_name}: {e}")
+                endpoint_errors.append(f"{endpoint_name}: {type(e).__name__}: {redact_secret_text(e)}")
 
         if isinstance(calendar, list):
             for event in calendar:
@@ -1712,13 +1771,39 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
             if any(v.get('source') == 'fmp' for v in event_map.values()):
                 source_labels.append('fmp')
                 print(f"✅ FMP earnings calendar 사용: {used_endpoint}")
+            source_attempts.append({
+                "source": "fmp",
+                "status": "ok",
+                "endpoint": used_endpoint,
+                "rows": len(calendar),
+                "matched_delta": len(event_map) - fmp_before,
+                "errors": endpoint_errors[:5]
+            })
         else:
             print(f"⚠️ FMP earnings calendar 실패: {' | '.join(endpoint_errors) if endpoint_errors else 'unknown'}")
+            source_attempts.append({
+                "source": "fmp",
+                "status": "failed",
+                "endpoint": used_endpoint,
+                "rows": 0,
+                "matched_delta": 0,
+                "errors": endpoint_errors[:5]
+            })
+    else:
+        source_attempts.append({
+            "source": "fmp",
+            "status": "skipped_missing_key",
+            "endpoint": None,
+            "rows": 0,
+            "matched_delta": 0,
+            "errors": []
+        })
 
     # 2) Finnhub 캘린더 (단일 호출)
     missing_symbols = sorted(target_set - set(event_map.keys()))
     if missing_symbols and FINNHUB_API_KEY:
         try:
+            finnhub_before = len(event_map)
             url = f"https://finnhub.io/api/v1/calendar/earnings?from={start_date}&to={end_date}&token={FINNHUB_API_KEY}"
             response = requests.get(url, timeout=20)
             response.raise_for_status()
@@ -1739,8 +1824,34 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
 
             if any(v.get('source') == 'finnhub' for v in event_map.values()):
                 source_labels.append('finnhub')
+            source_attempts.append({
+                "source": "finnhub",
+                "status": "ok",
+                "endpoint": "calendar/earnings",
+                "rows": len(rows) if isinstance(rows, list) else 0,
+                "matched_delta": len(event_map) - finnhub_before,
+                "errors": []
+            })
         except Exception as e:
-            print(f"⚠️ Finnhub earnings calendar 실패: {str(e)}")
+            clean_error = redact_secret_text(e)
+            print(f"⚠️ Finnhub earnings calendar 실패: {clean_error}")
+            source_attempts.append({
+                "source": "finnhub",
+                "status": "failed",
+                "endpoint": "calendar/earnings",
+                "rows": 0,
+                "matched_delta": 0,
+                "errors": [clean_error]
+            })
+    elif missing_symbols:
+        source_attempts.append({
+            "source": "finnhub",
+            "status": "skipped_missing_key",
+            "endpoint": "calendar/earnings",
+            "rows": 0,
+            "matched_delta": 0,
+            "errors": []
+        })
 
     # 3) yfinance fallback (누락 티커만)
     missing_symbols = sorted(target_set - set(event_map.keys()))
@@ -1763,11 +1874,39 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
 
         if yf_found > 0:
             source_labels.append('yfinance')
+        source_attempts.append({
+            "source": "yfinance",
+            "status": "ok",
+            "endpoint": "Ticker.get_earnings_dates/calendar/info",
+            "rows": len(missing_symbols),
+            "matched_delta": yf_found,
+            "errors": []
+        })
+    else:
+        source_attempts.append({
+            "source": "yfinance",
+            "status": "skipped_no_missing_symbols",
+            "endpoint": "Ticker.get_earnings_dates/calendar/info",
+            "rows": 0,
+            "matched_delta": 0,
+            "errors": []
+        })
 
     payload["events"] = event_map
     payload["covered_count"] = len(event_map)
     payload["missing_count"] = max(0, len(target_set) - len(event_map))
+    payload["matched_symbols"] = sorted(set(event_map.keys()) & target_set)
+    payload["missing_symbols"] = sorted(target_set - set(event_map.keys()))
     payload["source"] = '+'.join(source_labels) if source_labels else 'unavailable'
+    payload["source_attempts"] = source_attempts
+    payload["source_counts"] = _count_event_field(event_map, "source")
+    payload["confidence_counts"] = _count_event_field(event_map, "confidence")
+    payload["event_risk_counts"] = _count_event_field(event_map, "event_risk")
+    payload["window"] = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "max_forward_days": 60
+    }
 
     return payload
 
@@ -1789,6 +1928,8 @@ def run_harvester():
     dispatch_market_regime_ready = False
     dispatch_earnings_event_ready = False
     dispatch_earnings_event_count = 0
+    dispatch_earnings_event_missing = 0
+    dispatch_earnings_event_source = "unavailable"
     daily_group_label = "N/A"
     daily_batch_mode = DAILY_BATCH_MODE or "auto"
     daily_target_count = 0
@@ -1898,16 +2039,30 @@ def run_harvester():
                         earnings_event_missing = total_count
                         try:
                             earnings_event_map = fetch_earnings_event_map(s3_tickers, current_trigger_file, today_str)
+                            earnings_event_audit = build_earnings_event_coverage_audit(
+                                s3_tickers,
+                                current_trigger_file,
+                                today_str,
+                                earnings_event_map
+                            )
                             earnings_event_count = len(earnings_event_map.get('events', {}))
                             earnings_event_source = earnings_event_map.get('source', 'unavailable')
                             earnings_event_missing = int(earnings_event_map.get('missing_count', max(0, total_count - earnings_event_count)))
                             upload_json(EARNINGS_EVENT_FILENAME, earnings_event_map, sys_id)
+                            upload_json(EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME, earnings_event_audit, sys_id)
                             earnings_event_ready = True
-                            print(f"📅 실적 이벤트 맵 완료: {earnings_event_count}건 (source: {earnings_event_source}, missing: {earnings_event_missing})")
+                            print(
+                                "📅 실적 이벤트 맵 완료: "
+                                f"{earnings_event_count}건 "
+                                f"(source: {earnings_event_source}, missing: {earnings_event_missing}, "
+                                f"audit={EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME})"
+                            )
                         except Exception as e:
                             print(f"⚠️ 실적 이벤트 맵 업로드 실패: {str(e)}")
                         dispatch_earnings_event_ready = earnings_event_ready
                         dispatch_earnings_event_count = earnings_event_count
+                        dispatch_earnings_event_missing = earnings_event_missing
+                        dispatch_earnings_event_source = earnings_event_source
 
                         update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
 
@@ -1930,6 +2085,9 @@ def run_harvester():
                 "marketRegimeReady": dispatch_market_regime_ready,
                 "earningsEventReady": dispatch_earnings_event_ready,
                 "earningsEventCount": dispatch_earnings_event_count,
+                "earningsEventMissing": dispatch_earnings_event_missing,
+                "earningsEventSource": dispatch_earnings_event_source,
+                "earningsEventCoverageAudit": EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME,
                 "benchmarkSuccess": dispatch_benchmark_success,
                 "benchmarkSkipped": dispatch_benchmark_skipped,
                 "benchmarkFailed": dispatch_benchmark_fail,
