@@ -26,6 +26,12 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: master-stock-harvester-${{ github.ref }}
+  # Stage3 handoff is time-sensitive for Stage4 readiness; let it preempt
+  # stale daily/manual collection runs instead of competing for Drive/API quota.
+  cancel-in-progress: ${{ github.event_name == 'repository_dispatch' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
