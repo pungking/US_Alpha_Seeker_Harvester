@@ -18,6 +18,30 @@ This is used to track symbols that are onboarding, partially covered, recovered,
   - Consecutive runs with missing quote payload before state becomes `STALE`.
 - `HARVESTER_RETIRE_DAYS` (default: `45`)
   - If a symbol is not seen for this many days, state is moved to `RETIRED`.
+- `HARVESTER_SKIP_RETIRED_SYMBOLS` (default: `true`)
+  - Skip data collection for symbols already classified as `RETIRED`.
+- `HARVESTER_SKIP_EXCLUDED_SYMBOLS` (default: `true`)
+  - Skip data collection for symbols already classified as `EXCLUDED` because the instrument type is not analysis-eligible.
+
+## Mapping freshness audit
+
+The harvester treats `System_Identity_Maps/Ticker_ID_Mapping_Final.json` as an upstream universe contract, not as a file it can destructively rewrite from quote failures alone.
+
+To keep collection fresh without hiding bad symbols, daily runs now:
+
+- classify stale/retired/excluded symbols from `HARVESTER_SYMBOL_STATE.json`,
+- skip only confirmed `RETIRED` and `EXCLUDED` symbols,
+- keep stale common-stock symbols visible until the retire policy or an upstream mapping refresh resolves them,
+- write an audit artifact with mapping-review and skip candidates.
+
+Artifacts:
+
+- `state/harvester-mapping-freshness-audit.json`
+- `state/harvester-mapping-freshness-audit.md`
+
+Drive mirror:
+
+- `System_Identity_Maps/HARVESTER_MAPPING_FRESHNESS_AUDIT.json`
 
 ## Run summary artifact
 

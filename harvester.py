@@ -42,6 +42,14 @@ HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH = (
     os.getenv("HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH")
     or "state/stage4-earnings-event-coverage-audit.json"
 ).strip()
+HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH = (
+    os.getenv("HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH")
+    or "state/harvester-mapping-freshness-audit.json"
+).strip()
+HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH = (
+    os.getenv("HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH")
+    or "state/harvester-mapping-freshness-audit.md"
+).strip()
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -131,8 +139,16 @@ MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
 EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
 EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME = "STAGE4_EARNINGS_EVENT_COVERAGE_AUDIT.json"
 HARVESTER_SYMBOL_STATE_FILENAME = "HARVESTER_SYMBOL_STATE.json"
+HARVESTER_MAPPING_FRESHNESS_AUDIT_FILENAME = "HARVESTER_MAPPING_FRESHNESS_AUDIT.json"
 FMP_API_KEY = os.getenv("FMP_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_KEY") or os.getenv("FINNHUB_API_KEY")
+
+
+def _read_bool_env(name, default=False):
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _read_positive_int_env(name, default):
@@ -150,7 +166,11 @@ SYMBOL_STATE_STALE_HISTORY_STREAK = _read_positive_int_env("HARVESTER_STALE_HIST
 SYMBOL_STATE_STALE_QUOTE_STREAK = _read_positive_int_env("HARVESTER_STALE_QUOTE_STREAK", 3)
 SYMBOL_STATE_RETIRE_DAYS = _read_positive_int_env("HARVESTER_RETIRE_DAYS", 45)
 HARVESTER_FAILURE_SAMPLE_LIMIT = _read_positive_int_env("HARVESTER_FAILURE_SAMPLE_LIMIT", 20)
+HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT = _read_positive_int_env("HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT", 100)
+HARVESTER_SKIP_RETIRED_SYMBOLS = _read_bool_env("HARVESTER_SKIP_RETIRED_SYMBOLS", True)
+HARVESTER_SKIP_EXCLUDED_SYMBOLS = _read_bool_env("HARVESTER_SKIP_EXCLUDED_SYMBOLS", True)
 RUN_FAILURE_DETAILS = []
+RUN_SYMBOL_SKIP_DETAILS = []
 
 
 def write_json_report(path, payload, label):
@@ -161,6 +181,17 @@ def write_json_report(path, payload, label):
     with open(tmp_path, "w", encoding="utf-8") as fp:
         json.dump(payload, fp, ensure_ascii=True, indent=2)
         fp.write("\n")
+    os.replace(tmp_path, path)
+    print(f"🧾 {label} saved: {path}", flush=True)
+
+
+def write_text_report(path, payload, label):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fp:
+        fp.write(str(payload or ""))
     os.replace(tmp_path, path)
     print(f"🧾 {label} saved: {path}", flush=True)
 
@@ -206,12 +237,41 @@ def record_symbol_failure(symbol, stage, category, reason, **context):
     )
 
 
+def record_symbol_skip(symbol, stage, category, reason, **context):
+    clean_context = {}
+    for key, value in context.items():
+        if value is None or value == "":
+            continue
+        clean_context[key] = _short_failure_text(value, 220)
+    RUN_SYMBOL_SKIP_DETAILS.append(
+        {
+            "symbol": str(symbol or "UNKNOWN").strip().upper() or "UNKNOWN",
+            "stage": str(stage or "unknown").strip(),
+            "category": str(category or "UNKNOWN").strip().upper(),
+            "reason": _short_failure_text(reason or "unknown"),
+            "context": clean_context,
+        }
+    )
+
+
 def build_failure_snapshot():
     category_counts = Counter(item.get("category") or "UNKNOWN" for item in RUN_FAILURE_DETAILS)
     stage_counts = Counter(item.get("stage") or "unknown" for item in RUN_FAILURE_DETAILS)
     samples = RUN_FAILURE_DETAILS[:HARVESTER_FAILURE_SAMPLE_LIMIT]
     return {
         "total": len(RUN_FAILURE_DETAILS),
+        "categoryCounts": dict(sorted(category_counts.items())),
+        "stageCounts": dict(sorted(stage_counts.items())),
+        "samples": samples,
+    }
+
+
+def build_skip_snapshot():
+    category_counts = Counter(item.get("category") or "UNKNOWN" for item in RUN_SYMBOL_SKIP_DETAILS)
+    stage_counts = Counter(item.get("stage") or "unknown" for item in RUN_SYMBOL_SKIP_DETAILS)
+    samples = RUN_SYMBOL_SKIP_DETAILS[:HARVESTER_FAILURE_SAMPLE_LIMIT]
+    return {
+        "total": len(RUN_SYMBOL_SKIP_DETAILS),
         "categoryCounts": dict(sorted(category_counts.items())),
         "stageCounts": dict(sorted(stage_counts.items())),
         "samples": samples,
@@ -231,6 +291,7 @@ def write_harvester_failure_report(payload):
 
 def build_harvester_failure_report(summary):
     snapshot = build_failure_snapshot()
+    skip_snapshot = build_skip_snapshot()
     return {
         "schemaVersion": 1,
         "generatedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
@@ -241,20 +302,34 @@ def build_harvester_failure_report(summary):
             "stageCounts": snapshot["stageCounts"],
             "sampleLimit": HARVESTER_FAILURE_SAMPLE_LIMIT,
         },
+        "skipSummary": {
+            "total": skip_snapshot["total"],
+            "categoryCounts": skip_snapshot["categoryCounts"],
+            "stageCounts": skip_snapshot["stageCounts"],
+            "sampleLimit": HARVESTER_FAILURE_SAMPLE_LIMIT,
+        },
         "failures": RUN_FAILURE_DETAILS,
+        "skips": RUN_SYMBOL_SKIP_DETAILS,
     }
 
 
 def failure_telegram_summary():
     if not RUN_FAILURE_DETAILS:
-        return "실패 상세: `none`"
-    snapshot = build_failure_snapshot()
-    count_preview = ", ".join(f"{k}:{v}" for k, v in snapshot["categoryCounts"].items()) or "unknown"
-    sample_preview = ", ".join(
-        f"{item.get('symbol')}:{item.get('category')}/{item.get('reason')}"
-        for item in snapshot["samples"][:5]
-    )
-    return f"실패상세: `{count_preview}`\n샘플: `{_short_failure_text(sample_preview, 900)}`"
+        failure_text = "실패 상세: `none`"
+    else:
+        snapshot = build_failure_snapshot()
+        count_preview = ", ".join(f"{k}:{v}" for k, v in snapshot["categoryCounts"].items()) or "unknown"
+        sample_preview = ", ".join(
+            f"{item.get('symbol')}:{item.get('category')}/{item.get('reason')}"
+            for item in snapshot["samples"][:5]
+        )
+        failure_text = f"실패상세: `{count_preview}`\n샘플: `{_short_failure_text(sample_preview, 900)}`"
+
+    if not RUN_SYMBOL_SKIP_DETAILS:
+        return failure_text
+    skip_snapshot = build_skip_snapshot()
+    skip_preview = ", ".join(f"{k}:{v}" for k, v in skip_snapshot["categoryCounts"].items()) or "unknown"
+    return f"{failure_text}\n라이프사이클 skip: `{skip_preview}`"
 
 def get_drive_service():
     creds_data = {
@@ -1064,6 +1139,203 @@ def _apply_symbol_retire_policy(state_map, touched_set, now_text):
         if last_seen_dt <= retire_cutoff:
             entry["state"] = "RETIRED"
             entry["reason"] = f"retire_timeout_{SYMBOL_STATE_RETIRE_DAYS}d"
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def should_skip_symbol_for_collection(state_entry):
+    if not isinstance(state_entry, dict):
+        return False, None, None
+    state = str(state_entry.get("state") or "").strip().upper()
+    reason = str(state_entry.get("reason") or "unknown")
+    if state == "RETIRED" and HARVESTER_SKIP_RETIRED_SYMBOLS:
+        return True, "SYMBOL_SKIPPED_RETIRED", reason
+    if state == "EXCLUDED" and HARVESTER_SKIP_EXCLUDED_SYMBOLS:
+        return True, "SYMBOL_SKIPPED_EXCLUDED", reason
+    return False, None, None
+
+
+def _mapping_generated_at(full_map):
+    if not isinstance(full_map, dict):
+        return None
+    for key in ("generatedAt", "generated_at", "updatedAt", "updated_at"):
+        if full_map.get(key):
+            return full_map.get(key)
+    meta = full_map.get("_meta") or full_map.get("meta") or full_map.get("__meta__")
+    if isinstance(meta, dict):
+        for key in ("generatedAt", "generated_at", "updatedAt", "updated_at"):
+            if meta.get(key):
+                return meta.get(key)
+    return None
+
+
+def _state_counts_for_symbols(symbol_state, symbols):
+    counts = Counter()
+    for ticker in symbols:
+        entry = symbol_state.get(ticker) if isinstance(symbol_state, dict) else None
+        state = "UNSEEN"
+        if isinstance(entry, dict):
+            state = str(entry.get("state") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        counts[state] += 1
+    return dict(sorted(counts.items()))
+
+
+def _symbol_state_candidate(ticker, entry):
+    entry = entry if isinstance(entry, dict) else {}
+    analysis_eligible = entry.get("analysisEligible")
+    return {
+        "symbol": ticker,
+        "state": str(entry.get("state") or "UNKNOWN").strip().upper() or "UNKNOWN",
+        "reason": str(entry.get("reason") or "unknown"),
+        "instrumentType": entry.get("instrumentType") or "unknown",
+        "analysisEligible": bool(analysis_eligible) if analysis_eligible is not None else None,
+        "historyTier": entry.get("historyTier") or "unknown",
+        "historyPeriods": _safe_int(entry.get("historyPeriods")),
+        "missingHistoryStreak": _safe_int(entry.get("missingHistoryStreak")),
+        "missingQuoteStreak": _safe_int(entry.get("missingQuoteStreak")),
+        "firstSeenAt": entry.get("firstSeenAt"),
+        "lastSeenAt": entry.get("lastSeenAt"),
+        "lastSkippedAt": entry.get("lastSkippedAt"),
+    }
+
+
+def _top_candidates(candidates, limit=None):
+    if limit is None:
+        limit = HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT
+    return sorted(
+        candidates,
+        key=lambda x: (
+            -_safe_int(x.get("missingQuoteStreak")),
+            -_safe_int(x.get("missingHistoryStreak")),
+            str(x.get("symbol") or ""),
+        ),
+    )[:limit]
+
+
+def build_mapping_freshness_audit(full_map, filtered_tickers, symbol_state, today_str, batch_label, batch_mode):
+    all_symbols = sorted(
+        str(ticker).strip().upper()
+        for ticker, info in (full_map or {}).items()
+        if isinstance(ticker, str) and ticker and isinstance(info, dict) and info.get("group")
+    )
+    batch_symbols = sorted(str(ticker).strip().upper() for ticker in (filtered_tickers or {}).keys())
+    generated_at = _mapping_generated_at(full_map)
+
+    retired_candidates = []
+    excluded_candidates = []
+    stale_candidates = []
+    quote_missing_persistent = []
+    history_missing_persistent = []
+    for ticker in all_symbols:
+        entry = symbol_state.get(ticker) if isinstance(symbol_state, dict) else {}
+        candidate = _symbol_state_candidate(ticker, entry)
+        state = candidate["state"]
+        if state == "RETIRED":
+            retired_candidates.append(candidate)
+        if state == "EXCLUDED" or candidate.get("analysisEligible") is False and state != "UNSEEN":
+            excluded_candidates.append(candidate)
+        if state == "STALE":
+            stale_candidates.append(candidate)
+        if candidate["missingQuoteStreak"] >= SYMBOL_STATE_STALE_QUOTE_STREAK:
+            quote_missing_persistent.append(candidate)
+        if candidate["missingHistoryStreak"] >= SYMBOL_STATE_STALE_HISTORY_STREAK:
+            history_missing_persistent.append(candidate)
+
+    skip_symbols = sorted({item.get("symbol") for item in RUN_SYMBOL_SKIP_DETAILS if item.get("symbol")})
+    mapping_review_symbols = sorted(
+        {
+            *(item["symbol"] for item in retired_candidates),
+            *(item["symbol"] for item in excluded_candidates),
+            *(item["symbol"] for item in stale_candidates),
+            *(item["symbol"] for item in quote_missing_persistent),
+            *(item["symbol"] for item in history_missing_persistent),
+        }
+    )
+    action_counts = {
+        "skipCollection": len(skip_symbols),
+        "mappingReview": len(mapping_review_symbols),
+        "retired": len(retired_candidates),
+        "excluded": len(excluded_candidates),
+        "stale": len(stale_candidates),
+        "persistentQuoteMissing": len(quote_missing_persistent),
+        "persistentHistoryMissing": len(history_missing_persistent),
+    }
+
+    mapping_metadata_status = "present" if generated_at else "missing_generated_at"
+    return {
+        "schemaVersion": 1,
+        "generatedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "batch": {
+            "label": batch_label,
+            "mode": batch_mode,
+            "runLocalTime": today_str,
+        },
+        "mapping": {
+            "sourceFile": "Ticker_ID_Mapping_Final.json",
+            "mappingGeneratedAt": generated_at,
+            "mappingMetadataStatus": mapping_metadata_status,
+            "totalSymbols": len(all_symbols),
+            "batchSymbols": len(batch_symbols),
+            "stateCountsAll": _state_counts_for_symbols(symbol_state, all_symbols),
+            "stateCountsBatch": _state_counts_for_symbols(symbol_state, batch_symbols),
+            "newListingCoverageStatus": (
+                "unverifiable_without_mapping_generated_at"
+                if not generated_at
+                else "mapping_timestamp_available"
+            ),
+        },
+        "failureSummary": build_failure_snapshot(),
+        "skipSummary": build_skip_snapshot(),
+        "actionCounts": action_counts,
+        "retiredCandidates": _top_candidates(retired_candidates),
+        "instrumentIneligibleCandidates": _top_candidates(excluded_candidates),
+        "staleMappingCandidates": _top_candidates(stale_candidates),
+        "quoteMissingPersistentCandidates": _top_candidates(quote_missing_persistent),
+        "historyMissingPersistentCandidates": _top_candidates(history_missing_persistent),
+        "recommendedActions": {
+            "skipCollectionSymbols": skip_symbols[:HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT],
+            "mappingReviewSymbols": mapping_review_symbols[:HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT],
+            "doNotRewriteMappingAutomatically": True,
+            "requiresUpstreamUniverseRefreshForNewListings": not bool(generated_at),
+            "reason": (
+                "Collection freshness is enforced by lifecycle state; destructive mapping edits require "
+                "an authoritative upstream universe refresh."
+            ),
+        },
+    }
+
+
+def _mapping_audit_markdown(audit):
+    action = audit.get("actionCounts", {}) if isinstance(audit, dict) else {}
+    mapping = audit.get("mapping", {}) if isinstance(audit, dict) else {}
+    lines = [
+        "# Harvester Mapping Freshness Audit",
+        "",
+        f"- Generated: `{audit.get('generatedAt')}`",
+        f"- Source: `{mapping.get('sourceFile')}`",
+        f"- Mapping metadata: `{mapping.get('mappingMetadataStatus')}`",
+        f"- Symbols: total `{mapping.get('totalSymbols')}`, batch `{mapping.get('batchSymbols')}`",
+        f"- Lifecycle skips: `{action.get('skipCollection', 0)}`",
+        f"- Mapping review symbols: `{action.get('mappingReview', 0)}`",
+        f"- Retired: `{action.get('retired', 0)}` | Excluded: `{action.get('excluded', 0)}` | Stale: `{action.get('stale', 0)}`",
+        "",
+        "## Recommended Policy",
+        "",
+        "- Do not repeatedly collect symbols already classified as `RETIRED` or `EXCLUDED`.",
+        "- Keep stale/common symbols visible for review until the retire policy classifies them.",
+        "- Do not destructively rewrite `Ticker_ID_Mapping_Final.json` from quote failures alone.",
+        "- Refresh new listings from the upstream universe/mapping producer, not from Harvester guesswork.",
+        "",
+    ]
+    review = audit.get("recommendedActions", {}).get("mappingReviewSymbols", [])
+    if review:
+        lines.extend(["## Review Sample", "", ", ".join(f"`{s}`" for s in review[:40]), ""])
+    return "\n".join(lines).rstrip() + "\n"
 
 def get_dispatch_trigger_file():
     if not GITHUB_EVENT_PATH:
@@ -1932,6 +2204,7 @@ def run_harvester():
     start_time = time.time()
     started_at_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     total_success, total_error = 0, 0
+    total_lifecycle_skipped = 0
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
     is_weekend_update = (now_kst.weekday() in (5, 6))
@@ -2144,7 +2417,15 @@ def run_harvester():
         if not isinstance(full_map, dict):
             full_map = {}
             
-        filtered_tickers = {t: info for t, info in full_map.items() if (t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars)}
+        filtered_tickers = {
+            t: info
+            for t, info in full_map.items()
+            if isinstance(t, str)
+            and t
+            and isinstance(info, dict)
+            and info.get("group")
+            and ((t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars))
+        }
         daily_target_count = len(filtered_tickers)
 
         send_telegram(
@@ -2158,7 +2439,7 @@ def run_harvester():
         for group in groups:
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
             g_total = len(group_tickers)
-            g_success, g_error = 0, 0
+            g_success, g_error, g_lifecycle_skipped = 0, 0, 0
             print(f"\n--- 📦 그룹 [{group}] 작업 시작 ---")
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
             
@@ -2172,6 +2453,29 @@ def run_harvester():
                 success_flag = False
                 failure_recorded = False
                 last_attempt_error = None
+                previous_state_entry = symbol_state.get(ticker) if isinstance(symbol_state, dict) else None
+                should_skip, skip_category, skip_reason = should_skip_symbol_for_collection(previous_state_entry)
+                if should_skip:
+                    g_lifecycle_skipped += 1
+                    if isinstance(previous_state_entry, dict):
+                        previous_state_entry["lastSkippedAt"] = today_str
+                        previous_state_entry["lastSkipReason"] = skip_reason
+                    record_symbol_skip(
+                        ticker,
+                        "daily_lifecycle",
+                        skip_category,
+                        skip_reason,
+                        group=group,
+                        state=(previous_state_entry or {}).get("state"),
+                        instrumentType=(previous_state_entry or {}).get("instrumentType"),
+                        missingQuoteStreak=(previous_state_entry or {}).get("missingQuoteStreak"),
+                        missingHistoryStreak=(previous_state_entry or {}).get("missingHistoryStreak"),
+                    )
+                    print(
+                        f"⏭️ LIFECYCLE_SKIP [{ticker}] category={skip_category} reason={skip_reason}",
+                        flush=True
+                    )
+                    continue
                 for attempt in range(3): # 수집 재시도
                     try:
                         if i % 50 == 0:
@@ -2621,16 +2925,43 @@ def run_harvester():
             
             total_success += g_success
             total_error += g_error
+            total_lifecycle_skipped += g_lifecycle_skipped
             
-            print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error}")
-            send_telegram(f"📦 *그룹 [{group}] 완료*\n✅ 성공: `{g_success}` | ❌ 실패: `{g_error}`")
+            print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error} / lifecycle skip {g_lifecycle_skipped}")
+            send_telegram(
+                f"📦 *그룹 [{group}] 완료*\n"
+                f"✅ 성공: `{g_success}` | ❌ 실패: `{g_error}` | ⏭️ lifecycle skip: `{g_lifecycle_skipped}`"
+            )
 
         _apply_symbol_retire_policy(symbol_state, symbol_state_touched, today_str)
         upload_json(HARVESTER_SYMBOL_STATE_FILENAME, symbol_state, sys_id)
 
         duration = (time.time() - start_time) / 60
+        mapping_audit = build_mapping_freshness_audit(
+            full_map,
+            filtered_tickers,
+            symbol_state,
+            today_str,
+            daily_group_label,
+            daily_batch_mode,
+        )
+        write_json_report(
+            HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH,
+            mapping_audit,
+            "Harvester mapping freshness audit",
+        )
+        write_text_report(
+            HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH,
+            _mapping_audit_markdown(mapping_audit),
+            "Harvester mapping freshness audit markdown payload",
+        )
+        upload_json(HARVESTER_MAPPING_FRESHNESS_AUDIT_FILENAME, mapping_audit, sys_id)
         failure_line = failure_telegram_summary()
-        send_telegram(f"🏁 *수집 종료*\n⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}`\n{failure_line}")
+        send_telegram(
+            f"🏁 *수집 종료*\n"
+            f"⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}` | "
+            f"lifecycle skip: `{total_lifecycle_skipped}`\n{failure_line}"
+        )
         summary_payload = {
             "status": "success",
             "startedAt": started_at_utc,
@@ -2643,12 +2974,16 @@ def run_harvester():
             "weekendUpdate": bool(is_weekend_update),
             "successCount": total_success,
             "errorCount": total_error,
+            "lifecycleSkipCount": total_lifecycle_skipped,
             "durationMinutes": round(duration, 2),
         }
         failure_report = build_harvester_failure_report(summary_payload)
         write_harvester_failure_report(failure_report)
         summary_payload["failureReportPath"] = HARVESTER_FAILURE_REPORT_PATH
+        summary_payload["mappingFreshnessAuditPath"] = HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH
         summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
+        summary_payload["skipCategoryCounts"] = failure_report.get("skipSummary", {}).get("categoryCounts", {})
+        summary_payload["mappingFreshnessActionCounts"] = mapping_audit.get("actionCounts", {})
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
         write_harvester_run_summary(summary_payload)
 
@@ -2667,6 +3002,7 @@ def run_harvester():
             "targetSymbols": daily_target_count,
             "successCount": total_success,
             "errorCount": total_error,
+            "lifecycleSkipCount": total_lifecycle_skipped,
             "durationMinutes": round(duration, 2),
             "errorType": type(e).__name__,
             "errorMessage": str(e),
@@ -2675,6 +3011,7 @@ def run_harvester():
         write_harvester_failure_report(failure_report)
         summary_payload["failureReportPath"] = HARVESTER_FAILURE_REPORT_PATH
         summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
+        summary_payload["skipCategoryCounts"] = failure_report.get("skipSummary", {}).get("categoryCounts", {})
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
         write_harvester_run_summary(summary_payload)
         print(f"⛔ run_harvester fatal: {type(e).__name__}: {e}", flush=True)
