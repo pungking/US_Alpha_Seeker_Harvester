@@ -37,6 +37,7 @@ To keep collection fresh without hiding bad symbols, daily runs now:
 - default the collection mapping to common-stock eligible listings; set `HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON=true` only if monitoring ETFs/units/rights/warrants is intentionally required,
 - classify stale/retired/excluded symbols from `HARVESTER_SYMBOL_STATE.json`,
 - skip only confirmed `RETIRED` and `EXCLUDED` symbols,
+- let the refreshed authoritative mapping override stale `EXCLUDED`/`RETIRED` state so falsely excluded active common stocks can recover,
 - keep stale common-stock symbols visible until the retire policy or an upstream mapping refresh resolves them,
 - write an audit artifact with mapping-review and skip candidates.
 

@@ -1299,7 +1299,7 @@ def _derive_symbol_lifecycle_state(prev_state, analysis_eligible, history_tier, 
         base_state = "PROVISIONAL"
         base_reason = "history_partial"
 
-    if prev_state in {"ONBOARDING", "PROVISIONAL", "STALE"} and base_state == "ACTIVE":
+    if prev_state in {"ONBOARDING", "PROVISIONAL", "STALE", "EXCLUDED", "RETIRED"} and base_state == "ACTIVE":
         return "RECOVERED", "history_recovered"
     if prev_state == "RECOVERED" and base_state == "ACTIVE":
         return "ACTIVE", "recovery_warmup_passed"
@@ -1381,7 +1381,7 @@ def should_skip_symbol_for_collection(state_entry, authoritative_mapping_refresh
     reason = str(state_entry.get("reason") or "unknown")
     if state == "RETIRED" and HARVESTER_SKIP_RETIRED_SYMBOLS and not authoritative_mapping_refreshed:
         return True, "SYMBOL_SKIPPED_RETIRED", reason
-    if state == "EXCLUDED" and HARVESTER_SKIP_EXCLUDED_SYMBOLS:
+    if state == "EXCLUDED" and HARVESTER_SKIP_EXCLUDED_SYMBOLS and not authoritative_mapping_refreshed:
         return True, "SYMBOL_SKIPPED_EXCLUDED", reason
     return False, None, None
 
