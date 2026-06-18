@@ -75,6 +75,7 @@ jobs:
           HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH: state/stage4-earnings-event-coverage-audit.json
           HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH: state/harvester-mapping-freshness-audit.json
           HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH: state/harvester-mapping-freshness-audit.md
+          HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH: state/ticker-mapping-refresh-audit.json
         run: |
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
@@ -102,6 +103,7 @@ jobs:
             state/harvester-failure-report.json
             state/harvester-mapping-freshness-audit.json
             state/harvester-mapping-freshness-audit.md
+            state/ticker-mapping-refresh-audit.json
             state/stage4-earnings-event-coverage-audit.json
             state/symbol-agnostic-runtime-check.json
             state/symbol-agnostic-runtime-check.md

@@ -50,6 +50,10 @@ HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH = (
     os.getenv("HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH")
     or "state/harvester-mapping-freshness-audit.md"
 ).strip()
+HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH = (
+    os.getenv("HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH")
+    or "state/ticker-mapping-refresh-audit.json"
+).strip()
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -140,6 +144,7 @@ EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
 EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME = "STAGE4_EARNINGS_EVENT_COVERAGE_AUDIT.json"
 HARVESTER_SYMBOL_STATE_FILENAME = "HARVESTER_SYMBOL_STATE.json"
 HARVESTER_MAPPING_FRESHNESS_AUDIT_FILENAME = "HARVESTER_MAPPING_FRESHNESS_AUDIT.json"
+TICKER_MAPPING_REFRESH_AUDIT_FILENAME = "TICKER_MAPPING_REFRESH_AUDIT.json"
 FMP_API_KEY = os.getenv("FMP_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_KEY") or os.getenv("FINNHUB_API_KEY")
 
@@ -169,6 +174,9 @@ HARVESTER_FAILURE_SAMPLE_LIMIT = _read_positive_int_env("HARVESTER_FAILURE_SAMPL
 HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT = _read_positive_int_env("HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT", 100)
 HARVESTER_SKIP_RETIRED_SYMBOLS = _read_bool_env("HARVESTER_SKIP_RETIRED_SYMBOLS", True)
 HARVESTER_SKIP_EXCLUDED_SYMBOLS = _read_bool_env("HARVESTER_SKIP_EXCLUDED_SYMBOLS", True)
+HARVESTER_TICKER_MAPPING_REFRESH_ENABLED = _read_bool_env("HARVESTER_TICKER_MAPPING_REFRESH_ENABLED", True)
+HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN = _read_bool_env("HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN", True)
+HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON = _read_bool_env("HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON", False)
 RUN_FAILURE_DETAILS = []
 RUN_SYMBOL_SKIP_DETAILS = []
 
@@ -612,6 +620,8 @@ def _classify_instrument_type(symbol, name, quote_type=None):
     n = str(name or '').strip().lower()
     q = str(quote_type or '').strip().upper()
 
+    if q == 'ETF' or n.endswith(' etf') or ' etf' in n or 'exchange traded fund' in n:
+        return 'etf'
     if q == 'WARRANT' or s.endswith('.WS') or s.endswith('-WS') or s.endswith('WS') or ' warrant' in n:
         return 'warrant'
     if q == 'UNIT' or s.endswith('.U') or s.endswith('-U') or s.endswith('U') or ' unit' in n:
@@ -655,6 +665,223 @@ def _first_finite_from_values(values):
         if num is not None:
             return num
     return None
+
+
+LISTING_SOURCE_SPECS = [
+    {
+        "name": "nasdaqtrader_nasdaqlisted",
+        "url": "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+        "symbolField": "Symbol",
+        "exchange": "NASDAQ",
+    },
+    {
+        "name": "nasdaqtrader_otherlisted",
+        "url": "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+        "symbolField": "ACT Symbol",
+        "exchange": None,
+    },
+]
+
+
+EXCHANGE_CODE_LABELS = {
+    "A": "NYSE American",
+    "N": "NYSE",
+    "P": "NYSE Arca",
+    "V": "IEX",
+    "Z": "Cboe BZX",
+}
+
+
+def _normalize_listing_symbol_for_yfinance(symbol):
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return ""
+    # Nasdaq Trader class-share symbols use dots; Yahoo/yfinance commonly
+    # expects dashes for listed class shares.
+    return text.replace("/", "-").replace(".", "-").replace("$", "-")
+
+
+def _group_for_symbol(symbol):
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return "0"
+    first = text[0]
+    return first if first.isalpha() else "0"
+
+
+def _parse_pipe_listing_text(text, spec):
+    rows = []
+    creation_time = None
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return rows, creation_time
+    header = [part.strip() for part in lines[0].split("|")]
+    for line in lines[1:]:
+        if line.startswith("File Creation Time:"):
+            creation_time = line.split(":", 1)[1].strip()
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < len(header):
+            continue
+        row = dict(zip(header, parts))
+        raw_symbol = row.get(spec.get("symbolField")) or row.get("Symbol") or row.get("ACT Symbol")
+        symbol = _normalize_listing_symbol_for_yfinance(raw_symbol)
+        if not symbol:
+            continue
+        test_issue = str(row.get("Test Issue") or "").strip().upper()
+        if test_issue and test_issue != "N":
+            continue
+        name = row.get("Security Name") or row.get("Security Name ") or ""
+        etf_flag = str(row.get("ETF") or "").strip().upper() == "Y"
+        quote_type = "ETF" if etf_flag else "EQUITY"
+        instrument_type = _classify_instrument_type(symbol, name, quote_type)
+        exchange_code = row.get("Exchange") or spec.get("exchange") or "UNKNOWN"
+        exchange_label = EXCHANGE_CODE_LABELS.get(exchange_code, exchange_code)
+        rows.append(
+            {
+                "symbol": symbol,
+                "sourceSymbol": str(raw_symbol or "").strip().upper(),
+                "name": name,
+                "group": _group_for_symbol(symbol),
+                "exchange": exchange_label,
+                "exchangeCode": exchange_code,
+                "listingSource": spec.get("name"),
+                "listingStatus": "ACTIVE",
+                "instrumentType": instrument_type,
+                "analysisEligible": instrument_type == "common",
+                "isEtf": etf_flag,
+                "roundLotSize": row.get("Round Lot Size"),
+                "nasdaqSymbol": row.get("NASDAQ Symbol"),
+            }
+        )
+    return rows, creation_time
+
+
+def fetch_authoritative_listing_rows():
+    rows = {}
+    source_summaries = []
+    for spec in LISTING_SOURCE_SPECS:
+        url = spec.get("url")
+        name = spec.get("name")
+        summary = {"name": name, "url": url, "status": "pending", "rowCount": 0}
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            parsed_rows, creation_time = _parse_pipe_listing_text(response.text, spec)
+            for row in parsed_rows:
+                rows[row["symbol"]] = row
+            summary.update(
+                {
+                    "status": "ok",
+                    "rowCount": len(parsed_rows),
+                    "sourceCreationTime": creation_time,
+                }
+            )
+        except Exception as e:
+            summary.update(
+                {
+                    "status": "failed",
+                    "errorType": type(e).__name__,
+                    "errorMessage": _short_failure_text(e),
+                }
+            )
+        source_summaries.append(summary)
+    return rows, source_summaries
+
+
+def refresh_ticker_mapping_from_authoritative_sources(existing_map, today_str):
+    existing_map = existing_map if isinstance(existing_map, dict) else {}
+    if not HARVESTER_TICKER_MAPPING_REFRESH_ENABLED:
+        return existing_map, {
+            "schemaVersion": 1,
+            "generatedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "status": "disabled",
+            "reason": "HARVESTER_TICKER_MAPPING_REFRESH_ENABLED=false",
+        }
+
+    listing_rows, source_summaries = fetch_authoritative_listing_rows()
+    ok_sources = [s for s in source_summaries if s.get("status") == "ok"]
+    if not listing_rows:
+        audit = {
+            "schemaVersion": 1,
+            "generatedAt": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "status": "source_failed_fail_open" if HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN else "source_failed",
+            "sourceSummaries": source_summaries,
+            "existingSymbols": len([k for k, v in existing_map.items() if isinstance(k, str) and isinstance(v, dict)]),
+            "refreshedSymbols": 0,
+            "addedSymbols": [],
+            "removedSymbols": [],
+            "reason": "No authoritative listing rows returned.",
+        }
+        if HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN:
+            return existing_map, audit
+        raise RuntimeError("Ticker mapping refresh failed: no authoritative listing rows")
+
+    source_row_count = len(listing_rows)
+    if not HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON:
+        listing_rows = {
+            symbol: row
+            for symbol, row in listing_rows.items()
+            if row.get("analysisEligible")
+        }
+
+    existing_symbols = {
+        str(k).strip().upper()
+        for k, v in existing_map.items()
+        if isinstance(k, str) and k and isinstance(v, dict) and v.get("group")
+    }
+    refreshed_symbols = set(listing_rows.keys())
+    added_symbols = sorted(refreshed_symbols - existing_symbols)
+    removed_symbols = sorted(existing_symbols - refreshed_symbols)
+    common_count = sum(1 for row in listing_rows.values() if row.get("analysisEligible"))
+    non_common_count = len(listing_rows) - common_count
+
+    refreshed_map = {}
+    now_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    for symbol in sorted(listing_rows):
+        row = dict(listing_rows[symbol])
+        previous = existing_map.get(symbol) if isinstance(existing_map.get(symbol), dict) else {}
+        row["firstMappedAt"] = previous.get("firstMappedAt") or now_utc
+        row["lastMappedAt"] = now_utc
+        refreshed_map[symbol] = row
+
+    refreshed_map["_meta"] = {
+        "schemaVersion": 2,
+        "generatedAt": now_utc,
+        "generatedLocalTime": today_str,
+        "source": "nasdaqtrader_symbol_directory",
+        "sourceUrls": [spec.get("url") for spec in LISTING_SOURCE_SPECS],
+        "activeListingCount": len(listing_rows),
+        "sourceActiveListingCount": source_row_count,
+        "commonStockEligibleCount": common_count,
+        "nonCommonMonitoringCount": non_common_count,
+        "addedCount": len(added_symbols),
+        "removedCount": len(removed_symbols),
+        "refreshPolicy": "authoritative_active_listing_replace",
+        "includeNonCommon": HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON,
+    }
+
+    audit = {
+        "schemaVersion": 1,
+        "generatedAt": now_utc,
+        "status": "refreshed",
+        "sourceSummaries": source_summaries,
+        "okSourceCount": len(ok_sources),
+        "existingSymbols": len(existing_symbols),
+        "sourceActiveListingCount": source_row_count,
+        "refreshedSymbols": len(refreshed_symbols),
+        "commonStockEligibleCount": common_count,
+        "nonCommonMonitoringCount": non_common_count,
+        "excludedFromMappingNonCommonCount": source_row_count - len(listing_rows),
+        "includeNonCommon": HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON,
+        "addedCount": len(added_symbols),
+        "removedCount": len(removed_symbols),
+        "addedSymbols": added_symbols[:HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT],
+        "removedSymbols": removed_symbols[:HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT],
+        "removedPolicy": "removed_from_Ticker_ID_Mapping_Final_when_absent_from_authoritative_active_listing_sources",
+        "newListingPolicy": "added_to_Ticker_ID_Mapping_Final_when_present_in_authoritative_active_listing_sources",
+    }
+    return refreshed_map, audit
 
 def _safe_statement_value(df, candidate_rows):
     if df is None or getattr(df, "empty", True):
@@ -1148,12 +1375,12 @@ def _safe_int(value, default=0):
         return default
 
 
-def should_skip_symbol_for_collection(state_entry):
+def should_skip_symbol_for_collection(state_entry, authoritative_mapping_refreshed=False):
     if not isinstance(state_entry, dict):
         return False, None, None
     state = str(state_entry.get("state") or "").strip().upper()
     reason = str(state_entry.get("reason") or "unknown")
-    if state == "RETIRED" and HARVESTER_SKIP_RETIRED_SYMBOLS:
+    if state == "RETIRED" and HARVESTER_SKIP_RETIRED_SYMBOLS and not authoritative_mapping_refreshed:
         return True, "SYMBOL_SKIPPED_RETIRED", reason
     if state == "EXCLUDED" and HARVESTER_SKIP_EXCLUDED_SYMBOLS:
         return True, "SYMBOL_SKIPPED_EXCLUDED", reason
@@ -1300,11 +1527,11 @@ def build_mapping_freshness_audit(full_map, filtered_tickers, symbol_state, toda
         "recommendedActions": {
             "skipCollectionSymbols": skip_symbols[:HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT],
             "mappingReviewSymbols": mapping_review_symbols[:HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT],
-            "doNotRewriteMappingAutomatically": True,
-            "requiresUpstreamUniverseRefreshForNewListings": not bool(generated_at),
+            "doNotRewriteMappingFromQuoteFailures": True,
+            "requiresAuthoritativeListingRefreshForNewListings": False,
             "reason": (
-                "Collection freshness is enforced by lifecycle state; destructive mapping edits require "
-                "an authoritative upstream universe refresh."
+                "Ticker_ID_Mapping_Final is refreshed from authoritative listing directories; "
+                "quote failures only affect lifecycle skip/review classification."
             ),
         },
     }
@@ -1328,8 +1555,8 @@ def _mapping_audit_markdown(audit):
         "",
         "- Do not repeatedly collect symbols already classified as `RETIRED` or `EXCLUDED`.",
         "- Keep stale/common symbols visible for review until the retire policy classifies them.",
-        "- Do not destructively rewrite `Ticker_ID_Mapping_Final.json` from quote failures alone.",
-        "- Refresh new listings from the upstream universe/mapping producer, not from Harvester guesswork.",
+        "- Do not rewrite `Ticker_ID_Mapping_Final.json` from quote failures alone.",
+        "- Refresh new listings from authoritative listing directories before collection.",
         "",
     ]
     review = audit.get("recommendedActions", {}).get("mappingReviewSymbols", [])
@@ -2205,6 +2432,7 @@ def run_harvester():
     started_at_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     total_success, total_error = 0, 0
     total_lifecycle_skipped = 0
+    total_mapping_pruned = 0
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
     is_weekend_update = (now_kst.weekday() in (5, 6))
@@ -2222,6 +2450,7 @@ def run_harvester():
     daily_group_label = "N/A"
     daily_batch_mode = DAILY_BATCH_MODE or "auto"
     daily_target_count = 0
+    mapping_refresh_audit = {"status": "not_run"}
 
     try:
         print(f"🔍 시스템 가동: {today_str} (Event: {GITHUB_EVENT_NAME})")
@@ -2411,11 +2640,31 @@ def run_harvester():
         daily_batch_mode = batch_mode_source
         print(f"🧩 데일리 배치 선택: {group_label} (mode={batch_mode_source})")
 
-        full_map = download_json(find_file_id("Ticker_ID_Mapping_Final.json", sys_id))
+        full_map_file_id = find_file_id("Ticker_ID_Mapping_Final.json", sys_id)
+        full_map = download_json(full_map_file_id)
         
         # 딕셔너리가 아닌 경우 빈 딕셔너리로 초기화 방어
         if not isinstance(full_map, dict):
             full_map = {}
+
+        full_map, mapping_refresh_audit = refresh_ticker_mapping_from_authoritative_sources(full_map, today_str)
+        write_json_report(
+            HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH,
+            mapping_refresh_audit,
+            "Ticker mapping refresh audit",
+        )
+        upload_json(TICKER_MAPPING_REFRESH_AUDIT_FILENAME, mapping_refresh_audit, sys_id)
+        if mapping_refresh_audit.get("status") == "refreshed":
+            upload_json("Ticker_ID_Mapping_Final.json", full_map, sys_id)
+            print(
+                "🗺️ Ticker mapping refreshed from authoritative listings: "
+                f"active={mapping_refresh_audit.get('refreshedSymbols')} "
+                f"added={mapping_refresh_audit.get('addedCount')} "
+                f"removed={mapping_refresh_audit.get('removedCount')}",
+                flush=True,
+            )
+        else:
+            print(f"🗺️ Ticker mapping refresh status={mapping_refresh_audit.get('status')}", flush=True)
             
         filtered_tickers = {
             t: info
@@ -2439,7 +2688,7 @@ def run_harvester():
         for group in groups:
             group_tickers = {t: info for t, info in filtered_tickers.items() if info['group'] == group}
             g_total = len(group_tickers)
-            g_success, g_error, g_lifecycle_skipped = 0, 0, 0
+            g_success, g_error, g_lifecycle_skipped, g_mapping_pruned = 0, 0, 0, 0
             print(f"\n--- 📦 그룹 [{group}] 작업 시작 ---")
             daily_name, hist_name = f"{group}_stocks_daily.json", f"{group}_stocks_history.json"
             
@@ -2449,12 +2698,36 @@ def run_harvester():
             if not isinstance(daily_data, dict): daily_data = {}
             if not isinstance(hist_data, dict): hist_data = {}
 
+            active_group_symbols = set(group_tickers.keys())
+            stale_daily_symbols = sorted(
+                str(symbol).strip()
+                for symbol in daily_data.keys()
+                if isinstance(symbol, str)
+                and symbol
+                and not symbol.startswith("_")
+                and symbol.strip().upper() not in active_group_symbols
+            )
+            for stale_symbol in stale_daily_symbols:
+                daily_data.pop(stale_symbol, None)
+                hist_data.pop(stale_symbol, None)
+                g_mapping_pruned += 1
+                record_symbol_skip(
+                    stale_symbol,
+                    "daily_mapping_prune",
+                    "SYMBOL_PRUNED_MAPPING_ABSENT",
+                    "absent_from_refreshed_Ticker_ID_Mapping_Final",
+                    group=group,
+                )
+
             for i, ticker in enumerate(group_tickers, 1):
                 success_flag = False
                 failure_recorded = False
                 last_attempt_error = None
                 previous_state_entry = symbol_state.get(ticker) if isinstance(symbol_state, dict) else None
-                should_skip, skip_category, skip_reason = should_skip_symbol_for_collection(previous_state_entry)
+                should_skip, skip_category, skip_reason = should_skip_symbol_for_collection(
+                    previous_state_entry,
+                    authoritative_mapping_refreshed=mapping_refresh_audit.get("status") == "refreshed",
+                )
                 if should_skip:
                     g_lifecycle_skipped += 1
                     if isinstance(previous_state_entry, dict):
@@ -2926,11 +3199,16 @@ def run_harvester():
             total_success += g_success
             total_error += g_error
             total_lifecycle_skipped += g_lifecycle_skipped
+            total_mapping_pruned += g_mapping_pruned
             
-            print(f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error} / lifecycle skip {g_lifecycle_skipped}")
+            print(
+                f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error} / "
+                f"lifecycle skip {g_lifecycle_skipped} / mapping prune {g_mapping_pruned}"
+            )
             send_telegram(
                 f"📦 *그룹 [{group}] 완료*\n"
-                f"✅ 성공: `{g_success}` | ❌ 실패: `{g_error}` | ⏭️ lifecycle skip: `{g_lifecycle_skipped}`"
+                f"✅ 성공: `{g_success}` | ❌ 실패: `{g_error}` | "
+                f"⏭️ lifecycle skip: `{g_lifecycle_skipped}` | 🧹 mapping prune: `{g_mapping_pruned}`"
             )
 
         _apply_symbol_retire_policy(symbol_state, symbol_state_touched, today_str)
@@ -2960,7 +3238,7 @@ def run_harvester():
         send_telegram(
             f"🏁 *수집 종료*\n"
             f"⏱️ `{duration:.1f}분` | 성공: `{total_success}` | 실패: `{total_error}` | "
-            f"lifecycle skip: `{total_lifecycle_skipped}`\n{failure_line}"
+            f"lifecycle skip: `{total_lifecycle_skipped}` | mapping prune: `{total_mapping_pruned}`\n{failure_line}"
         )
         summary_payload = {
             "status": "success",
@@ -2975,11 +3253,16 @@ def run_harvester():
             "successCount": total_success,
             "errorCount": total_error,
             "lifecycleSkipCount": total_lifecycle_skipped,
+            "mappingPruneCount": total_mapping_pruned,
             "durationMinutes": round(duration, 2),
         }
         failure_report = build_harvester_failure_report(summary_payload)
         write_harvester_failure_report(failure_report)
         summary_payload["failureReportPath"] = HARVESTER_FAILURE_REPORT_PATH
+        summary_payload["tickerMappingRefreshAuditPath"] = HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH
+        summary_payload["tickerMappingRefreshStatus"] = mapping_refresh_audit.get("status")
+        summary_payload["tickerMappingAddedCount"] = mapping_refresh_audit.get("addedCount", 0)
+        summary_payload["tickerMappingRemovedCount"] = mapping_refresh_audit.get("removedCount", 0)
         summary_payload["mappingFreshnessAuditPath"] = HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH
         summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
         summary_payload["skipCategoryCounts"] = failure_report.get("skipSummary", {}).get("categoryCounts", {})
@@ -3003,6 +3286,7 @@ def run_harvester():
             "successCount": total_success,
             "errorCount": total_error,
             "lifecycleSkipCount": total_lifecycle_skipped,
+            "mappingPruneCount": total_mapping_pruned,
             "durationMinutes": round(duration, 2),
             "errorType": type(e).__name__,
             "errorMessage": str(e),
@@ -3010,6 +3294,8 @@ def run_harvester():
         failure_report = build_harvester_failure_report(summary_payload)
         write_harvester_failure_report(failure_report)
         summary_payload["failureReportPath"] = HARVESTER_FAILURE_REPORT_PATH
+        summary_payload["tickerMappingRefreshAuditPath"] = HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH
+        summary_payload["tickerMappingRefreshStatus"] = mapping_refresh_audit.get("status")
         summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
         summary_payload["skipCategoryCounts"] = failure_report.get("skipSummary", {}).get("categoryCounts", {})
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]

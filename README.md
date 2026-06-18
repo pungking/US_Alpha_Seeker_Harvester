@@ -25,10 +25,16 @@ This is used to track symbols that are onboarding, partially covered, recovered,
 
 ## Mapping freshness audit
 
-The harvester treats `System_Identity_Maps/Ticker_ID_Mapping_Final.json` as an upstream universe contract, not as a file it can destructively rewrite from quote failures alone.
+The harvester owns the raw collection universe. Before daily collection it refreshes
+`System_Identity_Maps/Ticker_ID_Mapping_Final.json` from authoritative active
+listing directories, then uses lifecycle state as a second safety layer.
 
 To keep collection fresh without hiding bad symbols, daily runs now:
 
+- add newly listed symbols from authoritative listing sources,
+- remove symbols absent from authoritative active listing sources from the mapping,
+- prune symbols absent from the refreshed mapping out of `Financial_Data_Daily` group files so Stage0 cannot keep loading stale records,
+- default the collection mapping to common-stock eligible listings; set `HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON=true` only if monitoring ETFs/units/rights/warrants is intentionally required,
 - classify stale/retired/excluded symbols from `HARVESTER_SYMBOL_STATE.json`,
 - skip only confirmed `RETIRED` and `EXCLUDED` symbols,
 - keep stale common-stock symbols visible until the retire policy or an upstream mapping refresh resolves them,
@@ -38,10 +44,18 @@ Artifacts:
 
 - `state/harvester-mapping-freshness-audit.json`
 - `state/harvester-mapping-freshness-audit.md`
+- `state/ticker-mapping-refresh-audit.json`
 
 Drive mirror:
 
 - `System_Identity_Maps/HARVESTER_MAPPING_FRESHNESS_AUDIT.json`
+- `System_Identity_Maps/TICKER_MAPPING_REFRESH_AUDIT.json`
+- `System_Identity_Maps/Ticker_ID_Mapping_Final.json`
+
+Authoritative listing sources:
+
+- `https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt`
+- `https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt`
 
 ## Run summary artifact
 
