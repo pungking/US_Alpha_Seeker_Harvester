@@ -622,11 +622,11 @@ def _classify_instrument_type(symbol, name, quote_type=None):
 
     if q == 'ETF' or n.endswith(' etf') or ' etf' in n or 'exchange traded fund' in n:
         return 'etf'
-    if q == 'WARRANT' or s.endswith('.WS') or s.endswith('-WS') or s.endswith('WS') or ' warrant' in n:
+    if q == 'WARRANT' or s.endswith('.WS') or s.endswith('-WS') or s.endswith('.W') or s.endswith('-W') or ' warrant' in n:
         return 'warrant'
-    if q == 'UNIT' or s.endswith('.U') or s.endswith('-U') or s.endswith('U') or ' unit' in n:
+    if q == 'UNIT' or s.endswith('.U') or s.endswith('-U') or ' unit' in n:
         return 'unit'
-    if q == 'RIGHT' or s.endswith('.R') or s.endswith('-R') or s.endswith('R') or ' right' in n:
+    if q == 'RIGHT' or s.endswith('.R') or s.endswith('-R') or ' right' in n:
         return 'right'
 
     hybrid_keywords = [
@@ -635,7 +635,6 @@ def _classify_instrument_type(symbol, name, quote_type=None):
         'subordinat',
         'capital security',
         'notes',
-        'trust',
         'etn',
         'baby bond',
     ]
