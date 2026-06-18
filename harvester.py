@@ -631,12 +631,18 @@ def _classify_instrument_type(symbol, name, quote_type=None):
 
     hybrid_keywords = [
         'preferred',
+        'preference',
+        ' pfd ',
+        ' pfd',
         'depositary',
+        ' dep shs',
         'subordinat',
         'capital security',
         'notes',
         'etn',
         'baby bond',
+        'perpetual',
+        'liquidation preference',
     ]
     if any(k in n for k in hybrid_keywords):
         return 'hybrid'
@@ -732,7 +738,13 @@ def _parse_pipe_listing_text(text, spec):
             continue
         name = row.get("Security Name") or row.get("Security Name ") or ""
         etf_flag = str(row.get("ETF") or "").strip().upper() == "Y"
-        quote_type = "ETF" if etf_flag else "EQUITY"
+        preferred_flag = "$" in str(raw_symbol or "") or bool(
+            re.search(
+                r"(?i)(preferred|preference|\\bpfd\\b|dep shs|depositary|perpetual|liquidation preference)",
+                name,
+            )
+        )
+        quote_type = "ETF" if etf_flag else ("PREFERRED" if preferred_flag else "EQUITY")
         instrument_type = _classify_instrument_type(symbol, name, quote_type)
         exchange_code = row.get("Exchange") or spec.get("exchange") or "UNKNOWN"
         exchange_label = EXCHANGE_CODE_LABELS.get(exchange_code, exchange_code)
