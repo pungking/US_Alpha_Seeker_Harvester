@@ -619,6 +619,7 @@ def _classify_instrument_type(symbol, name, quote_type=None):
     s = str(symbol or '').strip().upper()
     n = str(name or '').strip().lower()
     q = str(quote_type or '').strip().upper()
+    ordinary_share_name = bool(re.search(r"\bordinary shares?\b", n))
 
     if q == 'ETF' or n.endswith(' etf') or ' etf' in n or 'exchange traded fund' in n:
         return 'etf'
@@ -644,7 +645,7 @@ def _classify_instrument_type(symbol, name, quote_type=None):
         'perpetual',
         'liquidation preference',
     ]
-    if any(k in n for k in hybrid_keywords):
+    if any(k in n for k in hybrid_keywords) and not (ordinary_share_name and q != 'PREFERRED'):
         return 'hybrid'
     if q in {'ETN', 'MUTUALFUND', 'PREFERRED', 'BOND', 'OPTION'}:
         return 'hybrid'
@@ -738,11 +739,13 @@ def _parse_pipe_listing_text(text, spec):
             continue
         name = row.get("Security Name") or row.get("Security Name ") or ""
         etf_flag = str(row.get("ETF") or "").strip().upper() == "Y"
+        ordinary_share_name = bool(re.search(r"(?i)\bordinary shares?\b", name))
         preferred_flag = "$" in str(raw_symbol or "") or bool(
             re.search(
-                r"(?i)(preferred|preference|\\bpfd\\b|dep shs|depositary|perpetual|liquidation preference)",
+                r"(?i)(preferred|preference|\bpfd\b|dep shs|depositary|perpetual|liquidation preference)",
                 name,
             )
+            and not ordinary_share_name
         )
         quote_type = "ETF" if etf_flag else ("PREFERRED" if preferred_flag else "EQUITY")
         instrument_type = _classify_instrument_type(symbol, name, quote_type)
