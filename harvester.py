@@ -652,6 +652,24 @@ def _classify_instrument_type(symbol, name, quote_type=None):
 
     return 'common'
 
+
+def _collection_instrument_profile(ticker, listing_info, quote_info):
+    listing_info = listing_info if isinstance(listing_info, dict) else {}
+    quote_info = quote_info if isinstance(quote_info, dict) else {}
+    listing_type = str(listing_info.get("instrumentType") or "").strip().lower()
+    if listing_type:
+        listing_eligible = listing_info.get("analysisEligible")
+        return (
+            listing_type,
+            bool(listing_eligible) if listing_eligible is not None else listing_type == "common",
+        )
+    instrument_type = _classify_instrument_type(
+        ticker,
+        quote_info.get('shortName') or quote_info.get('longName'),
+        quote_info.get('quoteType'),
+    )
+    return instrument_type, instrument_type == 'common'
+
 def _to_finite_float(value):
     if value is None:
         return None
@@ -2737,6 +2755,7 @@ def run_harvester():
                 success_flag = False
                 failure_recorded = False
                 last_attempt_error = None
+                listing_info = group_tickers.get(ticker) if isinstance(group_tickers.get(ticker), dict) else {}
                 previous_state_entry = symbol_state.get(ticker) if isinstance(symbol_state, dict) else None
                 should_skip, skip_category, skip_reason = should_skip_symbol_for_collection(
                     previous_state_entry,
@@ -2927,12 +2946,11 @@ def run_harvester():
                                 ]
                             )
                             quote_source = 'YFINANCE_INFO' if has_quote_payload else 'MISSING'
-                            instrument_type = _classify_instrument_type(
+                            instrument_type, analysis_eligible = _collection_instrument_profile(
                                 ticker,
-                                info.get('shortName') or info.get('longName'),
-                                info.get('quoteType')
+                                listing_info,
+                                info,
                             )
-                            analysis_eligible = instrument_type == 'common'
                             net_income_asof = (
                                 today_str
                                 if net_income_source == 'INFO'
@@ -3046,12 +3064,11 @@ def run_harvester():
                             history_rows = _history_rows_from_entry(history_entry)
                             history_periods = len(history_rows)
                             history_tier = _derive_history_tier(history_periods)
-                            instrument_type = _classify_instrument_type(
+                            instrument_type, analysis_eligible = _collection_instrument_profile(
                                 ticker,
-                                info.get('shortName') or info.get('longName'),
-                                info.get('quoteType')
+                                listing_info,
+                                info,
                             )
-                            analysis_eligible = instrument_type == 'common'
                             symbol_state_entry = _update_symbol_state_entry(
                                 symbol_state,
                                 ticker,
