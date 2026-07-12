@@ -52,6 +52,8 @@ jobs:
         run: python scripts/check_symbol_agnostic_runtime.py
       - name: Telegram routing policy audit
         run: python scripts/check_telegram_routing_policy.py
+      - name: Target lineage contract
+        run: python scripts/check_target_lineage_contract.py
         
       - name: Run Master Harvester
         env:

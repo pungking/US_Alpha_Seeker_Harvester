@@ -18,6 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
+from scripts.target_lineage import build_target_lineage
 
 # 로그 실시간 출력 설정
 # 항상 line buffering을 켜서 GitHub Actions/터미널에 진행 로그가 즉시 보이게 한다.
@@ -105,6 +106,10 @@ RAW_TRACE_OPTIONAL_KEYS = [
     "quoteSource",
     "netIncomeSource",
     "netIncomeAsOf",
+    "targetMeanPriceSource",
+    "targetMeanPriceRetrievedAt",
+    "targetMeanPriceAsOf",
+    "targetMeanPriceAsOfStatus",
 ]
 
 STATE_TRACE_OPTIONAL_KEYS = [
@@ -2986,6 +2991,11 @@ def run_harvester():
 
                             # [FIX] Restore legacy raw-record mapping so STANDARD_KEYS are filled with
                             # Yahoo source keys (trailingPE, priceToBook, returnOnEquity, etc).
+                            target_mean_price = info.get('targetMeanPrice')
+                            target_lineage = build_target_lineage(
+                                target_mean_price,
+                                datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                            )
                             raw_record = {
                                 "symbol": ticker,
                                 "name": info.get('shortName') or info.get('longName'),
@@ -2998,7 +3008,8 @@ def run_harvester():
                                 "pbr": info.get('priceToBook'),
                                 "psr": info.get('priceToSalesTrailing12Months'),
                                 "pegRatio": info_peg_ratio,
-                                "targetMeanPrice": info.get('targetMeanPrice'),
+                                "targetMeanPrice": target_mean_price,
+                                **target_lineage,
                                 "roe": info.get('returnOnEquity'),
                                 "roa": info.get('returnOnAssets'),
                                 "eps": info.get('trailingEps'),
