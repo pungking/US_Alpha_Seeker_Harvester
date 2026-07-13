@@ -59,6 +59,11 @@ def main() -> int:
     for key, value in partial["expected"].items():
         assert merged[key] == value
 
+    legacy = fixture["unattributedLegacyTarget"]
+    legacy_merged = merge_standard_record(legacy["previous"], legacy["incoming"])
+    for key, value in legacy["expected"].items():
+        assert legacy_merged[key] == value
+
     state_map = {
         "NNEW": {
             "state": "PROVISIONAL",

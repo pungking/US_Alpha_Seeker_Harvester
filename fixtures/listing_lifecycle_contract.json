@@ -16,18 +16,52 @@
       "symbol": "NNEW",
       "price": 10.0,
       "sector": "Technology",
-      "targetMeanPrice": 15.0
+      "targetMeanPrice": 15.0,
+      "targetMeanPriceSource": "YFINANCE_INFO",
+      "targetMeanPriceRetrievedAt": "2026-07-12T22:00:00Z",
+      "targetMeanPriceAsOf": null,
+      "targetMeanPriceAsOfStatus": "VENDOR_TARGET_ASOF_UNKNOWN"
     },
     "incoming": {
       "symbol": "NNEW",
       "price": 10.5,
       "sector": null,
-      "targetMeanPrice": null
+      "targetMeanPrice": null,
+      "targetMeanPriceSource": null,
+      "targetMeanPriceRetrievedAt": null,
+      "targetMeanPriceAsOf": null,
+      "targetMeanPriceAsOfStatus": "TARGET_SOURCE_NOT_AVAILABLE"
     },
     "expected": {
       "price": 10.5,
       "sector": "Technology",
-      "targetMeanPrice": 15.0
+      "targetMeanPrice": 15.0,
+      "targetMeanPriceSource": "YFINANCE_INFO",
+      "targetMeanPriceRetrievedAt": "2026-07-12T22:00:00Z",
+      "targetMeanPriceAsOfStatus": "VENDOR_TARGET_ASOF_UNKNOWN"
+    }
+  },
+  "unattributedLegacyTarget": {
+    "previous": {
+      "symbol": "OLDT",
+      "price": 20.0,
+      "targetMeanPrice": 25.0
+    },
+    "incoming": {
+      "symbol": "OLDT",
+      "price": 20.5,
+      "targetMeanPrice": null,
+      "targetMeanPriceSource": null,
+      "targetMeanPriceRetrievedAt": null,
+      "targetMeanPriceAsOf": null,
+      "targetMeanPriceAsOfStatus": "TARGET_SOURCE_NOT_AVAILABLE"
+    },
+    "expected": {
+      "targetMeanPrice": null,
+      "targetMeanPriceSource": null,
+      "targetMeanPriceRetrievedAt": null,
+      "targetMeanPriceAsOf": null,
+      "targetMeanPriceAsOfStatus": "TARGET_LINEAGE_INVALIDATED_MISSING_PROVENANCE"
     }
   }
 }

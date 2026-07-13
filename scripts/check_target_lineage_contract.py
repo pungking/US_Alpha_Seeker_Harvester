@@ -26,12 +26,25 @@ def main() -> int:
         [
             {"targetMeanPrice": 123.45, **present},
             {"targetMeanPrice": None, **missing},
+            {
+                "targetMeanPrice": None,
+                "targetMeanPriceSource": None,
+                "targetMeanPriceRetrievedAt": None,
+                "targetMeanPriceAsOf": None,
+                "targetMeanPriceAsOfStatus": "TARGET_LINEAGE_INVALIDATED_MISSING_PROVENANCE",
+            },
         ]
     )
     assert runtime["overall"] == "pass_complete_lineage"
     assert runtime["finiteTargetRows"] == 1
     assert runtime["completeLineageRows"] == 1
     assert runtime["missingLineageRows"] == 0
+    assert runtime["invalidatedTargetRows"] == 1
+    assert runtime["allAsOfStatusCounts"] == {
+        "TARGET_LINEAGE_INVALIDATED_MISSING_PROVENANCE": 1,
+        "TARGET_SOURCE_NOT_AVAILABLE": 1,
+        "VENDOR_TARGET_ASOF_UNKNOWN": 1,
+    }
     fresh_runtime = summarize_target_lineage(
         [{"targetMeanPrice": 123.45, **present}],
         reference_time="2026-07-12T02:02:03Z",

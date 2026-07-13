@@ -605,12 +605,71 @@ def summarize_key_coverage(records, keys):
         summary[key] = {"present": present, "missing": missing, "coveragePct": coverage_pct}
     return summary
 
+
+TARGET_LINEAGE_KEYS = (
+    "targetMeanPrice",
+    "targetMeanPriceSource",
+    "targetMeanPriceRetrievedAt",
+    "targetMeanPriceAsOf",
+    "targetMeanPriceAsOfStatus",
+)
+
+
+def _is_positive_finite(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
+
+
+def _has_complete_target_lineage(record):
+    return (
+        isinstance(record, dict)
+        and _is_positive_finite(record.get("targetMeanPrice"))
+        and bool(str(record.get("targetMeanPriceSource") or "").strip())
+        and bool(str(record.get("targetMeanPriceRetrievedAt") or "").strip())
+        and bool(str(record.get("targetMeanPriceAsOfStatus") or "").strip())
+    )
+
+
+def _merge_target_lineage_bundle(prev_record, raw_record):
+    if _has_complete_target_lineage(raw_record):
+        return {key: raw_record.get(key) for key in TARGET_LINEAGE_KEYS}
+    if _is_positive_finite(raw_record.get("targetMeanPrice") if isinstance(raw_record, dict) else None):
+        return {
+            "targetMeanPrice": None,
+            "targetMeanPriceSource": None,
+            "targetMeanPriceRetrievedAt": None,
+            "targetMeanPriceAsOf": None,
+            "targetMeanPriceAsOfStatus": "TARGET_LINEAGE_INVALIDATED_MISSING_PROVENANCE",
+        }
+    if _has_complete_target_lineage(prev_record):
+        return {key: prev_record.get(key) for key in TARGET_LINEAGE_KEYS}
+
+    legacy_target_present = _is_positive_finite(
+        prev_record.get("targetMeanPrice") if isinstance(prev_record, dict) else None
+    )
+    return {
+        "targetMeanPrice": None,
+        "targetMeanPriceSource": None,
+        "targetMeanPriceRetrievedAt": None,
+        "targetMeanPriceAsOf": None,
+        "targetMeanPriceAsOfStatus": (
+            "TARGET_LINEAGE_INVALIDATED_MISSING_PROVENANCE"
+            if legacy_target_present
+            else "TARGET_SOURCE_NOT_AVAILABLE"
+        ),
+    }
+
+
 def merge_standard_record(prev_record, raw_record):
     merged = {}
     for key in STANDARD_KEYS:
         new_v = raw_record.get(key, None) if isinstance(raw_record, dict) else None
         old_v = prev_record.get(key, None) if isinstance(prev_record, dict) else None
         merged[key] = new_v if new_v is not None else old_v
+    merged.update(_merge_target_lineage_bundle(prev_record, raw_record))
     return merged
 
 def _first_present(mapping, keys):

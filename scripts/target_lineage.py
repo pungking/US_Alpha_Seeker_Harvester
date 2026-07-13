@@ -53,9 +53,16 @@ def summarize_target_lineage(
     retrieved_ages_hours: list[float] = []
     source_counts: Counter[str] = Counter()
     as_of_status_counts: Counter[str] = Counter()
+    all_as_of_status_counts: Counter[str] = Counter()
+    invalidated_target_rows = 0
     reference = _parse_utc_timestamp(reference_time)
 
     for record in records:
+        as_of_status = str(record.get("targetMeanPriceAsOfStatus") or "").strip()
+        if as_of_status:
+            all_as_of_status_counts[as_of_status] += 1
+        if as_of_status == "TARGET_LINEAGE_INVALIDATED_MISSING_PROVENANCE":
+            invalidated_target_rows += 1
         try:
             target = float(record.get("targetMeanPrice"))
         except (TypeError, ValueError):
@@ -66,7 +73,6 @@ def summarize_target_lineage(
         finite_target_rows += 1
         source = str(record.get("targetMeanPriceSource") or "").strip()
         retrieved_at = str(record.get("targetMeanPriceRetrievedAt") or "").strip()
-        as_of_status = str(record.get("targetMeanPriceAsOfStatus") or "").strip()
         if source:
             source_counts[source] += 1
         if as_of_status:
@@ -104,6 +110,7 @@ def summarize_target_lineage(
         "freshLineageRows": fresh_lineage_rows,
         "staleLineageRows": stale_lineage_rows,
         "unparseableRetrievedAtRows": unparseable_retrieved_at_rows,
+        "invalidatedTargetRows": invalidated_target_rows,
         "freshnessMaxHours": freshness_max_hours if reference is not None else None,
         "maxRetrievedAgeHours": round(max(retrieved_ages_hours), 2) if retrieved_ages_hours else None,
         "lineageCoveragePct": round((complete_lineage_rows / finite_target_rows) * 100, 1)
@@ -111,6 +118,7 @@ def summarize_target_lineage(
         else 0.0,
         "sourceCounts": dict(sorted(source_counts.items())),
         "asOfStatusCounts": dict(sorted(as_of_status_counts.items())),
+        "allAsOfStatusCounts": dict(sorted(all_as_of_status_counts.items())),
     }
 
 
