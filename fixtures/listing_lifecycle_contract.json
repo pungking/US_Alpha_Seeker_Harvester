@@ -1,0 +1,33 @@
+{
+  "listingText": "Symbol|Security Name|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\nNNEW|New Common Corp Common Stock|N|N|100|N|N\nBRK.B|Class B Common Stock|N|N|100|N|N\nPREF$A|Example Preferred Series A|N|N|100|N|N\nETFX|Example Market ETF|N|N|100|Y|N\nTESTX|Test Issue Common Stock|Y|N|100|N|N\nFile Creation Time: 0713202621:00\n",
+  "sourceSpec": {
+    "name": "fixture_nasdaqtrader",
+    "symbolField": "Symbol",
+    "exchange": "NASDAQ"
+  },
+  "expected": {
+    "activeSymbols": ["NNEW", "BRK-B", "PREF-A", "ETFX"],
+    "analysisEligibleSymbols": ["NNEW", "BRK-B"],
+    "removedFromPreviousMapping": ["OLDX"],
+    "sourceCreationTime": "0713202621:00"
+  },
+  "partialRefresh": {
+    "previous": {
+      "symbol": "NNEW",
+      "price": 10.0,
+      "sector": "Technology",
+      "targetMeanPrice": 15.0
+    },
+    "incoming": {
+      "symbol": "NNEW",
+      "price": 10.5,
+      "sector": null,
+      "targetMeanPrice": null
+    },
+    "expected": {
+      "price": 10.5,
+      "sector": "Technology",
+      "targetMeanPrice": 15.0
+    }
+  }
+}

@@ -1,4 +1,4 @@
-from target_lineage import build_target_lineage
+from target_lineage import build_target_lineage, summarize_target_lineage
 
 
 def main() -> int:
@@ -18,6 +18,30 @@ def main() -> int:
         "targetMeanPriceAsOf": None,
         "targetMeanPriceAsOfStatus": "TARGET_SOURCE_NOT_AVAILABLE",
     }
+    runtime = summarize_target_lineage(
+        [
+            {"targetMeanPrice": 123.45, **present},
+            {"targetMeanPrice": None, **missing},
+        ]
+    )
+    assert runtime["overall"] == "pass_complete_lineage"
+    assert runtime["finiteTargetRows"] == 1
+    assert runtime["completeLineageRows"] == 1
+    assert runtime["missingLineageRows"] == 0
+    fresh_runtime = summarize_target_lineage(
+        [{"targetMeanPrice": 123.45, **present}],
+        reference_time="2026-07-12T02:02:03Z",
+        freshness_max_hours=2,
+    )
+    assert fresh_runtime["overall"] == "pass_complete_fresh_lineage"
+    assert fresh_runtime["freshLineageRows"] == 1
+    stale_runtime = summarize_target_lineage(
+        [{"targetMeanPrice": 123.45, **present}],
+        reference_time="2026-07-13T01:02:03Z",
+        freshness_max_hours=2,
+    )
+    assert stale_runtime["overall"] == "warn_stale_lineage"
+    assert stale_runtime["staleLineageRows"] == 1
     print("[TARGET_LINEAGE_CONTRACT] PASS")
     return 0
 

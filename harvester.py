@@ -18,7 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
-from scripts.target_lineage import build_target_lineage
+from scripts.target_lineage import build_target_lineage, summarize_target_lineage
 
 # 로그 실시간 출력 설정
 # 항상 line buffering을 켜서 GitHub Actions/터미널에 진행 로그가 즉시 보이게 한다.
@@ -54,6 +54,10 @@ HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH = (
 HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH = (
     os.getenv("HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH")
     or "state/ticker-mapping-refresh-audit.json"
+).strip()
+HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH = (
+    os.getenv("HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH")
+    or "state/target-lineage-runtime-audit.json"
 ).strip()
 
 # Raw-first policy:
@@ -182,6 +186,7 @@ HARVESTER_SKIP_EXCLUDED_SYMBOLS = _read_bool_env("HARVESTER_SKIP_EXCLUDED_SYMBOL
 HARVESTER_TICKER_MAPPING_REFRESH_ENABLED = _read_bool_env("HARVESTER_TICKER_MAPPING_REFRESH_ENABLED", True)
 HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN = _read_bool_env("HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN", True)
 HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON = _read_bool_env("HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON", False)
+HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS = _read_positive_int_env("HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS", 48)
 RUN_FAILURE_DETAILS = []
 RUN_SYMBOL_SKIP_DETAILS = []
 
@@ -2470,6 +2475,7 @@ def run_harvester():
     total_success, total_error = 0, 0
     total_lifecycle_skipped = 0
     total_mapping_pruned = 0
+    target_lineage_observations = []
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
     is_weekend_update = (now_kst.weekday() in (5, 6))
@@ -3195,6 +3201,16 @@ def run_harvester():
 
             requested_raw_keys = RAW_QUOTE_OPTIONAL_KEYS + RAW_FUNDAMENTAL_OPTIONAL_KEYS
             raw_cov = summarize_key_coverage(group_records, requested_raw_keys)
+            target_lineage_observations.extend(
+                {
+                    "targetMeanPrice": record.get("targetMeanPrice"),
+                    "targetMeanPriceSource": record.get("targetMeanPriceSource"),
+                    "targetMeanPriceRetrievedAt": record.get("targetMeanPriceRetrievedAt"),
+                    "targetMeanPriceAsOfStatus": record.get("targetMeanPriceAsOfStatus"),
+                }
+                for record in group_records.values()
+                if isinstance(record, dict)
+            )
             raw_status_preview = []
             for key in requested_raw_keys:
                 pct = raw_cov.get(key, {}).get("coveragePct", 0.0)
@@ -3276,6 +3292,26 @@ def run_harvester():
             "Harvester mapping freshness audit markdown payload",
         )
         upload_json(HARVESTER_MAPPING_FRESHNESS_AUDIT_FILENAME, mapping_audit, sys_id)
+        target_lineage_generated_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        target_lineage_runtime = summarize_target_lineage(
+            target_lineage_observations,
+            reference_time=target_lineage_generated_at,
+            freshness_max_hours=HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS,
+        )
+        target_lineage_runtime.update(
+            {
+                "schemaVersion": 1,
+                "generatedAt": target_lineage_generated_at,
+                "batchMode": daily_batch_mode,
+                "targetSymbols": daily_target_count,
+                "interpretation": "runtime_vendor_lineage_coverage_not_target_accuracy_approval",
+            }
+        )
+        write_json_report(
+            HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH,
+            target_lineage_runtime,
+            "Target lineage runtime audit",
+        )
         failure_line = failure_telegram_summary()
         send_telegram(
             f"🏁 *수집 종료*\n"
@@ -3309,6 +3345,8 @@ def run_harvester():
         summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
         summary_payload["skipCategoryCounts"] = failure_report.get("skipSummary", {}).get("categoryCounts", {})
         summary_payload["mappingFreshnessActionCounts"] = mapping_audit.get("actionCounts", {})
+        summary_payload["targetLineageRuntimeAuditPath"] = HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH
+        summary_payload["targetLineageRuntime"] = target_lineage_runtime
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
         write_harvester_run_summary(summary_payload)
 

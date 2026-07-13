@@ -54,6 +54,8 @@ jobs:
         run: python scripts/check_telegram_routing_policy.py
       - name: Target lineage contract
         run: python scripts/check_target_lineage_contract.py
+      - name: Listing lifecycle and partial retry contract
+        run: python scripts/check_listing_lifecycle_contract.py
         
       - name: Run Master Harvester
         env:
@@ -78,6 +80,7 @@ jobs:
           HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH: state/harvester-mapping-freshness-audit.json
           HARVESTER_MAPPING_FRESHNESS_AUDIT_MD_PATH: state/harvester-mapping-freshness-audit.md
           HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH: state/ticker-mapping-refresh-audit.json
+          HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH: state/target-lineage-runtime-audit.json
         run: |
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
@@ -107,6 +110,7 @@ jobs:
             state/harvester-mapping-freshness-audit.md
             state/ticker-mapping-refresh-audit.json
             state/stage4-earnings-event-coverage-audit.json
+            state/target-lineage-runtime-audit.json
             state/symbol-agnostic-runtime-check.json
             state/symbol-agnostic-runtime-check.md
             state/telegram-routing-policy-audit.*

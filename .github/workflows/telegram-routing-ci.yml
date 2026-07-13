@@ -20,12 +20,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install contract-check dependencies
+        run: pip install google-api-python-client google-auth requests yfinance pandas
       - name: Symbol-agnostic runtime guard
         run: python scripts/check_symbol_agnostic_runtime.py
       - name: Telegram routing policy audit
         run: python scripts/check_telegram_routing_policy.py
+      - name: Target lineage contract
+        run: python scripts/check_target_lineage_contract.py
+      - name: Listing lifecycle and partial retry contract
+        run: python scripts/check_listing_lifecycle_contract.py
       - name: Python compile check
-        run: python -m py_compile harvester.py scripts/check_symbol_agnostic_runtime.py scripts/check_telegram_routing_policy.py
+        run: python -m py_compile harvester.py scripts/*.py
       - name: Upload routing report
         if: always()
         uses: actions/upload-artifact@v5
