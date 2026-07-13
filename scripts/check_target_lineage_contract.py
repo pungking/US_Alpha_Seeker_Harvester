@@ -1,4 +1,8 @@
-from target_lineage import build_target_lineage, summarize_target_lineage
+from target_lineage import (
+    build_target_lineage,
+    build_target_lineage_runtime_audit,
+    summarize_target_lineage,
+)
 
 
 def main() -> int:
@@ -42,6 +46,19 @@ def main() -> int:
     )
     assert stale_runtime["overall"] == "warn_stale_lineage"
     assert stale_runtime["staleLineageRows"] == 1
+    checkpoint = build_target_lineage_runtime_audit(
+        [{"targetMeanPrice": 123.45, **present}],
+        reference_time="2026-07-12T02:02:03Z",
+        freshness_max_hours=2,
+        batch_mode="manual:all",
+        target_symbols=2,
+        completed_groups=["A"],
+        collection_status="partial_checkpoint",
+    )
+    assert checkpoint["collectionStatus"] == "partial_checkpoint"
+    assert checkpoint["completedGroups"] == ["A"]
+    assert checkpoint["completedGroupCount"] == 1
+    assert checkpoint["finiteTargetRows"] == 1
     print("[TARGET_LINEAGE_CONTRACT] PASS")
     return 0
 

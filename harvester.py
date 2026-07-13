@@ -18,7 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
-from scripts.target_lineage import build_target_lineage, summarize_target_lineage
+from scripts.target_lineage import build_target_lineage, build_target_lineage_runtime_audit
 
 # 로그 실시간 출력 설정
 # 항상 line buffering을 켜서 GitHub Actions/터미널에 진행 로그가 즉시 보이게 한다.
@@ -2476,6 +2476,7 @@ def run_harvester():
     total_lifecycle_skipped = 0
     total_mapping_pruned = 0
     target_lineage_observations = []
+    completed_lineage_groups = []
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
     is_weekend_update = (now_kst.weekday() in (5, 6))
@@ -3258,6 +3259,23 @@ def run_harvester():
             total_error += g_error
             total_lifecycle_skipped += g_lifecycle_skipped
             total_mapping_pruned += g_mapping_pruned
+            completed_lineage_groups.append(group)
+
+            target_lineage_generated_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            target_lineage_runtime = build_target_lineage_runtime_audit(
+                target_lineage_observations,
+                reference_time=target_lineage_generated_at,
+                freshness_max_hours=HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS,
+                batch_mode=daily_batch_mode,
+                target_symbols=daily_target_count,
+                completed_groups=completed_lineage_groups,
+                collection_status="partial_checkpoint",
+            )
+            write_json_report(
+                HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH,
+                target_lineage_runtime,
+                "Target lineage runtime audit checkpoint",
+            )
             
             print(
                 f"📦 그룹 [{group}] 완료: 성공 {g_success} / 실패 {g_error} / "
@@ -3293,19 +3311,14 @@ def run_harvester():
         )
         upload_json(HARVESTER_MAPPING_FRESHNESS_AUDIT_FILENAME, mapping_audit, sys_id)
         target_lineage_generated_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-        target_lineage_runtime = summarize_target_lineage(
+        target_lineage_runtime = build_target_lineage_runtime_audit(
             target_lineage_observations,
             reference_time=target_lineage_generated_at,
             freshness_max_hours=HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS,
-        )
-        target_lineage_runtime.update(
-            {
-                "schemaVersion": 1,
-                "generatedAt": target_lineage_generated_at,
-                "batchMode": daily_batch_mode,
-                "targetSymbols": daily_target_count,
-                "interpretation": "runtime_vendor_lineage_coverage_not_target_accuracy_approval",
-            }
+            batch_mode=daily_batch_mode,
+            target_symbols=daily_target_count,
+            completed_groups=completed_lineage_groups,
+            collection_status="completed",
         )
         write_json_report(
             HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH,

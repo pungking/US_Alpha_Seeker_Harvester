@@ -112,3 +112,34 @@ def summarize_target_lineage(
         "sourceCounts": dict(sorted(source_counts.items())),
         "asOfStatusCounts": dict(sorted(as_of_status_counts.items())),
     }
+
+
+def build_target_lineage_runtime_audit(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    reference_time: str,
+    freshness_max_hours: float,
+    batch_mode: str,
+    target_symbols: int,
+    completed_groups: Iterable[str],
+    collection_status: str,
+) -> dict[str, Any]:
+    groups = [str(group) for group in completed_groups]
+    audit = summarize_target_lineage(
+        records,
+        reference_time=reference_time,
+        freshness_max_hours=freshness_max_hours,
+    )
+    audit.update(
+        {
+            "schemaVersion": 1,
+            "generatedAt": reference_time,
+            "batchMode": batch_mode,
+            "targetSymbols": int(target_symbols),
+            "completedGroups": groups,
+            "completedGroupCount": len(groups),
+            "collectionStatus": collection_status,
+            "interpretation": "runtime_vendor_lineage_coverage_not_target_accuracy_approval",
+        }
+    )
+    return audit
