@@ -1,0 +1,52 @@
+{
+  "retrievedAt": "2026-07-21T12:00:00Z",
+  "period": "5y",
+  "observationCount": 30,
+  "baseRows": [
+    {
+      "date": "2026-07-17T00:00:00-04:00",
+      "Open": 10.0,
+      "High": 11.0,
+      "Low": 9.5,
+      "Close": 10.5,
+      "Volume": 100000,
+      "Dividends": 0.0,
+      "Stock Splits": 0.0
+    },
+    {
+      "date": "2026-07-20T00:00:00-04:00",
+      "Open": 10.5,
+      "High": 12.0,
+      "Low": 10.0,
+      "Close": 11.5,
+      "Volume": 120000,
+      "Dividends": 0.25,
+      "Stock Splits": 2.0
+    }
+  ],
+  "verifiedListingEvidence": {
+    "listingSource": "FIXTURE_AUTHORITATIVE_SOURCE",
+    "listingSourceAsOf": "2026-07-21T11:00:00Z",
+    "listingStatus": "ACTIVE",
+    "symbolChangeEvidence": {
+      "status": "VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE",
+      "source": "FIXTURE_AUTHORITATIVE_SOURCE",
+      "sourceAsOf": "2026-07-21T11:00:00Z"
+    },
+    "delistingEvidence": {
+      "status": "VERIFIED_NOT_DELISTED_AS_OF_SOURCE",
+      "source": "FIXTURE_AUTHORITATIVE_SOURCE",
+      "sourceAsOf": "2026-07-21T11:00:00Z"
+    },
+    "suspensionEvidence": {
+      "status": "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE",
+      "source": "FIXTURE_AUTHORITATIVE_SOURCE",
+      "sourceAsOf": "2026-07-21T11:00:00Z"
+    }
+  },
+  "unverifiedListingEvidence": {
+    "listingSource": "FIXTURE_ACTIVE_DIRECTORY_ONLY",
+    "listingSourceAsOf": "2026-07-21T11:00:00Z",
+    "listingStatus": "ACTIVE"
+  }
+}
