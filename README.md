@@ -78,3 +78,43 @@ Workflow `main.yml` can upsert each run summary into Notion `Daily Snapshot` DB.
 - `NOTION_HARVESTER_SYNC_REQUIRED` (variable, default `false`)
 
 When `NOTION_HARVESTER_SYNC_REQUIRED=false`, Notion sync is warning-only.
+
+## OHLCV corporate-action lineage
+
+Stage3 dispatch OHLCV files use the backward-compatible `ohlcv-lineage-v1`
+envelope:
+
+```json
+{
+  "schemaVersion": "ohlcv-lineage-v1",
+  "data": [],
+  "lineage": {}
+}
+```
+
+Legacy array-only files remain readable. The first dispatch that encounters a
+legacy file performs a full-history refresh before adding lineage; it does not
+claim corporate-action coverage from the old array alone.
+An incremental response that contains a split/dividend event, changes an
+overlapping adjusted OHLC value, or no longer overlaps the stored history also
+forces a full-history refresh so two adjustment bases are never merged.
+
+The lineage records yfinance/Yahoo retrieval time, source-as-of session,
+`auto_adjust=true`, split/dividend action columns, event effective dates,
+return basis, listing evidence, and source request lineage. Symbol-change,
+delisting, or suspension status remains `UNVERIFIED_*` unless a source record
+contains an explicit verified status, source, and source-as-of timestamp.
+A successfully returned yfinance action column can prove no split/dividend in
+the requested window; a missing or failed external event response is never
+converted into verified symbol-change, delisting, or suspension no-event
+evidence.
+
+The active listing directory does not by itself prove that no historical
+symbol change, delisting, or suspension occurred. Those statuses therefore
+remain `UNVERIFIED_*` until an explicit source-backed evidence record is
+available; such rows are intentionally ineligible for OOS cohort comparison.
+
+Runtime audit artifacts:
+
+- `state/corporate-action-lineage-runtime-audit.json`
+- `System_Identity_Maps/CORPORATE_ACTION_LINEAGE_RUNTIME_AUDIT.json`

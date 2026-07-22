@@ -59,6 +59,10 @@ HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH = (
     os.getenv("HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH")
     or "state/target-lineage-runtime-audit.json"
 ).strip()
+HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH = (
+    os.getenv("HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH")
+    or "state/corporate-action-lineage-runtime-audit.json"
+).strip()
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -151,7 +155,22 @@ BENCHMARK_SPECS = [
 MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
 EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
 EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME = "STAGE4_EARNINGS_EVENT_COVERAGE_AUDIT.json"
+CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME = "CORPORATE_ACTION_LINEAGE_RUNTIME_AUDIT.json"
 HARVESTER_SYMBOL_STATE_FILENAME = "HARVESTER_SYMBOL_STATE.json"
+
+VERIFIED_SYMBOL_CHANGE_STATUSES = {
+    "VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE",
+    "VERIFIED_SYMBOL_CHANGE",
+}
+VERIFIED_DELISTING_STATUSES = {
+    "VERIFIED_NOT_DELISTED_AS_OF_SOURCE",
+    "VERIFIED_DELISTED",
+}
+VERIFIED_SUSPENSION_STATUSES = {
+    "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE",
+    "VERIFIED_SUSPENDED",
+}
+OHLCV_LINEAGE_MIN_BARS = 30  # Matches the existing Stage4 strict OHLCV minimum.
 HARVESTER_MAPPING_FRESHNESS_AUDIT_FILENAME = "HARVESTER_MAPPING_FRESHNESS_AUDIT.json"
 TICKER_MAPPING_REFRESH_AUDIT_FILENAME = "TICKER_MAPPING_REFRESH_AUDIT.json"
 FMP_API_KEY = os.getenv("FMP_KEY")
@@ -944,6 +963,11 @@ def refresh_ticker_mapping_from_authoritative_sources(existing_map, today_str):
         previous = existing_map.get(symbol) if isinstance(existing_map.get(symbol), dict) else {}
         row["firstMappedAt"] = previous.get("firstMappedAt") or now_utc
         row["lastMappedAt"] = now_utc
+        # Preserve only explicit source-backed event evidence; refresh must not
+        # silently erase a previously captured corporate-action lineage record.
+        for evidence_key in ("symbolChangeEvidence", "delistingEvidence", "suspensionEvidence"):
+            if isinstance(previous.get(evidence_key), dict):
+                row[evidence_key] = dict(previous[evidence_key])
         refreshed_map[symbol] = row
 
     refreshed_map["_meta"] = {
@@ -1758,6 +1782,376 @@ def sanitize_ohlcv_records(records):
     return cleaned, removed
 
 
+def _extract_ohlcv_payload(payload):
+    if isinstance(payload, list):
+        return payload, None
+    if isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("candles") or []
+        lineage = payload.get("lineage") if isinstance(payload.get("lineage"), dict) else None
+        return rows if isinstance(rows, list) else [], lineage
+    return [], None
+
+
+def _event_rows(frame, column, value_key):
+    if column not in getattr(frame, "columns", []):
+        return []
+    rows = []
+    for index, value in frame[column].items():
+        number = _to_finite_float(value)
+        if number is None or number == 0:
+            continue
+        rows.append({"eventEffectiveAt": index.strftime("%Y-%m-%d"), value_key: number})
+    return rows
+
+
+def _verified_evidence_status(evidence, allowed_statuses, fallback):
+    status = str((evidence or {}).get("status") or "").strip().upper()
+    source = str((evidence or {}).get("source") or "").strip()
+    source_as_of = str((evidence or {}).get("sourceAsOf") or "").strip()
+    return status if status in allowed_statuses and source and _parse_iso_datetime(source_as_of) else fallback
+
+
+def _parse_iso_datetime(value, *, end_of_day=False):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if len(text) == 10:
+            parsed = datetime.datetime.fromisoformat(text)
+            if end_of_day:
+                parsed = parsed.replace(hour=23, minute=59, second=59)
+        else:
+            parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _external_evidence_time_valid(evidence, source_as_of, retrieved_at):
+    if not isinstance(evidence, dict):
+        return False
+    evidence_as_of = _parse_iso_datetime(evidence.get("sourceAsOf"), end_of_day=True)
+    history_as_of = _parse_iso_datetime(source_as_of)
+    retrieval = _parse_iso_datetime(retrieved_at)
+    if not evidence_as_of or not history_as_of or not retrieval:
+        return False
+    event_effective = _parse_iso_datetime(evidence.get("eventEffectiveAt") or evidence.get("effectiveAt"))
+    return bool(
+        history_as_of <= evidence_as_of <= retrieval
+        and (event_effective is None or event_effective <= evidence_as_of)
+    )
+
+
+def _normalized_external_evidence(evidence):
+    if not isinstance(evidence, dict):
+        return None
+    allowed = (
+        "status",
+        "source",
+        "sourceAsOf",
+        "eventEffectiveAt",
+        "oldSymbol",
+        "newSymbol",
+        "reason",
+    )
+    normalized = {key: evidence.get(key) for key in allowed if evidence.get(key) not in (None, "")}
+    if "eventEffectiveAt" not in normalized and evidence.get("effectiveAt") not in (None, ""):
+        normalized["eventEffectiveAt"] = evidence.get("effectiveAt")
+    return normalized or None
+
+
+def _corporate_lineage_is_comparable(lineage):
+    source_as_of = lineage.get("sourceAsOf")
+    retrieved_at = lineage.get("retrievedAt")
+    source_time = _parse_iso_datetime(source_as_of)
+    retrieval_time = _parse_iso_datetime(retrieved_at)
+    return bool(
+        lineage.get("vendor")
+        and source_time
+        and retrieval_time
+        and source_time <= retrieval_time
+        and lineage.get("adjustmentType")
+        and lineage.get("sourceFreshnessStatus") == "FRESH"
+        and lineage.get("historyCoverageStatus") == "VERIFIED_OBSERVED_HISTORY"
+        and lineage.get("splitAdjustmentStatus") == "VERIFIED_YFINANCE_AUTO_ADJUSTED"
+        and lineage.get("dividendAdjustmentStatus") == "VERIFIED_YFINANCE_AUTO_ADJUSTED"
+        and lineage.get("corporateActionStatus")
+        in {"VERIFIED_SPLIT_DIVIDEND_EVENTS_IN_WINDOW", "VERIFIED_NO_SPLIT_OR_DIVIDEND_EVENT_IN_WINDOW"}
+        and lineage.get("symbolChangeStatus") == "VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE"
+        and lineage.get("delistingStatus") == "VERIFIED_NOT_DELISTED_AS_OF_SOURCE"
+        and lineage.get("suspensionStatus") == "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE"
+        and all(
+            _external_evidence_time_valid(lineage.get(key), source_as_of, retrieved_at)
+            for key in ("symbolChangeEvidence", "delistingEvidence", "suspensionEvidence")
+        )
+    )
+
+
+def _frame_has_unseen_adjustment_event(frame, previous_lineage):
+    previous_lineage = previous_lineage if isinstance(previous_lineage, dict) else {}
+    event_specs = (
+        ("Stock Splits", "ratio", "splitEvents"),
+        ("Dividends", "amount", "dividendEvents"),
+    )
+    for column, value_key, lineage_key in event_specs:
+        previous_events = previous_lineage.get(lineage_key)
+        previous_by_date = {
+            str(row.get("eventEffectiveAt")): _to_finite_float(row.get(value_key))
+            for row in previous_events or []
+            if isinstance(row, dict) and row.get("eventEffectiveAt")
+        }
+        for row in _event_rows(frame, column, value_key):
+            prior_value = previous_by_date.get(str(row["eventEffectiveAt"]))
+            if prior_value is None or not math.isclose(
+                prior_value,
+                float(row[value_key]),
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            ):
+                return True
+    return False
+
+
+def _normalize_ohlcv_frame(frame, record_symbol):
+    rows = []
+    skipped = 0
+    for index, raw in frame.iterrows():
+        open_price = _to_finite_float(raw.get("Open"))
+        high_price = _to_finite_float(raw.get("High"))
+        low_price = _to_finite_float(raw.get("Low"))
+        close_price = _to_finite_float(raw.get("Close"))
+        if (
+            open_price is None
+            or high_price is None
+            or low_price is None
+            or close_price is None
+            or min(open_price, high_price, low_price, close_price) <= 0
+            or high_price < low_price
+        ):
+            skipped += 1
+            continue
+        volume_raw = _to_finite_float(raw.get("Volume"))
+        rows.append(
+            {
+                "symbol": record_symbol,
+                "date": index.strftime("%Y-%m-%d"),
+                "open": round(open_price, 2),
+                "high": round(high_price, 2),
+                "low": round(low_price, 2),
+                "close": round(close_price, 2),
+                "volume": int(max(0, round(volume_raw))) if volume_raw is not None else 0,
+            }
+        )
+    return rows, skipped
+
+
+def _adjusted_price_basis_changed(existing_rows, new_rows):
+    existing_by_date = {row.get("date"): row for row in existing_rows if row.get("date")}
+    for row in new_rows:
+        previous = existing_by_date.get(row.get("date"))
+        if not previous:
+            continue
+        if any(previous.get(key) != row.get(key) for key in ("open", "high", "low", "close")):
+            return True
+    return False
+
+
+def _incremental_window_overlaps(existing_rows, new_rows):
+    existing_dates = {row.get("date") for row in existing_rows if row.get("date")}
+    return any(row.get("date") in existing_dates for row in new_rows)
+
+
+def build_corporate_action_lineage(
+    frame,
+    *,
+    record_symbol: str,
+    source_symbol: str,
+    requested_period: str,
+    retrieved_at: str,
+    listing_evidence: dict | None = None,
+    expected_market_date: str | None = None,
+    previous_lineage: dict | None = None,
+    observation_count: int | None = None,
+    stored_rows: list[dict] | None = None,
+) -> dict:
+    listing_evidence = listing_evidence if isinstance(listing_evidence, dict) else {}
+    previous_lineage = previous_lineage if isinstance(previous_lineage, dict) else {}
+    stored_rows = stored_rows if isinstance(stored_rows, list) else []
+    source_as_of = (
+        str(stored_rows[-1].get("date"))[:10]
+        if stored_rows and stored_rows[-1].get("date")
+        else frame.index.max().strftime("%Y-%m-%d") if len(frame.index) else None
+    )
+    lookback_start = (
+        str(stored_rows[0].get("date"))[:10]
+        if stored_rows and stored_rows[0].get("date")
+        else frame.index.min().strftime("%Y-%m-%d") if len(frame.index) else None
+    )
+    has_split_column = "Stock Splits" in getattr(frame, "columns", [])
+    has_dividend_column = "Dividends" in getattr(frame, "columns", [])
+    split_events = _event_rows(frame, "Stock Splits", "ratio")
+    dividend_events = _event_rows(frame, "Dividends", "amount")
+
+    previous_splits = previous_lineage.get("splitEvents") if isinstance(previous_lineage.get("splitEvents"), list) else []
+    previous_dividends = previous_lineage.get("dividendEvents") if isinstance(previous_lineage.get("dividendEvents"), list) else []
+    split_events = list({row["eventEffectiveAt"]: row for row in [*previous_splits, *split_events]}.values())
+    dividend_events = list({row["eventEffectiveAt"]: row for row in [*previous_dividends, *dividend_events]}.values())
+    split_events.sort(key=lambda row: row["eventEffectiveAt"])
+    dividend_events.sort(key=lambda row: row["eventEffectiveAt"])
+
+    split_status = "VERIFIED_YFINANCE_AUTO_ADJUSTED" if has_split_column else "UNVERIFIED_SPLIT_ACTION_COLUMN_MISSING"
+    dividend_status = "VERIFIED_YFINANCE_AUTO_ADJUSTED" if has_dividend_column else "UNVERIFIED_DIVIDEND_ACTION_COLUMN_MISSING"
+    if has_split_column and has_dividend_column:
+        corporate_status = (
+            "VERIFIED_SPLIT_DIVIDEND_EVENTS_IN_WINDOW"
+            if split_events or dividend_events
+            else "VERIFIED_NO_SPLIT_OR_DIVIDEND_EVENT_IN_WINDOW"
+        )
+    else:
+        corporate_status = "UNVERIFIED_ACTION_COLUMNS_INCOMPLETE"
+
+    symbol_change_status = _verified_evidence_status(
+        listing_evidence.get("symbolChangeEvidence"),
+        VERIFIED_SYMBOL_CHANGE_STATUSES,
+        "UNVERIFIED_HISTORICAL_SYMBOL_CHANGE_SOURCE_MISSING",
+    )
+    delisting_status = _verified_evidence_status(
+        listing_evidence.get("delistingEvidence"),
+        VERIFIED_DELISTING_STATUSES,
+        "UNVERIFIED_DELISTING_EVENT_SOURCE_MISSING",
+    )
+    suspension_status = _verified_evidence_status(
+        listing_evidence.get("suspensionEvidence"),
+        VERIFIED_SUSPENSION_STATUSES,
+        "UNVERIFIED_SUSPENSION_EVENT_SOURCE_MISSING",
+    )
+    source_freshness_status = (
+        "FRESH"
+        if source_as_of and (not expected_market_date or source_as_of >= expected_market_date)
+        else "STALE_OR_UNVERIFIED"
+    )
+    effective_observation_count = observation_count if observation_count is not None else len(frame.index)
+    history_coverage_status = (
+        "VERIFIED_OBSERVED_HISTORY"
+        if effective_observation_count >= OHLCV_LINEAGE_MIN_BARS
+        else "UNVERIFIED_PARTIAL_HISTORY"
+    )
+
+    prior_start = previous_lineage.get("lookbackStart")
+    prior_end = previous_lineage.get("lookbackEnd")
+    effective_source_as_of = source_as_of if stored_rows else max(filter(None, [prior_end, source_as_of]), default=None)
+    effective_lookback_start = lookback_start if stored_rows else min(filter(None, [prior_start, lookback_start]), default=None)
+    lineage = {
+        "schemaVersion": "corporate-action-lineage-v1",
+        "lineageStatus": "PRESENT",
+        "symbol": str(record_symbol or "").strip().upper(),
+        "sourceSymbol": str(source_symbol or "").strip().upper(),
+        "vendor": "YFINANCE_YAHOO",
+        "retrievedAt": retrieved_at,
+        "sourceAsOf": effective_source_as_of,
+        "marketTimezone": "America/New_York",
+        "adjustmentType": "YFINANCE_AUTO_ADJUSTED_OHLC",
+        "splitAdjustmentStatus": split_status,
+        "dividendAdjustmentStatus": dividend_status,
+        "corporateActionStatus": corporate_status,
+        "symbolChangeStatus": symbol_change_status,
+        "delistingStatus": delisting_status,
+        "suspensionStatus": suspension_status,
+        "symbolChangeEvidence": _normalized_external_evidence(listing_evidence.get("symbolChangeEvidence")),
+        "delistingEvidence": _normalized_external_evidence(listing_evidence.get("delistingEvidence")),
+        "suspensionEvidence": _normalized_external_evidence(listing_evidence.get("suspensionEvidence")),
+        "sourceFreshnessStatus": source_freshness_status,
+        "historyCoverageStatus": history_coverage_status,
+        "survivorshipBiasStatus": "UNVERIFIED_INCOMPLETE_CORPORATE_ACTION_COVERAGE",
+        "returnBasis": "DIVIDEND_AND_SPLIT_ADJUSTED_PRICE_RETURN",
+        "lookbackStart": effective_lookback_start,
+        "lookbackEnd": effective_source_as_of,
+        "observationCount": int(effective_observation_count),
+        "splitEvents": split_events,
+        "dividendEvents": dividend_events,
+        "eventEffectiveAt": max(
+            [row["eventEffectiveAt"] for row in [*split_events, *dividend_events]],
+            default=None,
+        ),
+        "listingEvidence": {
+            "listingSource": listing_evidence.get("listingSource"),
+            "sourceAsOf": listing_evidence.get("listingSourceAsOf") or listing_evidence.get("lastMappedAt"),
+            "listingStatus": listing_evidence.get("listingStatus"),
+        },
+        "vendorRequestLineage": {
+            "method": "Ticker.history",
+            "period": requested_period,
+            "interval": "1d",
+            "actions": True,
+            "autoAdjust": True,
+            "sourceSymbol": str(source_symbol or "").strip().upper(),
+        },
+    }
+    if _corporate_lineage_is_comparable(lineage):
+        lineage["survivorshipBiasStatus"] = "VERIFIED_CORPORATE_ACTION_LINEAGE"
+        lineage["lineageVerifiedForComparison"] = True
+    else:
+        lineage["lineageVerifiedForComparison"] = False
+    return lineage
+
+
+def build_corporate_action_runtime_audit(
+    rows: list[dict],
+    *,
+    trigger_file: str | None,
+    expected_symbols: list[str] | None = None,
+    generated_at: str | None = None,
+) -> dict:
+    generated_at = generated_at or datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    lineage_rows = [row for row in rows if row.get("lineageStatus") == "PRESENT"]
+    rejected_rows = [row for row in rows if str(row.get("lineageStatus") or "").startswith("REJECTED_")]
+    verified_rows = [row for row in lineage_rows if row.get("lineageVerifiedForComparison") is True]
+    unverified_rows = [row for row in lineage_rows if row.get("lineageVerifiedForComparison") is not True]
+    expected = sorted({str(symbol or "").strip().upper() for symbol in (expected_symbols or []) if symbol})
+    row_symbols = [str(row.get("symbol") or "").strip().upper() for row in rows if row.get("symbol")]
+    row_counts = Counter(row_symbols)
+    missing_symbols = [symbol for symbol in expected if row_counts.get(symbol, 0) == 0]
+    duplicate_symbols = sorted(symbol for symbol, count in row_counts.items() if count > 1)
+    contract_status = "pass" if not missing_symbols and not duplicate_symbols else "warn_coverage_mismatch"
+    comparison_coverage_status = (
+        "verified_rows_available" if verified_rows else "unverified_external_event_source_coverage"
+    )
+    retrieved = sorted(str(row.get("retrievedAt")) for row in lineage_rows if row.get("retrievedAt"))
+    source_as_of = sorted(str(row.get("sourceAsOf")) for row in lineage_rows if row.get("sourceAsOf"))
+    return {
+        "schemaVersion": "corporate-action-lineage-runtime-audit-v1",
+        "generatedAt": generated_at,
+        "triggerFile": trigger_file,
+        "overall": contract_status,
+        "summary": {
+            "targetRows": len(expected) if expected else len(rows),
+            "lineageRows": len(lineage_rows),
+            "verifiedForComparisonRows": len(verified_rows),
+            "unverifiedRows": len(unverified_rows),
+            "rejectedRows": len(rejected_rows),
+            "missingRows": len(missing_symbols),
+            "duplicateRows": len(duplicate_symbols),
+            "lineageCoveragePct": (
+                round((len(set(row_symbols).intersection(expected)) / len(expected)) * 100, 2)
+                if expected
+                else 100.0
+            ),
+            "comparisonCoverageStatus": comparison_coverage_status,
+        },
+        "sourceTimestamps": {
+            "earliestRetrievedAt": retrieved[0] if retrieved else None,
+            "latestRetrievedAt": retrieved[-1] if retrieved else None,
+            "earliestSourceAsOf": source_as_of[0] if source_as_of else None,
+            "latestSourceAsOf": source_as_of[-1] if source_as_of else None,
+        },
+        "missingSymbols": missing_symbols,
+        "duplicateSymbols": duplicate_symbols,
+        "rows": sorted(rows, key=lambda row: str(row.get("symbol") or "")),
+    }
+
+
 def get_latest_ohlcv_date(records):
     if not isinstance(records, list) or not records:
         return None
@@ -1804,29 +2198,48 @@ def is_ohlcv_fresh(existing_records):
 
 
 # --- [OHLCV 누적 수집 로직] ---
-def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symbol=None):
+def sync_ohlcv_incremental(
+    ticker,
+    ohlcv_dir_id,
+    source_symbol=None,
+    record_symbol=None,
+    listing_evidence=None,
+    lineage_sink=None,
+):
     source_symbol = source_symbol or ticker
     record_symbol = record_symbol or ticker
     file_name = f"{record_symbol}_OHLCV.json"
     file_id = find_file_id(file_name, ohlcv_dir_id)
-    # OHLCV는 리스트 형태이므로 리스트로 변환 보장
-    existing_data = download_json(file_id)
-    if not isinstance(existing_data, list): existing_data = []
+    existing_payload = download_json(file_id)
+    existing_data, existing_lineage = _extract_ohlcv_payload(existing_payload)
     existing_data, removed_invalid_existing = sanitize_ohlcv_records(existing_data)
     if removed_invalid_existing > 0:
         print(f"🧹 {file_name}: invalid OHLCV rows {removed_invalid_existing}건 제거")
 
     # [최적화] 최신 거래일까지 이미 수집된 종목은 재호출 스킵
-    if existing_data and is_ohlcv_fresh(existing_data):
+    if existing_data and is_ohlcv_fresh(existing_data) and existing_lineage:
         if removed_invalid_existing > 0:
-            upload_json(file_name, existing_data, ohlcv_dir_id)
+            upload_json(
+                file_name,
+                {
+                    "schemaVersion": "ohlcv-lineage-v1",
+                    "generatedAt": existing_lineage.get("retrievedAt"),
+                    "symbol": record_symbol,
+                    "sourceSymbol": source_symbol,
+                    "data": existing_data,
+                    "lineage": existing_lineage,
+                },
+                ohlcv_dir_id,
+            )
+        if isinstance(lineage_sink, list):
+            lineage_sink.append(existing_lineage)
         return "SKIPPED"
 
     try:
         stock = yf.Ticker(source_symbol)
-        # 데이터가 없으면 5년(5y), 있으면 최근 7일(7d)만
-        period = OHLCV_INCREMENTAL_PERIOD if existing_data else OHLCV_INITIAL_PERIOD
-        df = stock.history(period=period, interval="1d")
+        # Legacy arrays receive one full refresh so the initial lineage window is not fabricated.
+        period = OHLCV_INCREMENTAL_PERIOD if existing_data and existing_lineage else OHLCV_INITIAL_PERIOD
+        df = stock.history(period=period, interval="1d", actions=True, auto_adjust=True)
 
         if df.empty:
             record_symbol_failure(
@@ -1838,42 +2251,38 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
                 requestedPeriod=period,
                 existingRows=len(existing_data),
             )
+            if isinstance(lineage_sink, list):
+                lineage_sink.append(
+                    {
+                        "symbol": record_symbol,
+                        "sourceSymbol": source_symbol,
+                        "lineageStatus": "REJECTED_VENDOR_MISSING",
+                        "reason": "yfinance_history_empty",
+                    }
+                )
             return "FAILED"
 
-        # 각 레코드마다 symbol 필드를 강제로 추가
-        new_recs = []
-        skipped_invalid_new = 0
-        for d, r in df.iterrows():
-            open_price = _to_finite_float(r.get("Open"))
-            high_price = _to_finite_float(r.get("High"))
-            low_price = _to_finite_float(r.get("Low"))
-            close_price = _to_finite_float(r.get("Close"))
-            if (
-                open_price is None
-                or high_price is None
-                or low_price is None
-                or close_price is None
-                or open_price <= 0
-                or high_price <= 0
-                or low_price <= 0
-                or close_price <= 0
-                or high_price < low_price
-            ):
-                skipped_invalid_new += 1
-                continue
-            volume_raw = _to_finite_float(r.get("Volume"))
-            volume = int(max(0, round(volume_raw))) if volume_raw is not None else 0
-            new_recs.append(
-                {
-                    "symbol": record_symbol,
-                    "date": d.strftime('%Y-%m-%d'),
-                    "open": round(open_price, 2),
-                    "high": round(high_price, 2),
-                    "low": round(low_price, 2),
-                    "close": round(close_price, 2),
-                    "volume": volume,
-                }
+        new_recs, skipped_invalid_new = _normalize_ohlcv_frame(df, record_symbol)
+
+        # Yahoo adjusted OHLC is retrospectively rebased after split/dividend
+        # events. Never merge a rebased incremental window into an older basis.
+        full_refresh_required = bool(
+            existing_data
+            and existing_lineage
+            and (
+                _frame_has_unseen_adjustment_event(df, existing_lineage)
+                or _adjusted_price_basis_changed(existing_data, new_recs)
+                or not _incremental_window_overlaps(existing_data, new_recs)
             )
+        )
+        if full_refresh_required:
+            period = OHLCV_INITIAL_PERIOD
+            df = stock.history(period=period, interval="1d", actions=True, auto_adjust=True)
+            if df.empty:
+                raise RuntimeError("full_history_refresh_required_but_vendor_returned_empty")
+            new_recs, skipped_invalid_new = _normalize_ohlcv_frame(df, record_symbol)
+            existing_data = []
+            existing_lineage = None
 
         if skipped_invalid_new > 0:
             print(f"🧹 {file_name}: fetched invalid OHLCV rows {skipped_invalid_new}건 제외")
@@ -1896,9 +2305,44 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
                 fetchedRows=len(new_recs),
                 skippedInvalidRows=skipped_invalid_new,
             )
+            if isinstance(lineage_sink, list):
+                lineage_sink.append(
+                    {
+                        "symbol": record_symbol,
+                        "sourceSymbol": source_symbol,
+                        "lineageStatus": "REJECTED_PARTIAL_HISTORY",
+                        "reason": "no_valid_ohlcv_rows_after_sanitize",
+                    }
+                )
             return "FAILED"
 
-        upload_json(file_name, final_list, ohlcv_dir_id)
+        retrieved_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        lineage = build_corporate_action_lineage(
+            df,
+            record_symbol=record_symbol,
+            source_symbol=source_symbol,
+            requested_period=period,
+            retrieved_at=retrieved_at,
+            listing_evidence=listing_evidence,
+            expected_market_date=get_expected_market_date_str(),
+            previous_lineage=existing_lineage,
+            observation_count=len(final_list),
+            stored_rows=final_list,
+        )
+        upload_json(
+            file_name,
+            {
+                "schemaVersion": "ohlcv-lineage-v1",
+                "generatedAt": retrieved_at,
+                "symbol": record_symbol,
+                "sourceSymbol": source_symbol,
+                "data": final_list,
+                "lineage": lineage,
+            },
+            ohlcv_dir_id,
+        )
+        if isinstance(lineage_sink, list):
+            lineage_sink.append(lineage)
         return "UPDATED"
     except Exception as e:
         record_symbol_failure(
@@ -1914,6 +2358,15 @@ def sync_ohlcv_incremental(ticker, ohlcv_dir_id, source_symbol=None, record_symb
             flush=True
         )
         traceback.print_exc()
+        if isinstance(lineage_sink, list):
+            lineage_sink.append(
+                {
+                    "symbol": record_symbol,
+                    "sourceSymbol": source_symbol,
+                    "lineageStatus": "REJECTED_VENDOR_ERROR",
+                    "reason": type(e).__name__,
+                }
+            )
         return "FAILED"
 
 # --- [3. 시장 컨텍스트 스냅샷 생성] ---
@@ -1983,7 +2436,7 @@ def build_breadth_snapshot(tickers, ohlcv_dir_id):
 
     for ticker in tickers:
         file_id = find_file_id(f"{ticker}_OHLCV.json", ohlcv_dir_id)
-        records = download_json(file_id)
+        records, _ = _extract_ohlcv_payload(download_json(file_id))
         if not isinstance(records, list) or len(records) < 50:
             continue
 
@@ -2108,7 +2561,7 @@ def build_market_regime_snapshot(trigger_file, timestamp, tickers, ohlcv_dir_id)
     for benchmark in BENCHMARK_SPECS:
         alias = benchmark["alias"]
         file_id = find_file_id(f"{alias}_OHLCV.json", ohlcv_dir_id)
-        records = download_json(file_id)
+        records, _ = _extract_ohlcv_payload(download_json(file_id))
         snapshot = build_benchmark_snapshot(records, alias)
         if snapshot:
             if alias == "SP500_INDEX":
@@ -2550,6 +3003,8 @@ def run_harvester():
     dispatch_earnings_event_count = 0
     dispatch_earnings_event_missing = 0
     dispatch_earnings_event_source = "unavailable"
+    dispatch_corporate_action_ready = False
+    dispatch_corporate_action_summary = {}
     daily_group_label = "N/A"
     daily_batch_mode = DAILY_BATCH_MODE or "auto"
     daily_target_count = 0
@@ -2565,6 +3020,14 @@ def run_harvester():
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
             dispatch_trigger_file = get_dispatch_trigger_file()
+            ticker_mapping = {}
+            try:
+                ticker_mapping_id = find_file_id("Ticker_ID_Mapping_Final.json", sys_id)
+                candidate_mapping = download_json(ticker_mapping_id)
+                if isinstance(candidate_mapping, dict):
+                    ticker_mapping = candidate_mapping
+            except Exception as e:
+                print(f"⚠️ Corporate-action listing lineage unavailable: {type(e).__name__}: {e}", flush=True)
             
             if s3_folder_id:
                 query = f"'{s3_folder_id}' in parents and name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
@@ -2600,8 +3063,19 @@ def run_harvester():
                         update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING", current_trigger_file)
 
                         ohlcv_skipped = 0
+                        corporate_action_lineage_rows = []
                         for idx, st in enumerate(s3_tickers, 1):
-                            sync_status = sync_ohlcv_incremental(st, ohlcv_dir_id)
+                            listing_evidence = dict(ticker_mapping.get(st) or {})
+                            mapping_meta = ticker_mapping.get("_meta") if isinstance(ticker_mapping.get("_meta"), dict) else {}
+                            listing_evidence["listingSourceAsOf"] = (
+                                listing_evidence.get("lastMappedAt") or mapping_meta.get("generatedAt")
+                            )
+                            sync_status = sync_ohlcv_incremental(
+                                st,
+                                ohlcv_dir_id,
+                                listing_evidence=listing_evidence,
+                                lineage_sink=corporate_action_lineage_rows,
+                            )
                             if sync_status == "UPDATED":
                                 total_success += 1
                             elif sync_status == "SKIPPED":
@@ -2619,6 +3093,27 @@ def run_harvester():
                             if idx % 10 == 0 or idx == total_count:
                                 print(f"📊 진행 중... {idx}/{total_count} (skip {ohlcv_skipped})")
                                 update_progress(idx, total_count, st, sys_id, "PROCESSING", current_trigger_file)
+
+                        try:
+                            corporate_action_audit = build_corporate_action_runtime_audit(
+                                corporate_action_lineage_rows,
+                                trigger_file=current_trigger_file,
+                                expected_symbols=s3_tickers,
+                            )
+                            write_json_report(
+                                HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH,
+                                corporate_action_audit,
+                                "Corporate-action lineage runtime audit",
+                            )
+                            upload_json(
+                                CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME,
+                                corporate_action_audit,
+                                sys_id,
+                            )
+                            dispatch_corporate_action_ready = corporate_action_audit.get("overall") == "pass"
+                            dispatch_corporate_action_summary = corporate_action_audit.get("summary", {})
+                        except Exception as e:
+                            print(f"⚠️ Corporate-action lineage audit 생성 실패: {type(e).__name__}: {e}", flush=True)
 
                         benchmark_success = 0
                         benchmark_fail = 0
@@ -2692,7 +3187,21 @@ def run_harvester():
 
                         update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
 
-                        upload_json("LATEST_STAGE4_READY.json", {"status": "COMPLETED", "trigger_file": current_trigger_file, "timestamp": today_str}, sys_id)
+                        upload_json(
+                            "LATEST_STAGE4_READY.json",
+                            {
+                                "status": "COMPLETED",
+                                "trigger_file": current_trigger_file,
+                                "timestamp": today_str,
+                                "corporateActionLineageStatus": (
+                                    "CONTRACT_READY"
+                                    if dispatch_corporate_action_ready
+                                    else "COVERAGE_MISMATCH"
+                                ),
+                                "corporateActionLineageAudit": CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME,
+                            },
+                            sys_id,
+                        )
                         regime_status = "READY" if market_regime_ready else "SKIPPED"
                         earnings_status = "READY" if earnings_event_ready else "SKIPPED"
                         failure_line = failure_telegram_summary()
@@ -2715,6 +3224,10 @@ def run_harvester():
                 "earningsEventSource": dispatch_earnings_event_source,
                 "earningsEventCoverageAudit": EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME,
                 "earningsEventCoverageAuditPath": HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH,
+                "corporateActionLineageReady": dispatch_corporate_action_ready,
+                "corporateActionLineageSummary": dispatch_corporate_action_summary,
+                "corporateActionLineageAudit": CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME,
+                "corporateActionLineageAuditPath": HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH,
                 "benchmarkSuccess": dispatch_benchmark_success,
                 "benchmarkSkipped": dispatch_benchmark_skipped,
                 "benchmarkFailed": dispatch_benchmark_fail,
