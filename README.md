@@ -114,7 +114,53 @@ symbol change, delisting, or suspension occurred. Those statuses therefore
 remain `UNVERIFIED_*` until an explicit source-backed evidence record is
 available; such rows are intentionally ineligible for OOS cohort comparison.
 
+External evidence is additive to `corporate-action-lineage-v1`; existing field
+names are unchanged. A verified external event/no-event record now also
+requires a successful request, exact requested/matched symbol, explicit
+coverage interval, non-partial response, retrieval timestamp, and response
+SHA-256. Empty, timed-out, stale, partial, or entitlement-blocked responses
+remain unverified.
+
+Current source chain:
+
+- FMP Delisted Companies for delisting events and coverage.
+- Nasdaq Trader official current-halt RSS plus the documented one-year halt
+  search for H4/H9/H10/H11/M1/T6/T12 regulatory, listing, corporate-action, or
+  extended halt evidence. The current feed catches unresolved halts older than
+  the searchable history window; the artifact records the one-year historical
+  coverage limit instead of claiming the configured five-year window. RSS
+  publication time is validated independently from retrieval time; missing,
+  future, or older-than-policy feed timestamps make the suspension source
+  unverified. The default freshness ceiling is 15 minutes during the weekday
+  regular-session window and 120 hours outside that window to tolerate
+  weekends and exchange holidays without treating an intraday-stale feed as
+  current. Positive halt events outside the one-year query window are
+  retained with explicit preservation provenance until the configured global
+  retention cutoff, but current suspension status is determined by the fresh
+  complete current feed rather than by a preserved historical row.
+- FMP/Finnhub symbol-change endpoints only after entitlement and a captured
+  response fixture validate their response contract.
+
+If the symbol-change endpoint is unavailable or its response shape has not
+been verified, the audit reports `BLOCKED_EXTERNAL_SOURCE_CONTRACT` and does
+not manufacture `VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE`. The existing
+`TICKER_MAPPING_REFRESH_AUDIT.json` carries source summaries and compact event
+rows, so removed/delisted symbols are not lost when the active ticker mapping
+is replaced.
+
+Batch-source no-event evidence records the evaluated symbol separately from
+the response match. `matchedSymbol` is empty for a proven exact absence and is
+populated only when an event row actually matches; `symbolMatchStatus` and the
+complete response hash make that distinction auditable.
+
+Compatibility/migration note: this is an additive extension of
+`corporate-action-lineage-v1`. Existing status fields retain their semantics;
+older rows without the request-proof envelope remain valid historical
+artifacts but are not eligible for OOS comparison. Consumers must not backfill
+the new proof fields or upgrade legacy rows by inference.
+
 Runtime audit artifacts:
 
+- `state/ticker-mapping-refresh-audit.json`
 - `state/corporate-action-lineage-runtime-audit.json`
 - `System_Identity_Maps/CORPORATE_ACTION_LINEAGE_RUNTIME_AUDIT.json`
