@@ -11,8 +11,13 @@ import re
 import math
 import ssl
 import traceback
+import hashlib
+from email.utils import parsedate_to_datetime
 import yfinance as yf
 from collections import Counter
+from html.parser import HTMLParser
+from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -206,6 +211,24 @@ HARVESTER_TICKER_MAPPING_REFRESH_ENABLED = _read_bool_env("HARVESTER_TICKER_MAPP
 HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN = _read_bool_env("HARVESTER_TICKER_MAPPING_REFRESH_FAIL_OPEN", True)
 HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON = _read_bool_env("HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON", False)
 HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS = _read_positive_int_env("HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS", 48)
+HARVESTER_EXTERNAL_CORPORATE_ACTION_ENABLED = _read_bool_env(
+    "HARVESTER_EXTERNAL_CORPORATE_ACTION_ENABLED", True
+)
+HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS = _read_positive_int_env(
+    "HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS", 5
+)
+HARVESTER_FMP_DELISTED_MAX_PAGES = _read_positive_int_env(
+    "HARVESTER_FMP_DELISTED_MAX_PAGES", 50
+)
+HARVESTER_NASDAQ_HALT_RSS_MAX_AGE_HOURS = _read_positive_int_env(
+    "HARVESTER_NASDAQ_HALT_RSS_MAX_AGE_HOURS", 120
+)
+HARVESTER_NASDAQ_HALT_RSS_RTH_MAX_AGE_MINUTES = _read_positive_int_env(
+    "HARVESTER_NASDAQ_HALT_RSS_RTH_MAX_AGE_MINUTES", 15
+)
+HARVESTER_NASDAQ_HALT_RSS_MAX_FUTURE_SKEW_MINUTES = _read_positive_int_env(
+    "HARVESTER_NASDAQ_HALT_RSS_MAX_FUTURE_SKEW_MINUTES", 15
+)
 RUN_FAILURE_DETAILS = []
 RUN_SYMBOL_SKIP_DETAILS = []
 
@@ -803,6 +826,679 @@ EXCHANGE_CODE_LABELS = {
     "Z": "Cboe BZX",
 }
 
+EXTERNAL_CORPORATE_ACTION_SCHEMA_VERSION = "external-corporate-action-coverage-v1"
+FMP_DELISTED_ENDPOINT = "https://financialmodelingprep.com/stable/delisted-companies"
+NASDAQ_HALT_SEARCH_PAGE = "https://www.nasdaqtrader.com/Trader.aspx?id=TradingHaltSearch"
+NASDAQ_HALT_RPC_ENDPOINT = "https://www.nasdaqtrader.com/RPCHandler.axd"
+NASDAQ_HALT_RSS_ENDPOINT = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+NASDAQ_HISTORICAL_SUSPENSION_CODES = {"H4", "H9", "H10", "H11", "M1", "T6", "T12"}
+NASDAQ_HALT_REASON_LABELS = {
+    "H4": "non_compliance",
+    "H9": "filings_not_current",
+    "H10": "sec_trading_suspension",
+    "H11": "regulatory_concern",
+    "M1": "corporate_action",
+    "T6": "extraordinary_market_activity",
+    "T12": "additional_information_requested",
+}
+
+
+def _canonical_sha256(payload) -> str:
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _normalize_event_symbol(value) -> str:
+    return _normalize_listing_symbol_for_yfinance(value)
+
+
+def _parse_date(value) -> datetime.date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _coverage_start_date(end_date: datetime.date) -> datetime.date:
+    try:
+        return end_date.replace(
+            year=end_date.year - HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS
+        )
+    except ValueError:
+        return end_date.replace(
+            year=end_date.year - HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS,
+            day=28,
+        )
+
+
+def _one_year_coverage_start(end_date: datetime.date) -> datetime.date:
+    try:
+        return end_date.replace(year=end_date.year - 1)
+    except ValueError:
+        return end_date.replace(year=end_date.year - 1, day=28)
+
+
+class _HtmlTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() == "tr":
+            self._row = []
+        elif tag.lower() in {"th", "td"} and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered in {"th", "td"} and self._cell is not None and self._row is not None:
+            self._row.append(" ".join(self._cell).strip())
+            self._cell = None
+        elif lowered == "tr" and self._row is not None:
+            if any(self._row):
+                self.rows.append(self._row)
+            self._row = None
+
+
+def _parse_html_table_rows_with_contract(
+    html_text: str,
+) -> tuple[list[dict], int, bool]:
+    parser = _HtmlTableParser()
+    parser.feed(str(html_text or ""))
+    if not parser.rows:
+        return [], 0, False
+    headers = [str(value).strip() for value in parser.rows[0]]
+    raw_rows = parser.rows[1:]
+    shape_valid = bool(
+        headers
+        and raw_rows
+        and all(len(row) == len(headers) for row in raw_rows)
+    )
+    rows = [
+        dict(zip(headers, row))
+        for row in raw_rows
+        if len(row) == len(headers)
+    ]
+    return rows, len(raw_rows), shape_valid
+
+
+def _parse_html_table_rows(html_text: str) -> list[dict]:
+    rows, _, _ = _parse_html_table_rows_with_contract(html_text)
+    return rows
+
+
+def _market_timestamp(date_value, time_value) -> str | None:
+    date_text = str(date_value or "").strip()
+    time_text = str(time_value or "").strip()
+    if not date_text or not time_text:
+        return None
+    try:
+        parsed = datetime.datetime.strptime(
+            f"{date_text[:10]} {time_text}",
+            "%m/%d/%Y %H:%M:%S.%f" if "." in time_text else "%m/%d/%Y %H:%M:%S",
+        )
+        return parsed.replace(tzinfo=ZoneInfo("America/New_York")).isoformat()
+    except ValueError:
+        return None
+
+
+def _parse_fmp_delisted_rows(payload) -> list[dict]:
+    rows = []
+    for raw in payload if isinstance(payload, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        symbol = _normalize_event_symbol(raw.get("symbol"))
+        effective = _parse_date(raw.get("delistedDate"))
+        if not symbol or not effective:
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "companyName": raw.get("companyName") or None,
+                "exchange": raw.get("exchange") or None,
+                "ipoDate": str(raw.get("ipoDate") or "")[:10] or None,
+                "eventEffectiveAt": effective.isoformat(),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["eventEffectiveAt"], row["symbol"]))
+
+
+def _fmp_delisted_payload_contract_valid(payload) -> bool:
+    return bool(
+        isinstance(payload, list)
+        and all(
+            isinstance(row, dict)
+            and _normalize_event_symbol(row.get("symbol"))
+            and _parse_date(row.get("delistedDate"))
+            for row in payload
+        )
+    )
+
+
+def _events_within_coverage(
+    rows: list[dict],
+    coverage_start: datetime.date,
+    coverage_end: datetime.date,
+    *,
+    retain_current_active: bool = False,
+    source_as_of: str | None = None,
+) -> list[dict]:
+    as_of = _parse_iso_datetime(source_as_of)
+    return [
+        dict(row)
+        for row in rows or []
+        if (
+            isinstance(row, dict)
+            and (
+                (
+                    (effective := _parse_date(row.get("eventEffectiveAt")))
+                    and coverage_start <= effective <= coverage_end
+                )
+                or (
+                    retain_current_active
+                    and row.get("currentFeedObserved") is True
+                    and (
+                        (resumed := _parse_iso_datetime(row.get("resumedAt"))) is None
+                        or as_of is None
+                        or resumed > as_of
+                    )
+                )
+            )
+        )
+    ]
+
+
+def _parse_nasdaq_halt_rows(
+    html_text: str,
+    *,
+    allowed_codes: set[str] | None = None,
+) -> list[dict]:
+    allowed_codes = allowed_codes or NASDAQ_HISTORICAL_SUSPENSION_CODES
+    rows = []
+    for raw in _parse_html_table_rows(html_text):
+        reason_code = str(raw.get("Reason Code") or "").strip().upper()
+        if reason_code not in allowed_codes:
+            continue
+        symbol = _normalize_event_symbol(raw.get("Issue Symbol"))
+        effective = _market_timestamp(raw.get("Halt Date"), raw.get("Halt Time"))
+        if not symbol or not effective:
+            continue
+        resumed = _market_timestamp(
+            raw.get("Resumption Date"),
+            raw.get("Resumption Trade Time"),
+        )
+        rows.append(
+            {
+                "symbol": symbol,
+                "eventEffectiveAt": effective,
+                "resumedAt": resumed,
+                "reasonCode": reason_code,
+                "reason": NASDAQ_HALT_REASON_LABELS[reason_code],
+                "market": raw.get("Market") or None,
+                "currentFeedObserved": False,
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["eventEffectiveAt"],
+            row["symbol"],
+            row["reasonCode"],
+        ),
+    )
+
+
+def _parse_rfc2822_datetime(value: str | None) -> datetime.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _rss_publication_contract(
+    published_at: str | None,
+    retrieved_at: str,
+) -> tuple[bool, str | None, str | None, float | None, str]:
+    published = _parse_rfc2822_datetime(published_at)
+    retrieved = _parse_iso_datetime(retrieved_at)
+    if published is None or retrieved is None:
+        return (
+            False,
+            "current_feed_published_at_invalid",
+            None,
+            None,
+            "UNDETERMINED",
+        )
+    age_hours = (retrieved - published).total_seconds() / 3600
+    max_future_skew_hours = (
+        HARVESTER_NASDAQ_HALT_RSS_MAX_FUTURE_SKEW_MINUTES / 60
+    )
+    retrieved_market = retrieved.astimezone(ZoneInfo("America/New_York"))
+    minute_of_day = retrieved_market.hour * 60 + retrieved_market.minute
+    regular_session_window = bool(
+        retrieved_market.weekday() < 5
+        and (9 * 60 + 30) <= minute_of_day <= (16 * 60 + 15)
+    )
+    freshness_mode = (
+        "WEEKDAY_REGULAR_SESSION_WINDOW"
+        if regular_session_window
+        else "OFF_SESSION_WEEKEND_OR_HOLIDAY_TOLERANCE"
+    )
+    max_age_hours = (
+        HARVESTER_NASDAQ_HALT_RSS_RTH_MAX_AGE_MINUTES / 60
+        if regular_session_window
+        else HARVESTER_NASDAQ_HALT_RSS_MAX_AGE_HOURS
+    )
+    if age_hours < -max_future_skew_hours:
+        return (
+            False,
+            "current_feed_published_at_future",
+            published.isoformat().replace("+00:00", "Z"),
+            age_hours,
+            freshness_mode,
+        )
+    if age_hours > max_age_hours:
+        return (
+            False,
+            "current_feed_published_at_stale",
+            published.isoformat().replace("+00:00", "Z"),
+            age_hours,
+            freshness_mode,
+        )
+    return (
+        True,
+        None,
+        published.isoformat().replace("+00:00", "Z"),
+        age_hours,
+        freshness_mode,
+    )
+
+
+def _parse_nasdaq_current_halt_rss(xml_payload: bytes) -> tuple[bool, str | None, list[dict]]:
+    try:
+        root = ElementTree.fromstring(xml_payload)
+    except (ElementTree.ParseError, TypeError, ValueError):
+        return False, None, []
+    channel = root.find("./channel")
+    if channel is None:
+        return False, None, []
+    namespace = {"ndaq": "http://www.nasdaqtrader.com/"}
+    declared_count = channel.find("ndaq:numItems", namespace)
+    items = channel.findall("./item")
+    try:
+        expected_count = int(str(declared_count.text or "").strip())
+    except (AttributeError, TypeError, ValueError):
+        return False, None, []
+    if expected_count != len(items):
+        return False, None, []
+    rows = []
+    for item in items:
+        def field(name: str) -> str:
+            node = item.find(f"ndaq:{name}", namespace)
+            return str(node.text or "").strip() if node is not None else ""
+
+        symbol = _normalize_event_symbol(field("IssueSymbol"))
+        reason_code = field("ReasonCode").upper()
+        effective = _market_timestamp(field("HaltDate"), field("HaltTime"))
+        if not symbol or not reason_code or not effective:
+            return False, None, []
+        rows.append(
+            {
+                "symbol": symbol,
+                "eventEffectiveAt": effective,
+                "resumedAt": _market_timestamp(
+                    field("ResumptionDate"),
+                    field("ResumptionTradeTime"),
+                ),
+                "reasonCode": reason_code,
+                "reason": NASDAQ_HALT_REASON_LABELS.get(
+                    reason_code,
+                    f"nasdaq_halt_{reason_code.lower()}",
+                ),
+                "market": field("Market") or None,
+                "currentFeedObserved": True,
+            }
+        )
+    return (
+        True,
+        str(channel.findtext("pubDate") or "").strip() or None,
+        sorted(
+            rows,
+            key=lambda row: (
+                row["eventEffectiveAt"],
+                row["symbol"],
+                row["reasonCode"],
+            ),
+        ),
+    )
+
+
+def _proof_from_source(
+    source: dict,
+    symbol: str,
+    *,
+    matched_symbol: str | None = None,
+    match_status: str = "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE",
+) -> dict:
+    return {
+        "source": source.get("source"),
+        "sourceAsOf": source.get("sourceAsOf"),
+        "sourceAsOfBasis": source.get("sourceAsOfBasis"),
+        "retrievedAt": source.get("retrievedAt"),
+        "requestStatus": "SUCCESS",
+        "requestedSymbol": symbol,
+        "matchedSymbol": matched_symbol,
+        "symbolMatchStatus": match_status,
+        "symbolMatchMethod": "DETERMINISTIC_EXACT_NORMALIZED_SYMBOL_LOOKUP",
+        "sourceScopeComplete": (
+            str(source.get("status") or "").upper() == "SUCCESS"
+            and source.get("partialResponse") is False
+        ),
+        "coverageStart": source.get("coverageStart"),
+        "coverageEnd": source.get("coverageEnd"),
+        "partialResponse": False,
+        "responseSha256": source.get("responseSha256"),
+        "queryScope": source.get("queryScope") or "ALL_US_MARKETS",
+        "requestScopeSymbolsSha256": source.get("requestScopeSymbolsSha256"),
+    }
+
+
+def _events_by_symbol(rows: list[dict], key: str = "symbol") -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        symbol = _normalize_event_symbol(row.get(key)) if isinstance(row, dict) else ""
+        if symbol:
+            grouped.setdefault(symbol, []).append(dict(row))
+    for symbol in grouped:
+        grouped[symbol].sort(
+            key=lambda row: (
+                str(row.get("eventEffectiveAt") or ""),
+                str(row.get("reasonCode") or ""),
+            )
+        )
+    return grouped
+
+
+def _preserved_evidence_after_refresh_failure(
+    previous_evidence,
+    source: dict,
+) -> dict | None:
+    if not isinstance(previous_evidence, dict):
+        return None
+    preserved = dict(previous_evidence)
+    preserved["preservedStatus"] = preserved.get("status")
+    preserved["status"] = "UNVERIFIED_EXTERNAL_SOURCE_REFRESH_FAILED"
+    preserved["reason"] = (
+        source.get("reason")
+        or source.get("status")
+        or "external_source_refresh_failed"
+    )
+    preserved["refreshFailureAt"] = source.get("retrievedAt")
+    return preserved
+
+
+def _symbol_change_chain(events: dict, symbol: str) -> list[dict]:
+    chain = []
+    current = symbol
+    visited = set()
+    while current and current not in visited:
+        visited.add(current)
+        matches = [
+            event
+            for event in events.get(current, [])
+            if _normalize_event_symbol(event.get("newSymbol")) == current
+        ]
+        if not matches:
+            break
+        selected = sorted(
+            matches,
+            key=lambda event: str(event.get("eventEffectiveAt") or ""),
+        )[-1]
+        chain.append(dict(selected))
+        current = _normalize_event_symbol(selected.get("oldSymbol"))
+    return sorted(chain, key=lambda event: str(event.get("eventEffectiveAt") or ""))
+
+
+def _apply_symbol_change_evidence(row: dict, events: dict, source: dict, symbol: str) -> str:
+    if str(source.get("status") or "").upper() != "SUCCESS":
+        preserved = _preserved_evidence_after_refresh_failure(
+            row.get("symbolChangeEvidence"),
+            source,
+        )
+        if preserved is None:
+            row.pop("symbolChangeEvidence", None)
+        else:
+            row["symbolChangeEvidence"] = preserved
+        return "blocked"
+    matching = _symbol_change_chain(events, symbol)
+    proof = _proof_from_source(
+        source,
+        symbol,
+        matched_symbol=symbol if matching else None,
+        match_status=(
+            "EXACT_EVENT_MATCH"
+            if matching
+            else "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE"
+        ),
+    )
+    if matching:
+        event = matching[-1]
+        row["symbolChangeEvidence"] = {
+            **proof,
+            "status": "VERIFIED_SYMBOL_CHANGE",
+            "oldSymbol": matching[0].get("oldSymbol"),
+            "newSymbol": event.get("newSymbol"),
+            "eventEffectiveAt": event.get("eventEffectiveAt"),
+            "events": matching,
+        }
+        return "event"
+    conflicts = [
+        event
+        for event in events.get(symbol, [])
+        if _normalize_event_symbol(event.get("oldSymbol")) == symbol
+    ]
+    if conflicts:
+        event = sorted(
+            conflicts,
+            key=lambda item: str(item.get("eventEffectiveAt") or ""),
+        )[-1]
+        row["symbolChangeEvidence"] = {
+            **_proof_from_source(
+                source,
+                symbol,
+                matched_symbol=symbol,
+                match_status="EXACT_EVENT_MATCH",
+            ),
+            "status": "UNVERIFIED_SOURCE_CONFLICT",
+            "reason": "active_symbol_matches_historical_old_symbol",
+            "eventEffectiveAt": event.get("eventEffectiveAt"),
+            "events": conflicts,
+        }
+        return "conflict"
+    row["symbolChangeEvidence"] = {
+        **proof,
+        "status": "VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE",
+    }
+    return "no_event"
+
+
+def _apply_delisting_evidence(row: dict, events: dict, source: dict, symbol: str) -> str:
+    if str(source.get("status") or "").upper() != "SUCCESS":
+        preserved = _preserved_evidence_after_refresh_failure(
+            row.get("delistingEvidence"),
+            source,
+        )
+        if preserved is None:
+            row.pop("delistingEvidence", None)
+        else:
+            row["delistingEvidence"] = preserved
+        return "blocked"
+    matching = events.get(symbol, [])
+    proof = _proof_from_source(
+        source,
+        symbol,
+        matched_symbol=symbol if matching else None,
+        match_status=(
+            "EXACT_EVENT_MATCH"
+            if matching
+            else "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE"
+        ),
+    )
+    if matching:
+        event = matching[-1]
+        row["delistingEvidence"] = {
+            **proof,
+            "status": "UNVERIFIED_SOURCE_CONFLICT",
+            "reason": "active_listing_conflicts_with_delisted_event",
+            "eventEffectiveAt": event.get("eventEffectiveAt"),
+            "events": matching,
+        }
+        return "conflict"
+    row["delistingEvidence"] = {
+        **proof,
+        "status": "VERIFIED_NOT_DELISTED_AS_OF_SOURCE",
+    }
+    return "no_event"
+
+
+def _apply_suspension_evidence(row: dict, events: dict, source: dict, symbol: str) -> str:
+    if str(source.get("status") or "").upper() != "SUCCESS":
+        preserved = _preserved_evidence_after_refresh_failure(
+            row.get("suspensionEvidence"),
+            source,
+        )
+        if preserved is None:
+            row.pop("suspensionEvidence", None)
+        else:
+            row["suspensionEvidence"] = preserved
+        return "blocked"
+    matching = events.get(symbol, [])
+    source_as_of = _parse_iso_datetime(source.get("sourceAsOf"))
+    active = []
+    for event in matching:
+        resumed_at = _parse_iso_datetime(event.get("resumedAt"))
+        if (
+            event.get("currentFeedObserved") is True
+            and (
+                resumed_at is None
+                or source_as_of is None
+                or resumed_at > source_as_of
+            )
+        ):
+            active.append(event)
+    all_resumed = bool(
+        matching
+        and source_as_of
+        and all(
+            (resumed_at := _parse_iso_datetime(event.get("resumedAt")))
+            and resumed_at <= source_as_of
+            for event in matching
+        )
+    )
+    proof = _proof_from_source(
+        source,
+        symbol,
+        matched_symbol=symbol if matching else None,
+        match_status=(
+            "EXACT_HISTORICAL_EVENT_MATCH_CURRENTLY_RESUMED"
+            if matching and not active and all_resumed
+            else "EXACT_HISTORICAL_EVENT_MATCH_NOT_IN_CURRENT_FEED"
+            if matching and not active
+            else "EXACT_EVENT_MATCH"
+            if matching
+            else "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE"
+        ),
+    )
+    if active:
+        event = active[-1]
+        row["suspensionEvidence"] = {
+            **proof,
+            "status": "VERIFIED_SUSPENDED",
+            "eventEffectiveAt": event.get("eventEffectiveAt"),
+            "reason": event.get("reason"),
+            "events": matching,
+        }
+        return "active_event"
+    row["suspensionEvidence"] = {
+        **proof,
+        "status": "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE",
+        "events": matching,
+    }
+    return "resumed_event" if matching else "no_event"
+
+
+def apply_external_corporate_action_coverage(
+    mapping: dict,
+    coverage: dict,
+) -> tuple[dict, dict]:
+    result = {
+        symbol: dict(row)
+        for symbol, row in mapping.items()
+        if (
+            isinstance(symbol, str)
+            and not symbol.startswith("_")
+            and isinstance(row, dict)
+        )
+    }
+    sources = coverage.get("sources") if isinstance(coverage.get("sources"), dict) else {}
+    event_rows = coverage.get("events") if isinstance(coverage.get("events"), dict) else {}
+    symbol_change_events: dict[str, list[dict]] = {}
+    for event in event_rows.get("symbolChanges") or []:
+        if not isinstance(event, dict):
+            continue
+        for value in (event.get("oldSymbol"), event.get("newSymbol")):
+            symbol = _normalize_event_symbol(value)
+            if symbol:
+                symbol_change_events.setdefault(symbol, []).append(dict(event))
+    delisting_events = _events_by_symbol(event_rows.get("delistings") or [])
+    suspension_events = _events_by_symbol(event_rows.get("suspensions") or [])
+    counts = Counter()
+    for symbol in sorted(result):
+        row = result[symbol]
+        counts[f"symbolChange:{_apply_symbol_change_evidence(row, symbol_change_events, sources.get('symbolChange') or {}, symbol)}"] += 1
+        counts[f"delisting:{_apply_delisting_evidence(row, delisting_events, sources.get('delisting') or {}, symbol)}"] += 1
+        counts[f"suspension:{_apply_suspension_evidence(row, suspension_events, sources.get('suspension') or {}, symbol)}"] += 1
+    source_conflict_rows = sum(
+        1
+        for row in result.values()
+        if any(
+            str((row.get(key) or {}).get("status") or "").upper() == "UNVERIFIED_SOURCE_CONFLICT"
+            for key in ("symbolChangeEvidence", "delistingEvidence", "suspensionEvidence")
+        )
+    )
+    summary = {
+        "totalRows": len(result),
+        "symbolChangeBlockedRows": counts["symbolChange:blocked"],
+        "delistingBlockedRows": counts["delisting:blocked"],
+        "suspensionBlockedRows": counts["suspension:blocked"],
+        "sourceConflictRows": source_conflict_rows,
+        "unknownRows": 0,
+        "statusCounts": dict(sorted(counts.items())),
+    }
+    return result, summary
+
 
 def _normalize_listing_symbol_for_yfinance(symbol):
     text = str(symbol or "").strip().upper()
@@ -909,7 +1605,571 @@ def fetch_authoritative_listing_rows():
     return rows, source_summaries
 
 
-def refresh_ticker_mapping_from_authoritative_sources(existing_map, today_str):
+def _previous_external_coverage(previous_audit) -> dict:
+    if not isinstance(previous_audit, dict):
+        return {}
+    coverage = previous_audit.get("externalCorporateActionCoverage")
+    return coverage if isinstance(coverage, dict) else {}
+
+
+def _merge_external_events(previous_rows, current_rows, key_fields) -> list[dict]:
+    merged = {}
+    for row in [*(previous_rows or []), *(current_rows or [])]:
+        if not isinstance(row, dict):
+            continue
+        key = tuple(str(row.get(field) or "") for field in key_fields)
+        if all(key):
+            merged[key] = dict(row)
+    return sorted(merged.values(), key=lambda row: tuple(str(row.get(field) or "") for field in key_fields))
+
+
+def _source_failure(source, status, reason, *, retrieved_at, **extra) -> dict:
+    return {
+        "status": status,
+        "source": source,
+        "reason": reason,
+        "retrievedAt": retrieved_at,
+        "partialResponse": True,
+        **extra,
+    }
+
+
+def _request_with_backoff(callable_request, attempts=3):
+    last_response = None
+    for attempt in range(attempts):
+        response = callable_request()
+        last_response = response
+        if getattr(response, "status_code", None) != 429:
+            return response
+        if attempt < attempts - 1:
+            time.sleep(1.0 * (2**attempt))
+    return last_response
+
+
+def _fetch_fmp_delisting_coverage(
+    session,
+    *,
+    api_key,
+    coverage_start,
+    coverage_end,
+    retrieved_at,
+    previous_coverage,
+) -> tuple[dict, list[dict]]:
+    if not api_key:
+        return (
+            _source_failure(
+                "FMP_DELISTED_COMPANIES",
+                "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                "credential_missing",
+                retrieved_at=retrieved_at,
+            ),
+            previous_coverage.get("events", {}).get("delistings", []),
+        )
+    page_hashes = []
+    fetched_rows = []
+    completed = False
+    for page in range(HARVESTER_FMP_DELISTED_MAX_PAGES):
+        response = _request_with_backoff(
+            lambda page=page: session.get(
+                FMP_DELISTED_ENDPOINT,
+                params={"page": page, "limit": 100},
+                headers={"apikey": api_key, "User-Agent": "US-Alpha-Seeker-Harvester/1.0"},
+                timeout=30,
+            )
+        )
+        status_code = getattr(response, "status_code", None)
+        if status_code in {401, 402, 403}:
+            return (
+                _source_failure(
+                    "FMP_DELISTED_COMPANIES",
+                    "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                    f"entitlement_or_auth_http_{status_code}",
+                    retrieved_at=retrieved_at,
+                ),
+                previous_coverage.get("events", {}).get("delistings", []),
+            )
+        if status_code != 200:
+            return (
+                _source_failure(
+                    "FMP_DELISTED_COMPANIES",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"http_{status_code}",
+                    retrieved_at=retrieved_at,
+                ),
+                previous_coverage.get("events", {}).get("delistings", []),
+            )
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = None
+        if not _fmp_delisted_payload_contract_valid(payload):
+            return (
+                _source_failure(
+                    "FMP_DELISTED_COMPANIES",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    "response_schema_invalid",
+                    retrieved_at=retrieved_at,
+                ),
+                previous_coverage.get("events", {}).get("delistings", []),
+            )
+        page_hashes.append(hashlib.sha256(response.content).hexdigest())
+        if not payload:
+            completed = bool(fetched_rows)
+            break
+        parsed = _parse_fmp_delisted_rows(payload)
+        fetched_rows.extend(parsed)
+        if len(payload) < 100:
+            completed = True
+            break
+        time.sleep(0.2)
+    current_rows = _events_within_coverage(
+        fetched_rows,
+        coverage_start,
+        coverage_end,
+    )
+    preserved_rows = _events_within_coverage(
+        previous_coverage.get("events", {}).get("delistings", []),
+        coverage_start,
+        coverage_end,
+    )
+    merged_rows = _merge_external_events(
+        [],
+        current_rows if completed else preserved_rows,
+        ("symbol", "eventEffectiveAt"),
+    )
+    response_sha = _canonical_sha256(
+        {
+            "pageHashes": page_hashes,
+            "events": merged_rows,
+        }
+    )
+    summary = {
+        "status": "SUCCESS" if completed else "UNVERIFIED_PARTIAL_RESPONSE",
+        "source": "FMP_DELISTED_COMPANIES",
+        "sourceAsOf": retrieved_at,
+        "sourceAsOfBasis": "RETRIEVAL_TIME_NO_VENDOR_TIMESTAMP",
+        "retrievedAt": retrieved_at,
+        "coverageStart": coverage_start.isoformat(),
+        "coverageEnd": coverage_end.isoformat(),
+        "partialResponse": not completed,
+        "responseSha256": response_sha,
+        "queryScope": "US_DELISTED_COMPANIES_ALL",
+        "requestCount": len(page_hashes),
+        "eventCount": len(merged_rows),
+        "partialObservedEventCount": 0 if completed else len(current_rows),
+        "preservedEventCount": 0 if completed else len(preserved_rows),
+    }
+    return summary, merged_rows
+
+
+def _fetch_nasdaq_suspension_coverage(
+    session,
+    *,
+    coverage_start,
+    coverage_end,
+    retrieved_at,
+    previous_coverage,
+) -> tuple[dict, list[dict]]:
+    headers = {"User-Agent": "US-Alpha-Seeker-Harvester/1.0"}
+    history_coverage_start = max(
+        coverage_start,
+        _one_year_coverage_start(coverage_end),
+    )
+    try:
+        landing = session.get(NASDAQ_HALT_SEARCH_PAGE, headers=headers, timeout=30)
+        if landing.status_code != 200:
+            raise RuntimeError(f"landing_http_{landing.status_code}")
+    except (requests.RequestException, RuntimeError) as exc:
+        return (
+            _source_failure(
+                "NASDAQ_TRADER_HALT_HISTORY",
+                "UNVERIFIED_SOURCE_RESPONSE",
+                f"{type(exc).__name__}:{_short_failure_text(exc, 180)}",
+                retrieved_at=retrieved_at,
+            ),
+            previous_coverage.get("events", {}).get("suspensions", []),
+        )
+    try:
+        current_feed = session.get(
+            NASDAQ_HALT_RSS_ENDPOINT,
+            headers=headers,
+            timeout=30,
+        )
+        if current_feed.status_code != 200:
+            raise RuntimeError(f"current_feed_http_{current_feed.status_code}")
+    except (requests.RequestException, RuntimeError) as exc:
+        return (
+            _source_failure(
+                "NASDAQ_TRADER_HALT_HISTORY_AND_CURRENT_FEED",
+                "UNVERIFIED_SOURCE_RESPONSE",
+                f"{type(exc).__name__}:{_short_failure_text(exc, 180)}",
+                retrieved_at=retrieved_at,
+            ),
+            previous_coverage.get("events", {}).get("suspensions", []),
+        )
+    current_feed_valid, current_feed_pub_date, current_feed_rows = (
+        _parse_nasdaq_current_halt_rss(current_feed.content)
+    )
+    if not current_feed_valid:
+        return (
+            _source_failure(
+                "NASDAQ_TRADER_HALT_HISTORY_AND_CURRENT_FEED",
+                "UNVERIFIED_SOURCE_RESPONSE",
+                "current_feed_contract_invalid",
+                retrieved_at=retrieved_at,
+                responseSha256=hashlib.sha256(current_feed.content).hexdigest(),
+            ),
+            previous_coverage.get("events", {}).get("suspensions", []),
+        )
+    (
+        publication_valid,
+        publication_reason,
+        current_feed_source_as_of,
+        current_feed_age_hours,
+        current_feed_freshness_mode,
+    ) = _rss_publication_contract(current_feed_pub_date, retrieved_at)
+    if not publication_valid:
+        return (
+            _source_failure(
+                "NASDAQ_TRADER_HALT_HISTORY_AND_CURRENT_FEED",
+                (
+                    "UNVERIFIED_STALE_SOURCE"
+                    if publication_reason == "current_feed_published_at_stale"
+                    else "UNVERIFIED_SOURCE_RESPONSE"
+                ),
+                publication_reason or "current_feed_published_at_invalid",
+                retrieved_at=retrieved_at,
+                currentFeedPublishedAt=current_feed_source_as_of,
+                currentFeedAgeHours=current_feed_age_hours,
+                currentFeedFreshnessMode=current_feed_freshness_mode,
+                responseSha256=hashlib.sha256(current_feed.content).hexdigest(),
+            ),
+            previous_coverage.get("events", {}).get("suspensions", []),
+        )
+    expected_headers = {"Halt Date", "Issue Symbol", "Reason Code", "Resumption Date"}
+    response_hashes = [hashlib.sha256(current_feed.content).hexdigest()]
+    historical_rows = []
+    raw_halt_rows = 0
+    for request_id, reason_code in enumerate(
+        sorted(NASDAQ_HISTORICAL_SUSPENSION_CODES),
+        1,
+    ):
+        args = [
+            "",
+            reason_code,
+            "",
+            history_coverage_start.strftime("%m/%d/%Y"),
+            coverage_end.strftime("%m/%d/%Y"),
+            "",
+            "",
+        ]
+        request_payload = {
+            "id": request_id,
+            "method": "BL_TradeHalt.SearchTradeHaltsNEW",
+            "params": json.dumps(args, separators=(",", ":")),
+            "version": "1.1",
+        }
+        try:
+            response = session.post(
+                NASDAQ_HALT_RPC_ENDPOINT,
+                data=json.dumps(request_payload, separators=(",", ":")),
+                headers={
+                    **headers,
+                    "Content-Type": "application/json",
+                    "Referer": NASDAQ_HALT_SEARCH_PAGE,
+                },
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            return (
+                _source_failure(
+                    "NASDAQ_TRADER_HALT_HISTORY",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"{reason_code}:{type(exc).__name__}:{_short_failure_text(exc, 160)}",
+                    retrieved_at=retrieved_at,
+                ),
+                previous_coverage.get("events", {}).get("suspensions", []),
+            )
+        if response.status_code != 200:
+            return (
+                _source_failure(
+                    "NASDAQ_TRADER_HALT_HISTORY",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"{reason_code}:http_{response.status_code}",
+                    retrieved_at=retrieved_at,
+                ),
+                previous_coverage.get("events", {}).get("suspensions", []),
+            )
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = None
+        payload_contract_valid = bool(
+            isinstance(payload, dict)
+            and str(payload.get("id") or "") == str(request_id)
+            and str(payload.get("version") or "") == "1.1"
+            and isinstance(payload.get("result"), str)
+        )
+        html_text = payload.get("result") if payload_contract_valid else None
+        response_hashes.append(hashlib.sha256(response.content).hexdigest())
+        if not payload_contract_valid:
+            return (
+                _source_failure(
+                    "NASDAQ_TRADER_HALT_HISTORY",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"{reason_code}:rpc_response_contract_invalid",
+                    retrieved_at=retrieved_at,
+                    responseSha256=response_hashes[-1],
+                ),
+                previous_coverage.get("events", {}).get("suspensions", []),
+            )
+        if str(html_text or "").strip() == "No Data Found":
+            continue
+        (
+            table_rows,
+            raw_table_row_count,
+            table_shape_valid,
+        ) = _parse_html_table_rows_with_contract(html_text or "")
+        headers_found = set(re.findall(r"<th[^>]*>([^<]+)</th>", html_text or ""))
+        if not table_shape_valid or raw_table_row_count != len(table_rows):
+            return (
+                _source_failure(
+                    "NASDAQ_TRADER_HALT_HISTORY",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    (
+                        f"{reason_code}:halt_table_row_shape_invalid:"
+                        f"raw={raw_table_row_count}:parsed={len(table_rows)}"
+                    ),
+                    retrieved_at=retrieved_at,
+                    responseSha256=response_hashes[-1],
+                ),
+                previous_coverage.get("events", {}).get("suspensions", []),
+            )
+        if (
+            not table_rows
+            or not expected_headers.issubset(headers_found)
+            or any(
+                str(row.get("Reason Code") or "").strip().upper() != reason_code
+                for row in table_rows
+            )
+        ):
+            return (
+                _source_failure(
+                    "NASDAQ_TRADER_HALT_HISTORY",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"{reason_code}:halt_table_contract_invalid",
+                    retrieved_at=retrieved_at,
+                    responseSha256=response_hashes[-1],
+                ),
+                previous_coverage.get("events", {}).get("suspensions", []),
+            )
+        raw_halt_rows += raw_table_row_count
+        parsed_halt_rows = _parse_nasdaq_halt_rows(html_text or "")
+        if len(parsed_halt_rows) != len(table_rows):
+            return (
+                _source_failure(
+                    "NASDAQ_TRADER_HALT_HISTORY",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    (
+                        f"{reason_code}:halt_table_parse_loss:"
+                        f"raw={len(table_rows)}:parsed={len(parsed_halt_rows)}"
+                    ),
+                    retrieved_at=retrieved_at,
+                    responseSha256=response_hashes[-1],
+                ),
+                previous_coverage.get("events", {}).get("suspensions", []),
+            )
+        historical_rows.extend(parsed_halt_rows)
+    previous_historical_rows = []
+    for row in previous_coverage.get("events", {}).get("suspensions", []):
+        if not isinstance(row, dict):
+            continue
+        effective = _parse_date(row.get("eventEffectiveAt"))
+        if (
+            effective
+            and coverage_start <= effective < history_coverage_start
+        ):
+            previous_historical_rows.append(
+                {
+                    **row,
+                    "currentFeedObserved": False,
+                    "preservationStatus": (
+                        "PRESERVED_POSITIVE_EVENT_OUTSIDE_CURRENT_QUERY_WINDOW"
+                    ),
+                }
+            )
+    merged_rows = _merge_external_events(
+        previous_historical_rows,
+        _events_within_coverage(
+            historical_rows,
+            history_coverage_start,
+            coverage_end,
+            retain_current_active=True,
+            source_as_of=current_feed_source_as_of,
+        ),
+        ("symbol", "eventEffectiveAt", "reasonCode"),
+    )
+    merged_rows = _merge_external_events(
+        merged_rows,
+        _events_within_coverage(
+            current_feed_rows,
+            history_coverage_start,
+            coverage_end,
+            retain_current_active=True,
+            source_as_of=current_feed_source_as_of,
+        ),
+        ("symbol", "eventEffectiveAt", "reasonCode"),
+    )
+    response_sha = _canonical_sha256(
+        {
+            "responseHashes": response_hashes,
+            "reasonCodes": sorted(NASDAQ_HISTORICAL_SUSPENSION_CODES),
+            "events": merged_rows,
+        }
+    )
+    return (
+        {
+            "status": "SUCCESS",
+            "source": "NASDAQ_TRADER_HALT_HISTORY_AND_CURRENT_FEED",
+            "sourceAsOf": current_feed_source_as_of,
+            "sourceAsOfBasis": "NASDAQ_RSS_PUBLICATION_TIME",
+            "retrievedAt": retrieved_at,
+            "coverageStart": history_coverage_start.isoformat(),
+            "coverageEnd": coverage_end.isoformat(),
+            "partialResponse": False,
+            "responseSha256": response_sha,
+            "queryScope": (
+                "CURRENT_ALL_CODES_PLUS_LAST_YEAR_REGULATORY_EXTENDED_"
+                "AND_CORPORATE_ACTION_HALT_CODES"
+            ),
+            "requestCount": len(response_hashes) + 1,
+            "currentFeedRows": len(current_feed_rows),
+            "currentFeedPublishedAt": current_feed_source_as_of,
+            "currentFeedAgeHours": current_feed_age_hours,
+            "currentFeedFreshnessMode": current_feed_freshness_mode,
+            "currentFeedMaxAgeHours": HARVESTER_NASDAQ_HALT_RSS_MAX_AGE_HOURS,
+            "currentFeedRthMaxAgeMinutes": (
+                HARVESTER_NASDAQ_HALT_RSS_RTH_MAX_AGE_MINUTES
+            ),
+            "rawHaltRows": raw_halt_rows,
+            "eventCount": len(merged_rows),
+            "preservedHistoricalEventRows": len(previous_historical_rows),
+            "includedHistoricalReasonCodes": sorted(
+                NASDAQ_HISTORICAL_SUSPENSION_CODES
+            ),
+            "sourceCoverageLimit": "NASDAQ_HALT_SEARCH_LAST_YEAR",
+            "requestedCoverageStart": coverage_start.isoformat(),
+        },
+        merged_rows,
+    )
+
+
+def fetch_external_corporate_action_coverage(
+    active_symbols,
+    *,
+    previous_coverage=None,
+    now_utc=None,
+    session=None,
+) -> dict:
+    generated_at = now_utc or datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    coverage_end = _parse_iso_datetime(generated_at).date()
+    coverage_start = _coverage_start_date(coverage_end)
+    previous_coverage = previous_coverage if isinstance(previous_coverage, dict) else {}
+    active = sorted({_normalize_event_symbol(symbol) for symbol in active_symbols if symbol})
+    scope_hash = _canonical_sha256(active)
+    if not HARVESTER_EXTERNAL_CORPORATE_ACTION_ENABLED:
+        return {
+            "schemaVersion": EXTERNAL_CORPORATE_ACTION_SCHEMA_VERSION,
+            "generatedAt": generated_at,
+            "overall": "disabled",
+            "sources": {},
+            "events": {"symbolChanges": [], "delistings": [], "suspensions": []},
+            "requestScopeSymbolsSha256": scope_hash,
+        }
+    client = session or requests.Session()
+    symbol_source = _source_failure(
+        "FMP_OR_FINNHUB_SYMBOL_CHANGE",
+        "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+        "entitlement_and_verified_response_fixture_required",
+        retrieved_at=generated_at,
+    )
+    symbol_events = _events_within_coverage(
+        previous_coverage.get("events", {}).get("symbolChanges", []),
+        coverage_start,
+        coverage_end,
+    )
+    delisting_source, delisting_events = _fetch_fmp_delisting_coverage(
+        client,
+        api_key=FMP_API_KEY,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+        retrieved_at=generated_at,
+        previous_coverage=previous_coverage,
+    )
+    suspension_source, suspension_events = _fetch_nasdaq_suspension_coverage(
+        client,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
+        retrieved_at=generated_at,
+        previous_coverage=previous_coverage,
+    )
+    delisting_events = _events_within_coverage(
+        delisting_events,
+        coverage_start,
+        coverage_end,
+    )
+    suspension_events = _events_within_coverage(
+        suspension_events,
+        coverage_start,
+        coverage_end,
+        retain_current_active=True,
+        source_as_of=generated_at,
+    )
+    for source in (symbol_source, delisting_source, suspension_source):
+        if isinstance(source, dict):
+            source["requestScopeSymbolsSha256"] = scope_hash
+    sources = {
+        "symbolChange": symbol_source,
+        "delisting": delisting_source,
+        "suspension": suspension_source,
+    }
+    source_statuses = {key: value.get("status") for key, value in sources.items()}
+    overall = (
+        "pass"
+        if all(status == "SUCCESS" for status in source_statuses.values())
+        else "blocked_external_source_contract"
+    )
+    return {
+        "schemaVersion": EXTERNAL_CORPORATE_ACTION_SCHEMA_VERSION,
+        "generatedAt": generated_at,
+        "overall": overall,
+        "coverageStart": coverage_start.isoformat(),
+        "coverageEnd": coverage_end.isoformat(),
+        "requestScopeSymbolsSha256": scope_hash,
+        "activeSymbolCount": len(active),
+        "sources": sources,
+        "events": {
+            "symbolChanges": symbol_events,
+            "delistings": delisting_events,
+            "suspensions": suspension_events,
+        },
+        "summary": {
+            "sourceStatuses": source_statuses,
+            "symbolChangeEventRows": len(symbol_events),
+            "delistingEventRows": len(delisting_events),
+            "suspensionEventRows": len(suspension_events),
+        },
+    }
+
+
+def refresh_ticker_mapping_from_authoritative_sources(
+    existing_map,
+    today_str,
+    *,
+    previous_mapping_audit=None,
+):
     existing_map = existing_map if isinstance(existing_map, dict) else {}
     if not HARVESTER_TICKER_MAPPING_REFRESH_ENABLED:
         return existing_map, {
@@ -970,6 +2230,36 @@ def refresh_ticker_mapping_from_authoritative_sources(existing_map, today_str):
                 row[evidence_key] = dict(previous[evidence_key])
         refreshed_map[symbol] = row
 
+    previous_external = _previous_external_coverage(previous_mapping_audit)
+    try:
+        external_coverage = fetch_external_corporate_action_coverage(
+            refreshed_symbols,
+            previous_coverage=previous_external,
+            now_utc=now_utc,
+        )
+    except Exception as exc:
+        external_coverage = {
+            "schemaVersion": EXTERNAL_CORPORATE_ACTION_SCHEMA_VERSION,
+            "generatedAt": now_utc,
+            "overall": "unverified_source_response",
+            "sources": {
+                "symbolChange": _source_failure(
+                    "FMP_OR_FINNHUB_SYMBOL_CHANGE",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"{type(exc).__name__}:{_short_failure_text(exc, 180)}",
+                    retrieved_at=now_utc,
+                ),
+                "delisting": {},
+                "suspension": {},
+            },
+            "events": previous_external.get("events")
+            or {"symbolChanges": [], "delistings": [], "suspensions": []},
+        }
+    refreshed_map, external_application_summary = apply_external_corporate_action_coverage(
+        refreshed_map,
+        external_coverage,
+    )
+    external_sources = external_coverage.get("sources") or {}
     refreshed_map["_meta"] = {
         "schemaVersion": 2,
         "generatedAt": now_utc,
@@ -984,6 +2274,19 @@ def refresh_ticker_mapping_from_authoritative_sources(existing_map, today_str):
         "removedCount": len(removed_symbols),
         "refreshPolicy": "authoritative_active_listing_replace",
         "includeNonCommon": HARVESTER_TICKER_MAPPING_INCLUDE_NON_COMMON,
+        "externalCorporateActionCoverage": {
+            "schemaVersion": external_coverage.get("schemaVersion"),
+            "generatedAt": external_coverage.get("generatedAt"),
+            "overall": external_coverage.get("overall"),
+            "coverageStart": external_coverage.get("coverageStart"),
+            "coverageEnd": external_coverage.get("coverageEnd"),
+            "requestScopeSymbolsSha256": external_coverage.get("requestScopeSymbolsSha256"),
+            "sourceStatuses": {
+                key: (value or {}).get("status")
+                for key, value in external_sources.items()
+            },
+            "applicationSummary": external_application_summary,
+        },
     }
 
     audit = {
@@ -1005,6 +2308,8 @@ def refresh_ticker_mapping_from_authoritative_sources(existing_map, today_str):
         "removedSymbols": removed_symbols[:HARVESTER_MAPPING_AUDIT_SAMPLE_LIMIT],
         "removedPolicy": "removed_from_Ticker_ID_Mapping_Final_when_absent_from_authoritative_active_listing_sources",
         "newListingPolicy": "added_to_Ticker_ID_Mapping_Final_when_present_in_authoritative_active_listing_sources",
+        "externalCorporateActionCoverage": external_coverage,
+        "externalCorporateActionApplication": external_application_summary,
     }
     return refreshed_map, audit
 
@@ -1804,11 +3109,71 @@ def _event_rows(frame, column, value_key):
     return rows
 
 
-def _verified_evidence_status(evidence, allowed_statuses, fallback):
+def _external_evidence_contract_valid(evidence, expected_symbol=None):
+    if not isinstance(evidence, dict):
+        return False
+    requested_symbol = str(evidence.get("requestedSymbol") or "").strip().upper()
+    matched_symbol = str(evidence.get("matchedSymbol") or "").strip().upper()
+    match_status = str(evidence.get("symbolMatchStatus") or "").strip().upper()
+    match_method = str(evidence.get("symbolMatchMethod") or "").strip().upper()
+    expected = str(expected_symbol or requested_symbol).strip().upper()
+    response_sha = str(evidence.get("responseSha256") or "").strip().lower()
+    request_scope_sha = str(
+        evidence.get("requestScopeSymbolsSha256") or ""
+    ).strip().lower()
+    source_as_of = _parse_iso_datetime(evidence.get("sourceAsOf"))
+    retrieved_at = _parse_iso_datetime(evidence.get("retrievedAt"))
+    coverage_start = _parse_iso_datetime(evidence.get("coverageStart"))
+    coverage_end = _parse_iso_datetime(evidence.get("coverageEnd"), end_of_day=True)
+    return bool(
+        str(evidence.get("requestStatus") or "").strip().upper() == "SUCCESS"
+        and str(evidence.get("source") or "").strip()
+        and expected
+        and requested_symbol == expected
+        and (
+            (
+                match_status == "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE"
+                and not matched_symbol
+            )
+            or (
+                match_status
+                in {
+                    "EXACT_EVENT_MATCH",
+                    "EXACT_HISTORICAL_EVENT_MATCH_CURRENTLY_RESUMED",
+                    "EXACT_HISTORICAL_EVENT_MATCH_NOT_IN_CURRENT_FEED",
+                }
+                and matched_symbol == expected
+            )
+        )
+        and match_method == "DETERMINISTIC_EXACT_NORMALIZED_SYMBOL_LOOKUP"
+        and evidence.get("sourceScopeComplete") is True
+        and str(evidence.get("queryScope") or "").strip()
+        and re.fullmatch(r"[0-9a-f]{64}", request_scope_sha)
+        and source_as_of
+        and retrieved_at
+        and coverage_start
+        and coverage_end
+        and coverage_start <= coverage_end
+        and source_as_of <= retrieved_at
+        and evidence.get("partialResponse") is False
+        and re.fullmatch(r"[0-9a-f]{64}", response_sha)
+    )
+
+
+def _verified_evidence_status(evidence, allowed_statuses, fallback, expected_symbol=None):
     status = str((evidence or {}).get("status") or "").strip().upper()
     source = str((evidence or {}).get("source") or "").strip()
     source_as_of = str((evidence or {}).get("sourceAsOf") or "").strip()
-    return status if status in allowed_statuses and source and _parse_iso_datetime(source_as_of) else fallback
+    return (
+        status
+        if (
+            status in allowed_statuses
+            and source
+            and _parse_iso_datetime(source_as_of)
+            and _external_evidence_contract_valid(evidence, expected_symbol)
+        )
+        else fallback
+    )
 
 
 def _parse_iso_datetime(value, *, end_of_day=False):
@@ -1829,18 +3194,47 @@ def _parse_iso_datetime(value, *, end_of_day=False):
         return None
 
 
-def _external_evidence_time_valid(evidence, source_as_of, retrieved_at):
+def _external_evidence_time_valid(
+    evidence,
+    source_as_of,
+    retrieved_at,
+    *,
+    expected_symbol=None,
+    lookback_start=None,
+):
     if not isinstance(evidence, dict):
         return False
-    evidence_as_of = _parse_iso_datetime(evidence.get("sourceAsOf"), end_of_day=True)
+    evidence_as_of = _parse_iso_datetime(evidence.get("sourceAsOf"))
+    evidence_as_of_end = _parse_iso_datetime(
+        evidence.get("sourceAsOf"),
+        end_of_day=True,
+    )
+    evidence_retrieved = _parse_iso_datetime(evidence.get("retrievedAt"))
+    coverage_start = _parse_iso_datetime(evidence.get("coverageStart"))
+    coverage_end = _parse_iso_datetime(evidence.get("coverageEnd"), end_of_day=True)
     history_as_of = _parse_iso_datetime(source_as_of)
+    history_start = _parse_iso_datetime(lookback_start)
     retrieval = _parse_iso_datetime(retrieved_at)
-    if not evidence_as_of or not history_as_of or not retrieval:
+    if not all(
+        (
+            evidence_as_of,
+            evidence_as_of_end,
+            evidence_retrieved,
+            coverage_start,
+            coverage_end,
+            history_as_of,
+            history_start,
+            retrieval,
+        )
+    ):
         return False
     event_effective = _parse_iso_datetime(evidence.get("eventEffectiveAt") or evidence.get("effectiveAt"))
     return bool(
-        history_as_of <= evidence_as_of <= retrieval
-        and (event_effective is None or event_effective <= evidence_as_of)
+        _external_evidence_contract_valid(evidence, expected_symbol)
+        and coverage_start <= history_start <= history_as_of <= coverage_end
+        and history_as_of <= evidence_as_of_end
+        and evidence_as_of <= evidence_retrieved <= retrieval
+        and (event_effective is None or event_effective <= evidence_as_of_end)
     )
 
 
@@ -1851,12 +3245,42 @@ def _normalized_external_evidence(evidence):
         "status",
         "source",
         "sourceAsOf",
+        "sourceAsOfBasis",
+        "retrievedAt",
+        "requestStatus",
+        "requestedSymbol",
+        "matchedSymbol",
+        "symbolMatchStatus",
+        "symbolMatchMethod",
+        "sourceScopeComplete",
+        "coverageStart",
+        "coverageEnd",
+        "partialResponse",
+        "responseSha256",
+        "queryScope",
+        "requestScopeSymbolsSha256",
         "eventEffectiveAt",
+        "resumedAt",
         "oldSymbol",
         "newSymbol",
         "reason",
+        "preservedStatus",
+        "refreshFailureAt",
     )
     normalized = {key: evidence.get(key) for key in allowed if evidence.get(key) not in (None, "")}
+    if evidence.get("partialResponse") is False:
+        normalized["partialResponse"] = False
+    if evidence.get("sourceScopeComplete") is True:
+        normalized["sourceScopeComplete"] = True
+    if isinstance(evidence.get("events"), list):
+        normalized["events"] = sorted(
+            [dict(row) for row in evidence["events"] if isinstance(row, dict)],
+            key=lambda row: (
+                str(row.get("eventEffectiveAt") or ""),
+                str(row.get("symbol") or ""),
+                str(row.get("reasonCode") or ""),
+            ),
+        )
     if "eventEffectiveAt" not in normalized and evidence.get("effectiveAt") not in (None, ""):
         normalized["eventEffectiveAt"] = evidence.get("effectiveAt")
     return normalized or None
@@ -1866,12 +3290,16 @@ def _corporate_lineage_is_comparable(lineage):
     source_as_of = lineage.get("sourceAsOf")
     retrieved_at = lineage.get("retrievedAt")
     source_time = _parse_iso_datetime(source_as_of)
-    retrieval_time = _parse_iso_datetime(retrieved_at)
+    market_data_retrieval_time = _parse_iso_datetime(retrieved_at)
+    evaluation_time = _parse_iso_datetime(
+        lineage.get("lineageEvaluatedAt") or retrieved_at
+    )
     return bool(
         lineage.get("vendor")
         and source_time
-        and retrieval_time
-        and source_time <= retrieval_time
+        and market_data_retrieval_time
+        and evaluation_time
+        and source_time <= market_data_retrieval_time <= evaluation_time
         and lineage.get("adjustmentType")
         and lineage.get("sourceFreshnessStatus") == "FRESH"
         and lineage.get("historyCoverageStatus") == "VERIFIED_OBSERVED_HISTORY"
@@ -1879,11 +3307,17 @@ def _corporate_lineage_is_comparable(lineage):
         and lineage.get("dividendAdjustmentStatus") == "VERIFIED_YFINANCE_AUTO_ADJUSTED"
         and lineage.get("corporateActionStatus")
         in {"VERIFIED_SPLIT_DIVIDEND_EVENTS_IN_WINDOW", "VERIFIED_NO_SPLIT_OR_DIVIDEND_EVENT_IN_WINDOW"}
-        and lineage.get("symbolChangeStatus") == "VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE"
+        and lineage.get("symbolChangeStatus") in VERIFIED_SYMBOL_CHANGE_STATUSES
         and lineage.get("delistingStatus") == "VERIFIED_NOT_DELISTED_AS_OF_SOURCE"
         and lineage.get("suspensionStatus") == "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE"
         and all(
-            _external_evidence_time_valid(lineage.get(key), source_as_of, retrieved_at)
+            _external_evidence_time_valid(
+                lineage.get(key),
+                source_as_of,
+                lineage.get("lineageEvaluatedAt") or retrieved_at,
+                expected_symbol=lineage.get("symbol"),
+                lookback_start=lineage.get("lookbackStart"),
+            )
             for key in ("symbolChangeEvidence", "delistingEvidence", "suspensionEvidence")
         )
     )
@@ -2016,16 +3450,19 @@ def build_corporate_action_lineage(
         listing_evidence.get("symbolChangeEvidence"),
         VERIFIED_SYMBOL_CHANGE_STATUSES,
         "UNVERIFIED_HISTORICAL_SYMBOL_CHANGE_SOURCE_MISSING",
+        record_symbol,
     )
     delisting_status = _verified_evidence_status(
         listing_evidence.get("delistingEvidence"),
         VERIFIED_DELISTING_STATUSES,
         "UNVERIFIED_DELISTING_EVENT_SOURCE_MISSING",
+        record_symbol,
     )
     suspension_status = _verified_evidence_status(
         listing_evidence.get("suspensionEvidence"),
         VERIFIED_SUSPENSION_STATUSES,
         "UNVERIFIED_SUSPENSION_EVENT_SOURCE_MISSING",
+        record_symbol,
     )
     source_freshness_status = (
         "FRESH"
@@ -2050,6 +3487,7 @@ def build_corporate_action_lineage(
         "sourceSymbol": str(source_symbol or "").strip().upper(),
         "vendor": "YFINANCE_YAHOO",
         "retrievedAt": retrieved_at,
+        "lineageEvaluatedAt": retrieved_at,
         "sourceAsOf": effective_source_as_of,
         "marketTimezone": "America/New_York",
         "adjustmentType": "YFINANCE_AUTO_ADJUSTED_OHLC",
@@ -2097,12 +3535,83 @@ def build_corporate_action_lineage(
     return lineage
 
 
+def refresh_corporate_action_lineage_evidence(
+    existing_lineage: dict,
+    listing_evidence: dict,
+) -> dict:
+    lineage = dict(existing_lineage)
+    symbol = str(lineage.get("symbol") or "").strip().upper()
+    evidence_specs = (
+        (
+            "symbolChangeEvidence",
+            "symbolChangeStatus",
+            VERIFIED_SYMBOL_CHANGE_STATUSES,
+            "UNVERIFIED_HISTORICAL_SYMBOL_CHANGE_SOURCE_MISSING",
+        ),
+        (
+            "delistingEvidence",
+            "delistingStatus",
+            VERIFIED_DELISTING_STATUSES,
+            "UNVERIFIED_DELISTING_EVENT_SOURCE_MISSING",
+        ),
+        (
+            "suspensionEvidence",
+            "suspensionStatus",
+            VERIFIED_SUSPENSION_STATUSES,
+            "UNVERIFIED_SUSPENSION_EVENT_SOURCE_MISSING",
+        ),
+    )
+    evaluation_times = [
+        value
+        for value in (
+            lineage.get("lineageEvaluatedAt"),
+            lineage.get("retrievedAt"),
+        )
+        if _parse_iso_datetime(value)
+    ]
+    for evidence_key, status_key, allowed_statuses, fallback in evidence_specs:
+        evidence = listing_evidence.get(evidence_key)
+        lineage[evidence_key] = _normalized_external_evidence(evidence)
+        lineage[status_key] = _verified_evidence_status(
+            evidence,
+            allowed_statuses,
+            fallback,
+            symbol,
+        )
+        if isinstance(evidence, dict) and _parse_iso_datetime(evidence.get("retrievedAt")):
+            evaluation_times.append(evidence["retrievedAt"])
+    if evaluation_times:
+        latest = max(
+            evaluation_times,
+            key=lambda value: _parse_iso_datetime(value),
+        )
+        lineage["lineageEvaluatedAt"] = latest
+    lineage["listingEvidence"] = {
+        "listingSource": listing_evidence.get("listingSource"),
+        "sourceAsOf": (
+            listing_evidence.get("listingSourceAsOf")
+            or listing_evidence.get("lastMappedAt")
+        ),
+        "listingStatus": listing_evidence.get("listingStatus"),
+    }
+    if _corporate_lineage_is_comparable(lineage):
+        lineage["survivorshipBiasStatus"] = "VERIFIED_CORPORATE_ACTION_LINEAGE"
+        lineage["lineageVerifiedForComparison"] = True
+    else:
+        lineage["survivorshipBiasStatus"] = (
+            "UNVERIFIED_INCOMPLETE_CORPORATE_ACTION_COVERAGE"
+        )
+        lineage["lineageVerifiedForComparison"] = False
+    return lineage
+
+
 def build_corporate_action_runtime_audit(
     rows: list[dict],
     *,
     trigger_file: str | None,
     expected_symbols: list[str] | None = None,
     generated_at: str | None = None,
+    external_source_coverage: dict | None = None,
 ) -> dict:
     generated_at = generated_at or datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     lineage_rows = [row for row in rows if row.get("lineageStatus") == "PRESENT"]
@@ -2114,10 +3623,47 @@ def build_corporate_action_runtime_audit(
     row_counts = Counter(row_symbols)
     missing_symbols = [symbol for symbol in expected if row_counts.get(symbol, 0) == 0]
     duplicate_symbols = sorted(symbol for symbol, count in row_counts.items() if count > 1)
-    contract_status = "pass" if not missing_symbols and not duplicate_symbols else "warn_coverage_mismatch"
-    comparison_coverage_status = (
-        "verified_rows_available" if verified_rows else "unverified_external_event_source_coverage"
+    structural_contract_ready = not missing_symbols and not duplicate_symbols
+    external_source_coverage = (
+        external_source_coverage if isinstance(external_source_coverage, dict) else {}
     )
+    source_coverage_overall = external_source_coverage.get("overall")
+    compact_external_coverage = {
+        key: external_source_coverage.get(key)
+        for key in (
+            "schemaVersion",
+            "generatedAt",
+            "overall",
+            "coverageStart",
+            "coverageEnd",
+            "requestScopeSymbolsSha256",
+            "activeSymbolCount",
+            "sources",
+            "summary",
+        )
+        if external_source_coverage.get(key) is not None
+    }
+    if (
+        structural_contract_ready
+        and lineage_rows
+        and not unverified_rows
+        and not rejected_rows
+    ):
+        comparison_coverage_status = "verified_all_rows"
+    elif verified_rows:
+        comparison_coverage_status = "verified_rows_available_partial"
+    elif source_coverage_overall == "blocked_external_source_contract":
+        comparison_coverage_status = "blocked_external_source_contract"
+    else:
+        comparison_coverage_status = "unverified_external_event_source_coverage"
+    if not structural_contract_ready:
+        contract_status = "warn_coverage_mismatch"
+    elif rejected_rows:
+        contract_status = "warn_lineage_rejected"
+    elif unverified_rows:
+        contract_status = "warn_comparison_lineage_unverified"
+    else:
+        contract_status = "pass"
     retrieved = sorted(str(row.get("retrievedAt")) for row in lineage_rows if row.get("retrievedAt"))
     source_as_of = sorted(str(row.get("sourceAsOf")) for row in lineage_rows if row.get("sourceAsOf"))
     return {
@@ -2133,6 +3679,7 @@ def build_corporate_action_runtime_audit(
             "rejectedRows": len(rejected_rows),
             "missingRows": len(missing_symbols),
             "duplicateRows": len(duplicate_symbols),
+            "structuralContractReady": structural_contract_ready,
             "lineageCoveragePct": (
                 round((len(set(row_symbols).intersection(expected)) / len(expected)) * 100, 2)
                 if expected
@@ -2146,6 +3693,7 @@ def build_corporate_action_runtime_audit(
             "earliestSourceAsOf": source_as_of[0] if source_as_of else None,
             "latestSourceAsOf": source_as_of[-1] if source_as_of else None,
         },
+        "externalSourceCoverage": compact_external_coverage,
         "missingSymbols": missing_symbols,
         "duplicateSymbols": duplicate_symbols,
         "rows": sorted(rows, key=lambda row: str(row.get("symbol") or "")),
@@ -2218,21 +3766,34 @@ def sync_ohlcv_incremental(
 
     # [최적화] 최신 거래일까지 이미 수집된 종목은 재호출 스킵
     if existing_data and is_ohlcv_fresh(existing_data) and existing_lineage:
-        if removed_invalid_existing > 0:
+        refreshed_lineage = existing_lineage
+        if isinstance(listing_evidence, dict):
+            refreshed_lineage = refresh_corporate_action_lineage_evidence(
+                existing_lineage,
+                listing_evidence,
+            )
+        lineage_changed = (
+            _canonical_sha256(refreshed_lineage)
+            != _canonical_sha256(existing_lineage)
+        )
+        if removed_invalid_existing > 0 or lineage_changed:
             upload_json(
                 file_name,
                 {
                     "schemaVersion": "ohlcv-lineage-v1",
-                    "generatedAt": existing_lineage.get("retrievedAt"),
+                    "generatedAt": (
+                        refreshed_lineage.get("lineageEvaluatedAt")
+                        or refreshed_lineage.get("retrievedAt")
+                    ),
                     "symbol": record_symbol,
                     "sourceSymbol": source_symbol,
                     "data": existing_data,
-                    "lineage": existing_lineage,
+                    "lineage": refreshed_lineage,
                 },
                 ohlcv_dir_id,
             )
         if isinstance(lineage_sink, list):
-            lineage_sink.append(existing_lineage)
+            lineage_sink.append(refreshed_lineage)
         return "SKIPPED"
 
     try:
@@ -3005,6 +4566,7 @@ def run_harvester():
     dispatch_earnings_event_source = "unavailable"
     dispatch_corporate_action_ready = False
     dispatch_corporate_action_summary = {}
+    dispatch_corporate_action_comparison_status = "unverified_external_event_source_coverage"
     daily_group_label = "N/A"
     daily_batch_mode = DAILY_BATCH_MODE or "auto"
     daily_target_count = 0
@@ -3021,11 +4583,18 @@ def run_harvester():
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
             dispatch_trigger_file = get_dispatch_trigger_file()
             ticker_mapping = {}
+            external_source_coverage = {}
             try:
                 ticker_mapping_id = find_file_id("Ticker_ID_Mapping_Final.json", sys_id)
                 candidate_mapping = download_json(ticker_mapping_id)
                 if isinstance(candidate_mapping, dict):
                     ticker_mapping = candidate_mapping
+                mapping_audit_id = find_file_id(TICKER_MAPPING_REFRESH_AUDIT_FILENAME, sys_id)
+                candidate_audit = download_json(mapping_audit_id)
+                if isinstance(candidate_audit, dict):
+                    candidate_coverage = candidate_audit.get("externalCorporateActionCoverage")
+                    if isinstance(candidate_coverage, dict):
+                        external_source_coverage = candidate_coverage
             except Exception as e:
                 print(f"⚠️ Corporate-action listing lineage unavailable: {type(e).__name__}: {e}", flush=True)
             
@@ -3099,6 +4668,7 @@ def run_harvester():
                                 corporate_action_lineage_rows,
                                 trigger_file=current_trigger_file,
                                 expected_symbols=s3_tickers,
+                                external_source_coverage=external_source_coverage,
                             )
                             write_json_report(
                                 HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH,
@@ -3110,8 +4680,18 @@ def run_harvester():
                                 corporate_action_audit,
                                 sys_id,
                             )
-                            dispatch_corporate_action_ready = corporate_action_audit.get("overall") == "pass"
                             dispatch_corporate_action_summary = corporate_action_audit.get("summary", {})
+                            dispatch_corporate_action_ready = bool(
+                                dispatch_corporate_action_summary.get(
+                                    "structuralContractReady"
+                                )
+                            )
+                            dispatch_corporate_action_comparison_status = (
+                                dispatch_corporate_action_summary.get(
+                                    "comparisonCoverageStatus"
+                                )
+                                or "unverified_external_event_source_coverage"
+                            )
                         except Exception as e:
                             print(f"⚠️ Corporate-action lineage audit 생성 실패: {type(e).__name__}: {e}", flush=True)
 
@@ -3194,11 +4774,19 @@ def run_harvester():
                                 "trigger_file": current_trigger_file,
                                 "timestamp": today_str,
                                 "corporateActionLineageStatus": (
-                                    "CONTRACT_READY"
+                                    (
+                                        "CONTRACT_READY_OOS_VERIFIED"
+                                        if dispatch_corporate_action_comparison_status
+                                        == "verified_all_rows"
+                                        else "CONTRACT_READY_OOS_BLOCKED"
+                                    )
                                     if dispatch_corporate_action_ready
                                     else "COVERAGE_MISMATCH"
                                 ),
                                 "corporateActionLineageAudit": CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME,
+                                "corporateActionOosComparisonStatus": (
+                                    dispatch_corporate_action_comparison_status
+                                ),
                             },
                             sys_id,
                         )
@@ -3226,8 +4814,19 @@ def run_harvester():
                 "earningsEventCoverageAuditPath": HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH,
                 "corporateActionLineageReady": dispatch_corporate_action_ready,
                 "corporateActionLineageSummary": dispatch_corporate_action_summary,
+                "corporateActionOosComparisonStatus": (
+                    dispatch_corporate_action_comparison_status
+                ),
                 "corporateActionLineageAudit": CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME,
                 "corporateActionLineageAuditPath": HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH,
+                "corporateActionExternalCoverageOverall": external_source_coverage.get("overall"),
+                "corporateActionExternalSourceStatuses": (
+                    (external_source_coverage.get("summary") or {}).get("sourceStatuses")
+                    or {
+                        key: (value or {}).get("status")
+                        for key, value in (external_source_coverage.get("sources") or {}).items()
+                    }
+                ),
                 "benchmarkSuccess": dispatch_benchmark_success,
                 "benchmarkSkipped": dispatch_benchmark_skipped,
                 "benchmarkFailed": dispatch_benchmark_fail,
@@ -3263,7 +4862,28 @@ def run_harvester():
         if not isinstance(full_map, dict):
             full_map = {}
 
-        full_map, mapping_refresh_audit = refresh_ticker_mapping_from_authoritative_sources(full_map, today_str)
+        previous_mapping_refresh_audit = {}
+        try:
+            previous_mapping_audit_id = find_file_id(
+                TICKER_MAPPING_REFRESH_AUDIT_FILENAME,
+                sys_id,
+            )
+            previous_mapping_refresh_audit = (
+                download_json(previous_mapping_audit_id)
+                if previous_mapping_audit_id
+                else {}
+            )
+        except Exception as exc:
+            print(
+                "⚠️ Previous external corporate-action coverage unavailable: "
+                f"{type(exc).__name__}: {_short_failure_text(exc, 180)}",
+                flush=True,
+            )
+        full_map, mapping_refresh_audit = refresh_ticker_mapping_from_authoritative_sources(
+            full_map,
+            today_str,
+            previous_mapping_audit=previous_mapping_refresh_audit,
+        )
         write_json_report(
             HARVESTER_TICKER_MAPPING_REFRESH_AUDIT_PATH,
             mapping_refresh_audit,
@@ -3926,6 +5546,18 @@ def run_harvester():
         summary_payload["tickerMappingRefreshStatus"] = mapping_refresh_audit.get("status")
         summary_payload["tickerMappingAddedCount"] = mapping_refresh_audit.get("addedCount", 0)
         summary_payload["tickerMappingRemovedCount"] = mapping_refresh_audit.get("removedCount", 0)
+        external_coverage = mapping_refresh_audit.get("externalCorporateActionCoverage") or {}
+        summary_payload["corporateActionExternalCoverageOverall"] = external_coverage.get("overall")
+        summary_payload["corporateActionExternalSourceStatuses"] = (
+            (external_coverage.get("summary") or {}).get("sourceStatuses")
+            or {
+                key: (value or {}).get("status")
+                for key, value in (external_coverage.get("sources") or {}).items()
+            }
+        )
+        summary_payload["corporateActionExternalApplication"] = (
+            mapping_refresh_audit.get("externalCorporateActionApplication") or {}
+        )
         summary_payload["mappingFreshnessAuditPath"] = HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH
         summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
         summary_payload["skipCategoryCounts"] = failure_report.get("skipSummary", {}).get("categoryCounts", {})

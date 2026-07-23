@@ -31,18 +31,72 @@
     "symbolChangeEvidence": {
       "status": "VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE",
       "source": "FIXTURE_AUTHORITATIVE_SOURCE",
-      "sourceAsOf": "2026-07-21T11:00:00Z"
+      "sourceAsOf": "2026-07-21T11:00:00Z",
+      "retrievedAt": "2026-07-21T11:00:00Z",
+      "requestStatus": "SUCCESS",
+      "requestedSymbol": "SYNTH",
+      "matchedSymbol": null,
+      "symbolMatchStatus": "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE",
+      "symbolMatchMethod": "DETERMINISTIC_EXACT_NORMALIZED_SYMBOL_LOOKUP",
+      "sourceScopeComplete": true,
+      "queryScope": "FIXTURE_COMPLETE_SOURCE_WINDOW",
+      "requestScopeSymbolsSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "coverageStart": "2021-07-20",
+      "coverageEnd": "2026-07-21",
+      "partialResponse": false,
+      "responseSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
     "delistingEvidence": {
       "status": "VERIFIED_NOT_DELISTED_AS_OF_SOURCE",
       "source": "FIXTURE_AUTHORITATIVE_SOURCE",
-      "sourceAsOf": "2026-07-21T11:00:00Z"
+      "sourceAsOf": "2026-07-21T11:00:00Z",
+      "retrievedAt": "2026-07-21T11:00:00Z",
+      "requestStatus": "SUCCESS",
+      "requestedSymbol": "SYNTH",
+      "matchedSymbol": null,
+      "symbolMatchStatus": "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE",
+      "symbolMatchMethod": "DETERMINISTIC_EXACT_NORMALIZED_SYMBOL_LOOKUP",
+      "sourceScopeComplete": true,
+      "queryScope": "FIXTURE_COMPLETE_SOURCE_WINDOW",
+      "requestScopeSymbolsSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "coverageStart": "2021-07-20",
+      "coverageEnd": "2026-07-21",
+      "partialResponse": false,
+      "responseSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "suspensionEvidence": {
       "status": "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE",
       "source": "FIXTURE_AUTHORITATIVE_SOURCE",
-      "sourceAsOf": "2026-07-21T11:00:00Z"
+      "sourceAsOf": "2026-07-21T11:00:00Z",
+      "retrievedAt": "2026-07-21T11:00:00Z",
+      "requestStatus": "SUCCESS",
+      "requestedSymbol": "SYNTH",
+      "matchedSymbol": null,
+      "symbolMatchStatus": "NO_EXACT_EVENT_MATCH_IN_COMPLETE_RESPONSE",
+      "symbolMatchMethod": "DETERMINISTIC_EXACT_NORMALIZED_SYMBOL_LOOKUP",
+      "sourceScopeComplete": true,
+      "queryScope": "FIXTURE_COMPLETE_SOURCE_WINDOW",
+      "requestScopeSymbolsSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "coverageStart": "2021-07-20",
+      "coverageEnd": "2026-07-21",
+      "partialResponse": false,
+      "responseSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     }
+  },
+  "externalSourceFixtures": {
+    "coverageStart": "2021-07-20",
+    "coverageEnd": "2026-07-21",
+    "fmpDelistedRows": [
+      {
+        "symbol": "OLDX",
+        "companyName": "Old Example Corp",
+        "exchange": "NASDAQ",
+        "ipoDate": "2018-01-02",
+        "delistedDate": "2026-06-30"
+      }
+    ],
+    "nasdaqHaltHtml": "<div class=\"genTable\"><table><tr><th>Halt Date</th><th>Halt Time</th><th>Issue Symbol</th><th>Issue Name</th><th>Market</th><th>Reason Code</th><th>Pause Threshold Price</th><th>Resumption Date</th><th>Resumption Quote Time</th><th>Resumption Trade Time</th></tr><tr><td>07/17/2026</td><td>09:31:00</td><td>HALT</td><td>Halt Example Corp</td><td>NASDAQ</td><td>H10</td><td></td><td>07/18/2026</td><td>09:30:00</td><td>09:35:00</td></tr><tr><td>07/20/2026</td><td>10:00:00</td><td>OPEN</td><td>Open Halt Corp</td><td>NASDAQ</td><td>H11</td><td></td><td></td><td></td><td></td></tr><tr><td>07/20/2026</td><td>11:00:00</td><td>VOL</td><td>Volatility Corp</td><td>NASDAQ</td><td>LUDP</td><td></td><td>07/20/2026</td><td>11:05:00</td><td>11:10:00</td></tr></table></div>",
+    "nasdaqCurrentHaltRss": "<?xml version=\"1.0\" encoding=\"utf-8\"?><rss version=\"2.0\" xmlns:ndaq=\"http://www.nasdaqtrader.com/\"><channel><title>NASDAQTrader.com</title><pubDate>Tue, 21 Jul 2026 11:00:00 GMT</pubDate><ndaq:numItems>2</ndaq:numItems><item><title>OPEN</title><ndaq:HaltDate>07/20/2026</ndaq:HaltDate><ndaq:HaltTime>10:00:00</ndaq:HaltTime><ndaq:IssueSymbol>OPEN</ndaq:IssueSymbol><ndaq:IssueName>Open Halt Corp</ndaq:IssueName><ndaq:Market>NASDAQ</ndaq:Market><ndaq:ReasonCode>H11</ndaq:ReasonCode><ndaq:ResumptionDate></ndaq:ResumptionDate><ndaq:ResumptionTradeTime></ndaq:ResumptionTradeTime></item><item><title>FUTURE</title><ndaq:HaltDate>07/21/2026</ndaq:HaltDate><ndaq:HaltTime>10:00:00</ndaq:HaltTime><ndaq:IssueSymbol>FUTURE</ndaq:IssueSymbol><ndaq:IssueName>Future Resume Corp</ndaq:IssueName><ndaq:Market>NASDAQ</ndaq:Market><ndaq:ReasonCode>M1</ndaq:ReasonCode><ndaq:ResumptionDate>07/21/2026</ndaq:ResumptionDate><ndaq:ResumptionTradeTime>12:00:00</ndaq:ResumptionTradeTime></item></channel></rss>"
   },
   "unverifiedListingEvidence": {
     "listingSource": "FIXTURE_ACTIVE_DIRECTORY_ONLY",

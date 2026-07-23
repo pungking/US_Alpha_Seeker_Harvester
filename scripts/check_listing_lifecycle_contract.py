@@ -32,11 +32,30 @@ def main() -> int:
     assert creation_time == expected["sourceCreationTime"]
 
     original_fetch = harvester_module.fetch_authoritative_listing_rows
+    original_external_fetch = harvester_module.fetch_external_corporate_action_coverage
     try:
         harvester_module.fetch_authoritative_listing_rows = lambda: (
             by_symbol,
             [{"name": "fixture_nasdaqtrader", "status": "ok", "rowCount": len(by_symbol)}],
         )
+        harvester_module.fetch_external_corporate_action_coverage = lambda *_args, **_kwargs: {
+            "schemaVersion": "external-corporate-action-coverage-v1",
+            "generatedAt": "2026-07-13T13:00:00Z",
+            "overall": "blocked_external_source_contract",
+            "sources": {
+                key: {
+                    "status": "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                    "source": f"FIXTURE_{key.upper()}",
+                    "reason": "fixture_no_source",
+                }
+                for key in ("symbolChange", "delisting", "suspension")
+            },
+            "events": {
+                "symbolChanges": [],
+                "delistings": [],
+                "suspensions": [],
+            },
+        }
         refreshed_map, mapping_audit = refresh_ticker_mapping_from_authoritative_sources(
             {
                 "OLDX": {"group": "O", "firstMappedAt": "2025-01-01T00:00:00Z"},
@@ -46,6 +65,7 @@ def main() -> int:
         )
     finally:
         harvester_module.fetch_authoritative_listing_rows = original_fetch
+        harvester_module.fetch_external_corporate_action_coverage = original_external_fetch
     assert mapping_audit["status"] == "refreshed"
     assert mapping_audit["addedSymbols"] == ["NNEW"]
     assert mapping_audit["removedSymbols"] == expected["removedFromPreviousMapping"]
