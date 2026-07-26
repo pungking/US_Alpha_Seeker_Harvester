@@ -22,6 +22,7 @@ from harvester import (  # noqa: E402
     apply_external_corporate_action_coverage,
     build_corporate_action_lineage,
     build_corporate_action_runtime_audit,
+    build_mapping_corporate_action_runtime_audit,
     refresh_corporate_action_lineage_evidence,
 )
 
@@ -321,6 +322,7 @@ def main() -> int:
         "rejectedRows": 1,
         "missingRows": 0,
         "duplicateRows": 0,
+        "emptyScope": False,
         "structuralContractReady": True,
         "lineageCoveragePct": 100.0,
         "comparisonCoverageStatus": "verified_rows_available_partial",
@@ -1140,6 +1142,63 @@ def main() -> int:
     assert refreshed_mapping["SYNTH"]["delistingEvidence"]["status"] == "VERIFIED_NOT_DELISTED_AS_OF_SOURCE"
     assert refreshed_mapping["SYNTH"]["suspensionEvidence"]["status"] == "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE"
 
+    daily_audit = build_mapping_corporate_action_runtime_audit(
+        refreshed_mapping,
+        expected_symbols=["SYNTH"],
+        external_source_coverage=coverage,
+        generated_at=fixture["retrievedAt"],
+    )
+    assert daily_audit["auditScope"] == "MAPPING_SOURCE_ONLY"
+    assert daily_audit["overall"] == "warn_lineage_rejected"
+    assert daily_audit["summary"]["missingRows"] == 0
+    assert daily_audit["summary"]["duplicateRows"] == 0
+    assert daily_audit["sourceTimestamps"]["latestRetrievedAt"]
+    assert daily_audit["rows"][0]["lineageStatus"] == "REJECTED_HISTORY_LINEAGE_NOT_EVALUATED"
+    assert daily_audit["rows"][0]["lineageVerifiedForComparison"] is False
+
+    empty_audit = build_corporate_action_runtime_audit(
+        [],
+        trigger_file=None,
+        expected_symbols=[],
+        generated_at=fixture["retrievedAt"],
+    )
+    assert empty_audit["overall"] == "warn_coverage_mismatch"
+    assert empty_audit["summary"]["emptyScope"] is True
+    assert empty_audit["summary"]["lineageCoveragePct"] == 0.0
+
+    blocked_mapping_audit = build_mapping_corporate_action_runtime_audit(
+        {
+            "SYNTH": {
+                "group": "S",
+                "lastMappedAt": fixture["retrievedAt"],
+                "listingStatus": "ACTIVE",
+            }
+        },
+        expected_symbols=["SYNTH"],
+        external_source_coverage={"overall": "blocked_external_source_contract"},
+        generated_at=fixture["retrievedAt"],
+    )
+    blocked_row = blocked_mapping_audit["rows"][0]
+    assert blocked_row["mappingEvaluatedAt"] == fixture["retrievedAt"]
+    assert blocked_row.get("retrievedAt") is None
+    assert blocked_row.get("sourceAsOf") is None
+
+    rejected_dispatch_audit = build_corporate_action_runtime_audit(
+        [
+            {
+                "symbol": "SYNTH",
+                "lineageStatus": "REJECTED_VENDOR_MISSING",
+                "retrievedAt": fixture["retrievedAt"],
+                "sourceAsOf": fixture["verifiedListingEvidence"]["listingSourceAsOf"],
+            }
+        ],
+        trigger_file="STAGE3_FUNDAMENTAL_FULL_FIXTURE.json",
+        expected_symbols=["SYNTH"],
+        generated_at=fixture["retrievedAt"],
+    )
+    assert rejected_dispatch_audit["sourceTimestamps"]["latestRetrievedAt"] is None
+    assert rejected_dispatch_audit["sourceTimestamps"]["latestSourceAsOf"] is None
+
     renamed = build_corporate_action_lineage(
         frame,
         record_symbol="RENAMED-SYNTH",
@@ -1174,6 +1233,8 @@ def main() -> int:
     assert '"CONTRACT_READY_OOS_VERIFIED"' in harvester_source
     assert '"CONTRACT_READY_OOS_BLOCKED"' in harvester_source
     assert '"COVERAGE_MISMATCH"' in harvester_source
+    assert '"dispatch_completed_without_primary_lineage_audit"' in harvester_source
+    assert '"run_fatal_before_lineage_audit:' in harvester_source
 
     print("[CORPORATE_ACTION_LINEAGE_CONTRACT] PASS")
     return 0
