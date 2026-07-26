@@ -3612,6 +3612,7 @@ def build_corporate_action_runtime_audit(
     expected_symbols: list[str] | None = None,
     generated_at: str | None = None,
     external_source_coverage: dict | None = None,
+    audit_scope: str = "OHLCV_LINEAGE",
 ) -> dict:
     generated_at = generated_at or datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     lineage_rows = [row for row in rows if row.get("lineageStatus") == "PRESENT"]
@@ -3623,7 +3624,10 @@ def build_corporate_action_runtime_audit(
     row_counts = Counter(row_symbols)
     missing_symbols = [symbol for symbol in expected if row_counts.get(symbol, 0) == 0]
     duplicate_symbols = sorted(symbol for symbol, count in row_counts.items() if count > 1)
-    structural_contract_ready = not missing_symbols and not duplicate_symbols
+    scope_has_rows = bool(expected or rows)
+    structural_contract_ready = bool(
+        scope_has_rows and not missing_symbols and not duplicate_symbols
+    )
     external_source_coverage = (
         external_source_coverage if isinstance(external_source_coverage, dict) else {}
     )
@@ -3664,12 +3668,14 @@ def build_corporate_action_runtime_audit(
         contract_status = "warn_comparison_lineage_unverified"
     else:
         contract_status = "pass"
-    retrieved = sorted(str(row.get("retrievedAt")) for row in lineage_rows if row.get("retrievedAt"))
-    source_as_of = sorted(str(row.get("sourceAsOf")) for row in lineage_rows if row.get("sourceAsOf"))
+    timestamp_rows = rows if audit_scope == "MAPPING_SOURCE_ONLY" else lineage_rows
+    retrieved = sorted(str(row.get("retrievedAt")) for row in timestamp_rows if row.get("retrievedAt"))
+    source_as_of = sorted(str(row.get("sourceAsOf")) for row in timestamp_rows if row.get("sourceAsOf"))
     return {
         "schemaVersion": "corporate-action-lineage-runtime-audit-v1",
         "generatedAt": generated_at,
         "triggerFile": trigger_file,
+        "auditScope": audit_scope,
         "overall": contract_status,
         "summary": {
             "targetRows": len(expected) if expected else len(rows),
@@ -3679,11 +3685,12 @@ def build_corporate_action_runtime_audit(
             "rejectedRows": len(rejected_rows),
             "missingRows": len(missing_symbols),
             "duplicateRows": len(duplicate_symbols),
+            "emptyScope": not scope_has_rows,
             "structuralContractReady": structural_contract_ready,
             "lineageCoveragePct": (
                 round((len(set(row_symbols).intersection(expected)) / len(expected)) * 100, 2)
                 if expected
-                else 100.0
+                else 100.0 if rows else 0.0
             ),
             "comparisonCoverageStatus": comparison_coverage_status,
         },
@@ -3698,6 +3705,78 @@ def build_corporate_action_runtime_audit(
         "duplicateSymbols": duplicate_symbols,
         "rows": sorted(rows, key=lambda row: str(row.get("symbol") or "")),
     }
+
+
+def build_mapping_corporate_action_runtime_audit(
+    mapping: dict,
+    *,
+    expected_symbols: list[str],
+    external_source_coverage: dict,
+    generated_at: str | None = None,
+) -> dict:
+    rows = []
+    evidence_keys = (
+        "symbolChangeEvidence",
+        "delistingEvidence",
+        "suspensionEvidence",
+    )
+    for symbol in sorted(
+        {str(value or "").strip().upper() for value in expected_symbols if value}
+    ):
+        listing = mapping.get(symbol)
+        if not isinstance(listing, dict):
+            continue
+        evidence_rows = [
+            listing[key]
+            for key in evidence_keys
+            if isinstance(listing.get(key), dict)
+        ]
+        timestamps = [
+            evidence["retrievedAt"]
+            for evidence in evidence_rows
+            if _parse_iso_datetime(evidence.get("retrievedAt"))
+        ]
+        source_dates = [
+            evidence["sourceAsOf"]
+            for evidence in evidence_rows
+            if _parse_iso_datetime(evidence.get("sourceAsOf"))
+        ]
+        latest_retrieved = (
+            max(timestamps, key=lambda value: _parse_iso_datetime(value))
+            if timestamps
+            else None
+        )
+        latest_source_as_of = (
+            max(source_dates, key=lambda value: _parse_iso_datetime(value))
+            if source_dates
+            else None
+        )
+        row = refresh_corporate_action_lineage_evidence(
+            {
+                "symbol": symbol,
+                "sourceSymbol": symbol,
+                "lineageStatus": "REJECTED_HISTORY_LINEAGE_NOT_EVALUATED",
+                "reason": "daily_schedule_does_not_refresh_ohlcv_lineage",
+                "historyCoverageStatus": "UNVERIFIED_DAILY_MAPPING_SOURCE_ONLY",
+                "survivorshipBiasStatus": "UNVERIFIED_DAILY_MAPPING_SOURCE_ONLY",
+                "lineageVerifiedForComparison": False,
+                "retrievedAt": latest_retrieved,
+                "lineageEvaluatedAt": latest_retrieved,
+                "sourceAsOf": latest_source_as_of,
+                "mappingEvaluatedAt": listing.get("lastMappedAt"),
+            },
+            listing,
+        )
+        rows.append(row)
+
+    return build_corporate_action_runtime_audit(
+        rows,
+        trigger_file=None,
+        expected_symbols=expected_symbols,
+        generated_at=generated_at,
+        external_source_coverage=external_source_coverage,
+        audit_scope="MAPPING_SOURCE_ONLY",
+    )
 
 
 def get_latest_ohlcv_date(records):
@@ -4567,9 +4646,13 @@ def run_harvester():
     dispatch_corporate_action_ready = False
     dispatch_corporate_action_summary = {}
     dispatch_corporate_action_comparison_status = "unverified_external_event_source_coverage"
+    dispatch_corporate_action_lineage_rows = []
+    dispatch_expected_symbols = []
     daily_group_label = "N/A"
     daily_batch_mode = DAILY_BATCH_MODE or "auto"
     daily_target_count = 0
+    daily_corporate_action_audit = {}
+    corporate_action_runtime_audit_written = False
     mapping_refresh_audit = {"status": "not_run"}
 
     try:
@@ -4626,13 +4709,13 @@ def run_harvester():
                     
                     if s3_tickers:
                         total_count = len(s3_tickers)
+                        dispatch_expected_symbols = s3_tickers
                         dispatch_total_symbols = total_count
                         send_telegram(f"🚀 *수집 시작:* `{total_count}`종목 (OHLCV {OHLCV_INITIAL_PERIOD})")
                         
                         update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING", current_trigger_file)
 
                         ohlcv_skipped = 0
-                        corporate_action_lineage_rows = []
                         for idx, st in enumerate(s3_tickers, 1):
                             listing_evidence = dict(ticker_mapping.get(st) or {})
                             mapping_meta = ticker_mapping.get("_meta") if isinstance(ticker_mapping.get("_meta"), dict) else {}
@@ -4643,7 +4726,7 @@ def run_harvester():
                                 st,
                                 ohlcv_dir_id,
                                 listing_evidence=listing_evidence,
-                                lineage_sink=corporate_action_lineage_rows,
+                                lineage_sink=dispatch_corporate_action_lineage_rows,
                             )
                             if sync_status == "UPDATED":
                                 total_success += 1
@@ -4665,7 +4748,7 @@ def run_harvester():
 
                         try:
                             corporate_action_audit = build_corporate_action_runtime_audit(
-                                corporate_action_lineage_rows,
+                                dispatch_corporate_action_lineage_rows,
                                 trigger_file=current_trigger_file,
                                 expected_symbols=s3_tickers,
                                 external_source_coverage=external_source_coverage,
@@ -4675,6 +4758,7 @@ def run_harvester():
                                 corporate_action_audit,
                                 "Corporate-action lineage runtime audit",
                             )
+                            corporate_action_runtime_audit_written = True
                             upload_json(
                                 CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME,
                                 corporate_action_audit,
@@ -4794,6 +4878,31 @@ def run_harvester():
                         earnings_status = "READY" if earnings_event_ready else "SKIPPED"
                         failure_line = failure_telegram_summary()
                         send_telegram(f"✅ *Stage 4 수집 완료!*\n성공: `{total_success}` (skip `{ohlcv_skipped}`) | 실패: `{total_error}`\n벤치마크: `{benchmark_success}` 성공 (skip `{benchmark_skipped}`) / `{benchmark_fail}` 실패\n시장국면: `{regime_status}`\n실적이벤트: `{earnings_status}` ({earnings_event_count})\n{failure_line}")
+            if not corporate_action_runtime_audit_written:
+                fallback_audit = build_corporate_action_runtime_audit(
+                    dispatch_corporate_action_lineage_rows,
+                    trigger_file=dispatch_trigger_file,
+                    expected_symbols=dispatch_expected_symbols,
+                    external_source_coverage=external_source_coverage,
+                )
+                fallback_audit["failureReason"] = (
+                    "dispatch_completed_without_primary_lineage_audit"
+                )
+                write_json_report(
+                    HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH,
+                    fallback_audit,
+                    "Corporate-action dispatch fallback audit",
+                )
+                corporate_action_runtime_audit_written = True
+                dispatch_corporate_action_summary = fallback_audit.get(
+                    "summary", {}
+                )
+                dispatch_corporate_action_comparison_status = (
+                    dispatch_corporate_action_summary.get(
+                        "comparisonCoverageStatus"
+                    )
+                    or "unverified_external_event_source_coverage"
+                )
             duration = (time.time() - start_time) / 60
             summary_payload = {
                 "status": "success",
@@ -4912,6 +5021,20 @@ def run_harvester():
             and ((t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars))
         }
         daily_target_count = len(filtered_tickers)
+        daily_corporate_action_audit = build_mapping_corporate_action_runtime_audit(
+            full_map,
+            expected_symbols=list(filtered_tickers),
+            external_source_coverage=(
+                mapping_refresh_audit.get("externalCorporateActionCoverage")
+                or {}
+            ),
+        )
+        write_json_report(
+            HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH,
+            daily_corporate_action_audit,
+            "Corporate-action mapping source runtime audit",
+        )
+        corporate_action_runtime_audit_written = True
 
         send_telegram(
             f"📡 *[Daily] 본계정 가동*\n"
@@ -5558,6 +5681,17 @@ def run_harvester():
         summary_payload["corporateActionExternalApplication"] = (
             mapping_refresh_audit.get("externalCorporateActionApplication") or {}
         )
+        summary_payload["corporateActionLineageAuditPath"] = (
+            HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH
+        )
+        summary_payload["corporateActionLineageSummary"] = (
+            daily_corporate_action_audit.get("summary") or {}
+        )
+        summary_payload["corporateActionOosComparisonStatus"] = (
+            (daily_corporate_action_audit.get("summary") or {}).get(
+                "comparisonCoverageStatus"
+            )
+        )
         summary_payload["mappingFreshnessAuditPath"] = HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH
         summary_payload["failureCategoryCounts"] = failure_report.get("failureSummary", {}).get("categoryCounts", {})
         summary_payload["skipCategoryCounts"] = failure_report.get("skipSummary", {}).get("categoryCounts", {})
@@ -5570,6 +5704,25 @@ def run_harvester():
     except Exception as e:
         record_symbol_failure("RUN", "fatal", "RUN_FATAL", f"{type(e).__name__}: {e}")
         send_telegram(f"🚨 *에러 발생:* `{str(e)}` ", channel="alert")
+        if not corporate_action_runtime_audit_written:
+            failure_audit = build_corporate_action_runtime_audit(
+                [],
+                trigger_file=dispatch_trigger_file,
+                expected_symbols=[],
+                audit_scope=(
+                    "OHLCV_LINEAGE"
+                    if run_mode == "dispatch"
+                    else "MAPPING_SOURCE_ONLY"
+                ),
+            )
+            failure_audit["failureReason"] = (
+                f"run_fatal_before_lineage_audit:{type(e).__name__}"
+            )
+            write_json_report(
+                HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH,
+                failure_audit,
+                "Corporate-action lineage failure audit",
+            )
         duration = (time.time() - start_time) / 60
         summary_payload = {
             "status": "failed",
