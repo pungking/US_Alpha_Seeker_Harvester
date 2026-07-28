@@ -827,6 +827,7 @@ EXCHANGE_CODE_LABELS = {
 }
 
 EXTERNAL_CORPORATE_ACTION_SCHEMA_VERSION = "external-corporate-action-coverage-v1"
+FINNHUB_SYMBOL_CHANGE_ENDPOINT = "https://finnhub.io/api/v1/ca/symbol-change"
 FMP_DELISTED_ENDPOINT = "https://financialmodelingprep.com/stable/delisted-companies"
 NASDAQ_HALT_SEARCH_PAGE = "https://www.nasdaqtrader.com/Trader.aspx?id=TradingHaltSearch"
 NASDAQ_HALT_RPC_ENDPOINT = "https://www.nasdaqtrader.com/RPCHandler.axd"
@@ -977,6 +978,57 @@ def _parse_fmp_delisted_rows(payload) -> list[dict]:
             }
         )
     return sorted(rows, key=lambda row: (row["eventEffectiveAt"], row["symbol"]))
+
+
+def _parse_finnhub_symbol_change_rows(payload) -> list[dict]:
+    rows = []
+    for raw in payload.get("data", []) if isinstance(payload, dict) else []:
+        if not isinstance(raw, dict):
+            continue
+        old_symbol = _normalize_event_symbol(raw.get("oldSymbol"))
+        new_symbol = _normalize_event_symbol(raw.get("newSymbol"))
+        effective = _parse_date(raw.get("atDate"))
+        if not old_symbol or not new_symbol or not effective:
+            continue
+        rows.append(
+            {
+                "oldSymbol": old_symbol,
+                "newSymbol": new_symbol,
+                "eventEffectiveAt": effective.isoformat(),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["eventEffectiveAt"],
+            row["oldSymbol"],
+            row["newSymbol"],
+        ),
+    )
+
+
+def _finnhub_symbol_change_payload_contract_valid(
+    payload,
+    coverage_start: datetime.date,
+    coverage_end: datetime.date,
+) -> bool:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("fromDate") != coverage_start.isoformat()
+        or payload.get("toDate") != coverage_end.isoformat()
+        or not isinstance(payload.get("data"), list)
+    ):
+        return False
+    rows = _parse_finnhub_symbol_change_rows(payload)
+    return bool(
+        len(rows) == len(payload["data"])
+        and all(
+            coverage_start
+            <= _parse_date(row["eventEffectiveAt"])
+            <= coverage_end
+            for row in rows
+        )
+    )
 
 
 def _fmp_delisted_payload_contract_valid(payload) -> bool:
@@ -1646,6 +1698,157 @@ def _request_with_backoff(callable_request, attempts=3):
     return last_response
 
 
+def _fetch_finnhub_symbol_change_coverage(
+    session,
+    *,
+    api_key,
+    coverage_start,
+    coverage_end,
+    retrieved_at,
+    previous_coverage,
+) -> tuple[dict, list[dict]]:
+    previous_rows = previous_coverage.get("events", {}).get("symbolChanges", [])
+    failure_context = {
+        "coverageStart": coverage_start.isoformat(),
+        "coverageEnd": coverage_end.isoformat(),
+        "paginationComplete": False,
+    }
+    if not api_key:
+        return (
+            _source_failure(
+                "FINNHUB_SYMBOL_CHANGE",
+                "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                "credential_missing",
+                retrieved_at=retrieved_at,
+                **failure_context,
+            ),
+            previous_rows,
+        )
+
+    response_hashes = []
+    fetched_rows = []
+    segment_start = coverage_start
+    request_count = 0
+    while segment_start <= coverage_end:
+        segment_end = min(
+            segment_start + datetime.timedelta(days=364),
+            coverage_end,
+        )
+        try:
+            response = _request_with_backoff(
+                lambda: session.get(
+                    FINNHUB_SYMBOL_CHANGE_ENDPOINT,
+                    params={
+                        "from": segment_start.isoformat(),
+                        "to": segment_end.isoformat(),
+                        "token": api_key,
+                    },
+                    headers={"User-Agent": "US-Alpha-Seeker-Harvester/1.0"},
+                    timeout=30,
+                )
+            )
+        except requests.RequestException as exc:
+            return (
+                _source_failure(
+                    "FINNHUB_SYMBOL_CHANGE",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"{type(exc).__name__}:{_short_failure_text(exc, 180)}",
+                    retrieved_at=retrieved_at,
+                    requestCount=request_count + 1,
+                    **failure_context,
+                ),
+                previous_rows,
+            )
+        request_count += 1
+        status_code = getattr(response, "status_code", None)
+        if status_code in {401, 402, 403}:
+            return (
+                _source_failure(
+                    "FINNHUB_SYMBOL_CHANGE",
+                    "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                    f"entitlement_or_auth_http_{status_code}",
+                    retrieved_at=retrieved_at,
+                    requestCount=request_count,
+                    **failure_context,
+                ),
+                previous_rows,
+            )
+        if status_code != 200:
+            return (
+                _source_failure(
+                    "FINNHUB_SYMBOL_CHANGE",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    f"http_{status_code}",
+                    retrieved_at=retrieved_at,
+                    requestCount=request_count,
+                    **failure_context,
+                ),
+                previous_rows,
+            )
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = None
+        if not _finnhub_symbol_change_payload_contract_valid(
+            payload,
+            segment_start,
+            segment_end,
+        ):
+            return (
+                _source_failure(
+                    "FINNHUB_SYMBOL_CHANGE",
+                    "UNVERIFIED_SOURCE_RESPONSE",
+                    "response_schema_or_coverage_invalid",
+                    retrieved_at=retrieved_at,
+                    requestCount=request_count,
+                    **failure_context,
+                ),
+                previous_rows,
+            )
+        if len(payload["data"]) >= 2000:
+            return (
+                _source_failure(
+                    "FINNHUB_SYMBOL_CHANGE",
+                    "UNVERIFIED_PARTIAL_RESPONSE",
+                    "response_limit_reached",
+                    retrieved_at=retrieved_at,
+                    requestCount=request_count,
+                    **failure_context,
+                ),
+                previous_rows,
+            )
+        response_hashes.append(hashlib.sha256(response.content).hexdigest())
+        fetched_rows.extend(_parse_finnhub_symbol_change_rows(payload))
+        segment_start = segment_end + datetime.timedelta(days=1)
+
+    rows = _merge_external_events(
+        [],
+        _events_within_coverage(fetched_rows, coverage_start, coverage_end),
+        ("oldSymbol", "newSymbol", "eventEffectiveAt"),
+    )
+    return (
+        {
+            "status": "SUCCESS",
+            "source": "FINNHUB_SYMBOL_CHANGE",
+            "sourceAsOf": retrieved_at,
+            "sourceAsOfBasis": "RETRIEVAL_TIME_WITH_REQUESTED_DATE_WINDOWS",
+            "retrievedAt": retrieved_at,
+            "coverageStart": coverage_start.isoformat(),
+            "coverageEnd": coverage_end.isoformat(),
+            "partialResponse": False,
+            "paginationComplete": True,
+            "responseSha256": _canonical_sha256(
+                {"responseHashes": response_hashes, "events": rows}
+            ),
+            "queryScope": "US_LISTED_SYMBOL_CHANGES_DATE_SEGMENTED",
+            "requestCount": request_count,
+            "eventCount": len(rows),
+            "responseRowLimit": 2000,
+        },
+        rows,
+    )
+
+
 def _fetch_fmp_delisting_coverage(
     session,
     *,
@@ -2089,16 +2292,13 @@ def fetch_external_corporate_action_coverage(
             "requestScopeSymbolsSha256": scope_hash,
         }
     client = session or requests.Session()
-    symbol_source = _source_failure(
-        "FMP_OR_FINNHUB_SYMBOL_CHANGE",
-        "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
-        "entitlement_and_verified_response_fixture_required",
+    symbol_source, symbol_events = _fetch_finnhub_symbol_change_coverage(
+        client,
+        api_key=FINNHUB_API_KEY,
+        coverage_start=coverage_start,
+        coverage_end=coverage_end,
         retrieved_at=generated_at,
-    )
-    symbol_events = _events_within_coverage(
-        previous_coverage.get("events", {}).get("symbolChanges", []),
-        coverage_start,
-        coverage_end,
+        previous_coverage=previous_coverage,
     )
     delisting_source, delisting_events = _fetch_fmp_delisting_coverage(
         client,
@@ -2244,7 +2444,7 @@ def refresh_ticker_mapping_from_authoritative_sources(
             "overall": "unverified_source_response",
             "sources": {
                 "symbolChange": _source_failure(
-                    "FMP_OR_FINNHUB_SYMBOL_CHANGE",
+                    "FINNHUB_SYMBOL_CHANGE",
                     "UNVERIFIED_SOURCE_RESPONSE",
                     f"{type(exc).__name__}:{_short_failure_text(exc, 180)}",
                     retrieved_at=now_utc,

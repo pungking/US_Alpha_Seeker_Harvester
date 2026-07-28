@@ -14,6 +14,7 @@ from harvester import (  # noqa: E402
     _external_evidence_contract_valid,
     _external_evidence_time_valid,
     _extract_ohlcv_payload,
+    _fetch_finnhub_symbol_change_coverage,
     _fetch_fmp_delisting_coverage,
     _fetch_nasdaq_suspension_coverage,
     _parse_fmp_delisted_rows,
@@ -603,6 +604,99 @@ def main() -> int:
             return _FixtureResponse(
                 payload=external_fixture["fmpDelistedRows"],
             )
+
+    class _FinnhubSession:
+        def get(self, *_args, **kwargs):
+            params = kwargs["params"]
+            data = []
+            if params["from"] <= "2026-07-01" <= params["to"]:
+                data.append(
+                    {
+                        "atDate": "2026-07-01",
+                        "oldSymbol": "SYNTH-OLD",
+                        "newSymbol": "SYNTH",
+                    }
+                )
+            return _FixtureResponse(
+                payload={
+                    "data": data,
+                    "fromDate": params["from"],
+                    "toDate": params["to"],
+                }
+            )
+
+    symbol_summary, symbol_rows = _fetch_finnhub_symbol_change_coverage(
+        _FinnhubSession(),
+        api_key="fixture-key",
+        coverage_start=datetime.date(2021, 7, 20),
+        coverage_end=datetime.date(2026, 7, 21),
+        retrieved_at="2026-07-21T11:00:00Z",
+        previous_coverage={},
+    )
+    assert symbol_summary["status"] == "SUCCESS"
+    assert symbol_summary["partialResponse"] is False
+    assert symbol_summary["paginationComplete"] is True
+    assert symbol_summary["coverageStart"] == "2021-07-20"
+    assert symbol_summary["coverageEnd"] == "2026-07-21"
+    assert symbol_rows == [
+        {
+            "oldSymbol": "SYNTH-OLD",
+            "newSymbol": "SYNTH",
+            "eventEffectiveAt": "2026-07-01",
+        }
+    ]
+
+    class _BlockedFinnhubSession:
+        def get(self, *_args, **_kwargs):
+            return _FixtureResponse(status_code=403, payload={"error": "forbidden"})
+
+    blocked_symbol_summary, blocked_symbol_rows = (
+        _fetch_finnhub_symbol_change_coverage(
+            _BlockedFinnhubSession(),
+            api_key="fixture-key",
+            coverage_start=datetime.date(2021, 7, 20),
+            coverage_end=datetime.date(2026, 7, 21),
+            retrieved_at="2026-07-21T11:00:00Z",
+            previous_coverage={},
+        )
+    )
+    assert blocked_symbol_summary["status"] == "BLOCKED_EXTERNAL_SOURCE_CONTRACT"
+    assert blocked_symbol_summary["reason"] == "entitlement_or_auth_http_403"
+    assert blocked_symbol_rows == []
+
+    class _TimeoutFinnhubSession:
+        def get(self, *_args, **_kwargs):
+            raise harvester_module.requests.Timeout("fixture timeout")
+
+    timeout_symbol_summary, timeout_symbol_rows = (
+        _fetch_finnhub_symbol_change_coverage(
+            _TimeoutFinnhubSession(),
+            api_key="fixture-key",
+            coverage_start=datetime.date(2021, 7, 20),
+            coverage_end=datetime.date(2026, 7, 21),
+            retrieved_at="2026-07-21T11:00:00Z",
+            previous_coverage={
+                "events": {
+                    "symbolChanges": [
+                        {
+                            "oldSymbol": "PRESERVED-OLD",
+                            "newSymbol": "PRESERVED",
+                            "eventEffectiveAt": "2026-01-02",
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    assert timeout_symbol_summary["status"] == "UNVERIFIED_SOURCE_RESPONSE"
+    assert timeout_symbol_summary["reason"].startswith("Timeout:")
+    assert timeout_symbol_rows == [
+        {
+            "oldSymbol": "PRESERVED-OLD",
+            "newSymbol": "PRESERVED",
+            "eventEffectiveAt": "2026-01-02",
+        }
+    ]
 
     fmp_summary, fmp_rows = _fetch_fmp_delisting_coverage(
         _FmpSession(),
