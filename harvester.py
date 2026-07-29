@@ -2364,6 +2364,26 @@ def fetch_external_corporate_action_coverage(
     }
 
 
+def _refresh_dispatch_external_corporate_action_coverage(
+    active_symbols,
+    external_source_coverage,
+) -> dict:
+    coverage = (
+        external_source_coverage
+        if isinstance(external_source_coverage, dict)
+        else {}
+    )
+    symbol_source = (
+        (coverage.get("sources") or {}).get("symbolChange") or {}
+    )
+    if symbol_source.get("source") == "FINNHUB_SYMBOL_CHANGE":
+        return coverage
+    return fetch_external_corporate_action_coverage(
+        active_symbols,
+        previous_coverage=coverage,
+    )
+
+
 def refresh_ticker_mapping_from_authoritative_sources(
     existing_map,
     today_str,
@@ -4908,6 +4928,23 @@ def run_harvester():
                     ))
                     
                     if s3_tickers:
+                        try:
+                            external_source_coverage = (
+                                _refresh_dispatch_external_corporate_action_coverage(
+                                    s3_tickers,
+                                    external_source_coverage,
+                                )
+                            )
+                            ticker_mapping, _ = apply_external_corporate_action_coverage(
+                                ticker_mapping,
+                                external_source_coverage,
+                            )
+                        except Exception as e:
+                            print(
+                                "⚠️ Corporate-action dispatch source refresh failed: "
+                                f"{type(e).__name__}",
+                                flush=True,
+                            )
                         total_count = len(s3_tickers)
                         dispatch_expected_symbols = s3_tickers
                         dispatch_total_symbols = total_count
