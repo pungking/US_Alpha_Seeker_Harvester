@@ -27,18 +27,20 @@ read or printed.
 | Evidence | Result |
 |---|---|
 | Harvester `FMP_KEY` secret | Present and wired server-side |
-| Harvester `FINNHUB_KEY` secret | Missing; workflow wiring already exists |
+| Harvester `FINNHUB_KEY` secret | Present and wired server-side |
 | `US_Alpha_Seeker` `FINNHUB_KEY` secret | Present, but repository-scoped and not readable or transferable by this audit |
 | Nasdaq/NYSE paid product credential | Not present |
 | FMP delisting runtime | `BLOCKED_EXTERNAL_SOURCE_CONTRACT`, `entitlement_or_auth_http_402` |
 | Nasdaq halt runtime | `SUCCESS`, but historical coverage is one year versus the requested five years |
-| Finnhub post-`b2232648` runtime | `pending_natural_runtime_proof` |
+| Finnhub local entitlement probe | `EXISTING_SOURCE_ENTITLEMENT_REQUIRED` |
+| Finnhub natural run `30369628942` | Reused legacy dispatch coverage; producer refresh contract defect confirmed |
 | Lineage structural coverage | 300/300, missing 0, duplicate 0 |
 | Comparison-ready lineage | 0/300 |
 
-The fixed baseline is natural Harvester run `30355306266`. It predates
-`b2232648`, so it is valid evidence for the FMP and Nasdaq blockers but not a
-runtime proof of the merged Finnhub producer.
+Natural run `30369628942` was the first eligible run after the Finnhub secret
+wiring. Its dispatch path reused legacy `FMP_OR_FINNHUB_SYMBOL_CHANGE`
+coverage instead of invoking the merged producer, so it is evidence of a
+dispatch refresh defect rather than Finnhub runtime entitlement proof.
 
 ## Official Feasibility Matrix
 
@@ -270,8 +272,8 @@ do not delete previously captured positive-event evidence.
 
 ## Runtime And OOS Gate
 
-- The first natural `schedule` or `repository_dispatch` run after `b2232648`
-  remains the only allowed Finnhub runtime proof.
+- The first natural `schedule` or `repository_dispatch` run after the dispatch
+  refresh fix is the only remaining Finnhub runtime proof.
 - No `workflow_dispatch`, forced run, rerun, or repeated artifact download is
   authorized by this package.
 - Existing unverified Stage7 rows remain comparison-excluded.

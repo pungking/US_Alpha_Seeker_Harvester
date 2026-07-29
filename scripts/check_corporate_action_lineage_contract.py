@@ -20,6 +20,7 @@ from harvester import (  # noqa: E402
     _parse_fmp_delisted_rows,
     _parse_nasdaq_current_halt_rss,
     _parse_nasdaq_halt_rows,
+    _refresh_dispatch_external_corporate_action_coverage,
     apply_external_corporate_action_coverage,
     build_corporate_action_lineage,
     build_corporate_action_runtime_audit,
@@ -394,6 +395,48 @@ def main() -> int:
             "suspensions": [*halt_rows, *rss_rows],
         },
     }
+    legacy_dispatch_coverage = json.loads(json.dumps(coverage))
+    legacy_dispatch_coverage["sources"]["symbolChange"] = {
+        "status": "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+        "source": "FMP_OR_FINNHUB_SYMBOL_CHANGE",
+        "reason": "entitlement_and_verified_response_fixture_required",
+    }
+    current_dispatch_coverage = json.loads(json.dumps(coverage))
+    current_dispatch_coverage["sources"]["symbolChange"] = {
+        "status": "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+        "source": "FINNHUB_SYMBOL_CHANGE",
+        "reason": "entitlement_or_auth_http_403",
+    }
+    original_external_fetch = harvester_module.fetch_external_corporate_action_coverage
+    dispatch_refresh_calls = []
+    try:
+        harvester_module.fetch_external_corporate_action_coverage = (
+            lambda symbols, **kwargs: (
+                dispatch_refresh_calls.append(
+                    {
+                        "symbols": list(symbols),
+                        "previous": kwargs.get("previous_coverage"),
+                    }
+                )
+                or current_dispatch_coverage
+            )
+        )
+        refreshed_dispatch_coverage = _refresh_dispatch_external_corporate_action_coverage(
+            ["SYNTH"],
+            legacy_dispatch_coverage,
+        )
+        reused_dispatch_coverage = _refresh_dispatch_external_corporate_action_coverage(
+            ["SYNTH"],
+            current_dispatch_coverage,
+        )
+    finally:
+        harvester_module.fetch_external_corporate_action_coverage = original_external_fetch
+    assert len(dispatch_refresh_calls) == 1
+    assert dispatch_refresh_calls[0]["symbols"] == ["SYNTH"]
+    assert dispatch_refresh_calls[0]["previous"] == legacy_dispatch_coverage
+    assert refreshed_dispatch_coverage == current_dispatch_coverage
+    assert reused_dispatch_coverage == current_dispatch_coverage
+
     blocked_comparison_audit = build_corporate_action_runtime_audit(
         [unverified],
         trigger_file="STAGE3_FUNDAMENTAL_FULL_FIXTURE.json",
