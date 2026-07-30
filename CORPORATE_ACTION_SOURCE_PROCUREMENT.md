@@ -1,6 +1,6 @@
 # Corporate-Action Source Procurement
 
-Generated: 2026-07-28
+Generated: 2026-07-31
 
 ## Decision
 
@@ -9,7 +9,7 @@ delisting, suspension, and resumption no-event coverage.
 
 | Event | Decision | Primary source | Fallback | Five-year no-event proof |
 |---|---|---|---|---|
-| Symbol change | `EXISTING_SOURCE_ENTITLEMENT_REQUIRED` | Finnhub Symbol Change Premium | FMP Symbol Changes, then exchange-specific products | Blocked until a premium key is wired to this repository and a natural run passes |
+| Symbol change | `DEFER_AND_KEEP_COMPARISON_BLOCKED` | Finnhub Symbol Change Premium | FMP Symbol Changes, then exchange-specific products | Existing key is wired, but runtime returns HTTP 403; public terms do not prove plan mapping, five-year completeness, or artifact rights |
 | Delisting | `EXISTING_SOURCE_ENTITLEMENT_REQUIRED` | FMP Delisted Companies | Nasdaq Daily List and NYSE Group Corporate Actions for their own listings | Blocked by the current FMP credential returning HTTP 402 |
 | Suspension | `PAID_SOURCE_APPROVAL_REQUIRED` | NYSE Daily TAQ admin messages for consolidated U.S. coverage | Nasdaq halt history/RSS and SEC suspensions as positive-event supplements | Public sources do not publish a complete five-year no-event contract |
 | Resumption | `PAID_SOURCE_APPROVAL_REQUIRED` | NYSE Daily TAQ admin messages for consolidated U.S. coverage | Nasdaq halt history/RSS as a positive-event supplement | Same blocker as suspension |
@@ -34,39 +34,79 @@ read or printed.
 | Nasdaq halt runtime | `SUCCESS`, but historical coverage is one year versus the requested five years |
 | Finnhub local entitlement probe | `EXISTING_SOURCE_ENTITLEMENT_REQUIRED` |
 | Finnhub natural run `30369628942` | Reused legacy dispatch coverage; producer refresh contract defect confirmed |
-| Lineage structural coverage | 300/300, missing 0, duplicate 0 |
-| Comparison-ready lineage | 0/300 |
+| Finnhub natural run `30497551790` | `FINNHUB_SYMBOL_CHANGE`, `BLOCKED_EXTERNAL_SOURCE_CONTRACT`, `entitlement_or_auth_http_403` |
+| Lineage structural coverage | 2,924/2,924, missing 0, duplicate 0 |
+| Comparison-ready lineage | 0/2,924 |
 
 Natural run `30369628942` was the first eligible run after the Finnhub secret
 wiring. Its dispatch path reused legacy `FMP_OR_FINNHUB_SYMBOL_CHANGE`
 coverage instead of invoking the merged producer, so it is evidence of a
 dispatch refresh defect rather than Finnhub runtime entitlement proof.
 
+Run `30497551790` includes merge `53bd087d` and is the completed natural
+runtime proof. It made one server-side request for the configured five-year
+window and returned HTTP 403. The local and runtime entitlement decisions now
+agree. No additional probe is authorized.
+
 ## Official Feasibility Matrix
 
 ### Finnhub Symbol Change Premium
 
-- Product/endpoint: `GET /ca/symbol-change`.
-- Official contract: premium access, date-bounded requests, maximum 2,000
-  events per response, and `fromDate`/`toDate` response echoes.
-- Market scope: U.S.-listed and other documented markets.
-- Five-year implementation: already implemented as deterministic one-year
-  request segments with schema, date-echo, limit, and response-hash checks.
-- Authentication: server-side API token.
-- Public pricing: Finnhub lists Free at USD 0/month and All-In-One at USD
-  3,500/month billed annually, but the public table does not unambiguously map
-  Symbol Change Premium to a purchasable tier. Entitlement must be confirmed
-  against the existing key or by Finnhub sales.
-- Repository state: code ready; Harvester secret absent.
-- Decision: `EXISTING_SOURCE_ENTITLEMENT_REQUIRED`.
-- Next action: copy the already-owned key into the Harvester repository secret
-  `FINNHUB_KEY` without exposing its value, then let one natural run prove
-  entitlement and response completeness.
+Final procurement verdict: `DEFER_AND_KEEP_COMPARISON_BLOCKED`.
+
+Technical entitlement status: `EXISTING_PLAN_UPGRADE_REQUIRED`. This is not a
+purchase recommendation: the public contract is insufficient to name an exact
+licensable plan and price for this repository.
+
+| Contract item | Officially verified | Procurement result |
+|---|---|---|
+| Endpoint | `GET /api/v1/ca/symbol-change`; Premium access required | Existing key is not entitled |
+| Documented market scope | US-listed, EU-listed, NSE, and ASX securities | "US-listed" is documented; complete all-U.S.-exchange coverage is not warranted |
+| Query | Required `from` and `to` dates; response echoes `fromDate` and `toDate` | Exact bounded windows are supported |
+| Response size | Maximum 2,000 events per response | The API documents no cursor, page, or offset parameter; date segmentation is not pagination |
+| Effective date | `atDate` | Can be mapped to internal `eventEffectiveAt` without invention |
+| Five-year history | No public historical start date or completeness SLA | Five-year positive-event and no-event proof is unverified |
+| As-of lineage | Response includes query-window echoes, not vendor `sourceAsOf` or `retrievedAt` | Harvester may capture `retrievedAt`; `toDate` remains a coverage bound, not vendor as-of evidence |
+| Public personal plan | All-In-One: USD 3,500/month, billed annually, personal use | USD 42,000 annual list commitment before tax; endpoint inclusion is not explicitly mapped |
+| Public rate limit | All-In-One: 300 fundamental calls/minute; general cap 30 calls/second | No endpoint-specific rate is published |
+| Enterprise plan | Flexible quote, commercial use, redistribution right, unlimited API calls | Only public option that expressly addresses redistribution; exact price is unavailable |
+| Existing key upgrade | Public FAQ permits same-category plan changes through support | It does not state whether this endpoint is enabled on the existing key or requires a new key |
+| Cancellation | No refunds; email cancellation requires 30 days' notice; API access is revoked on cancellation | Exact downgrade and annual-commitment treatment require written confirmation |
+| Storage and redistribution | Personal terms prohibit sharing data or derived results without written approval and require data deletion when the subscription ends | Raw response storage/redistribution is not approved; public derived lineage and response hashes require written permission or private storage |
+
+The repository is public. Therefore the public All-In-One personal license is
+not sufficient evidence for publishing symbol-change event lineage or derived
+results in repository artifacts. A response SHA-256 is technically possible,
+but its retention/publication rights are not granted by the public terms.
+
+The current producer already performs deterministic bounded requests and
+rejects schema/date-echo/limit failures. No code change is required before a
+written entitlement and license are obtained.
+
+Required written answers from Finnhub:
+
+1. Does a named plan include `/api/v1/ca/symbol-change`?
+2. Does it provide complete US-listed history for a rolling five-year window,
+   including a complete empty response that can prove no event?
+3. Which U.S. exchanges and security types are included?
+4. Is the 2,000-event response limit handled only by date segmentation, and
+   what rate-limit bucket applies?
+5. Can the existing account/key be upgraded without key rotation?
+6. May parsed old/new symbol, effective date, lineage counts, and response
+   SHA-256 be retained in private artifacts? May any derived metadata appear
+   in public GitHub Actions artifacts?
+7. What data must be deleted after cancellation?
+8. What are the exact total annual price, taxes, commitment, renewal,
+   cancellation, and downgrade terms?
 
 Official references:
 
-- https://api.finnhub.io/docs/api/rate-limit
+- https://finnhub.io/docs/api/symbol-change
 - https://finnhub.io/pricing
+- https://finnhub.io/pricing-startups-and-enterprise
+- https://finnhub.io/faq
+- https://finnhub.io/terms-of-service
+- https://finnhub.io/docs/api/rate-limit
 
 ### FMP Symbol Changes And Delisted Companies
 
@@ -200,28 +240,74 @@ Official references:
 
 ## Procurement Packages
 
-### Package A: Lowest-Cost Symbol-Change Runtime Proof
+### Package A: Finnhub Symbol-Change Contract Decision
 
 Scope:
 
-1. Add the already-owned Finnhub token to the Harvester GitHub Actions secret
-   named `FINNHUB_KEY`.
-2. Do not copy the value into source, logs, variables, artifacts, or any
-   `VITE_*` key.
-3. Use it only for the existing server-side symbol-change producer.
-4. Accept no new vendor cost until the natural run proves whether the existing
-   account has Premium entitlement.
+1. Keep the current server-side `FINNHUB_KEY`; do not rotate it before Finnhub
+   states whether an entitlement change can reuse the key.
+2. Request a written quote for the exact endpoint, rolling five-year
+   completeness, all-U.S. scope, retention, and redistribution terms.
+3. Do not purchase All-In-One solely from its name. The public table does not
+   map Symbol Change Premium to that plan.
+4. Prefer an Enterprise written contract if derived lineage remains in public
+   repository artifacts. Otherwise move licensed evidence to private storage
+   before considering a personal-use plan.
+5. Keep `comparisonCoverageStatus=blocked_external_source_contract` until one
+   natural runtime proves the purchased contract.
 
-Approval phrase:
+Safe no-cost inquiry authorization:
 
 ```text
-APPROVE HARVESTER FINNHUB SECRET WIRING — copy the existing server-side
-FINNHUB_KEY into pungking/US_Alpha_Seeker_Harvester for symbol-change lineage
-only, no value disclosure, no VITE exposure, no forced run
+AUTHORIZE FINNHUB SYMBOL CHANGE CONTRACT INQUIRY — no purchase, no key change,
+no API probe; request written endpoint entitlement, rolling five-year all-US
+coverage, retention and redistribution rights, existing-key upgrade path,
+exact annual price, and cancellation terms only
 ```
 
-Rollback: delete the Harvester `FINNHUB_KEY` secret. No code or historical
-lineage row is rewritten.
+Current safe defer decision:
+
+```text
+DEFER FINNHUB SYMBOL CHANGE PREMIUM — keep OOS comparison blocked, no purchase,
+no secret change, no additional probe
+```
+
+Purchase approval is intentionally not valid until Finnhub provides a written
+plan and exact total commitment:
+
+```text
+APPROVE FINNHUB SYMBOL CHANGE PREMIUM — <written plan and quote id>,
+up to USD <exact total annual commitment>, server-side Harvester only,
+5-year symbol-change lineage, no VITE exposure,
+no raw response redistribution
+```
+
+Minimal post-approval change:
+
+1. Apply the entitlement to the existing account/key if Finnhub confirms that
+   path; otherwise replace only the server-side GitHub `FINNHUB_KEY`.
+2. Do not add a client key, dependency, endpoint, or Stage7 backfill.
+3. Run no manual probe. Verify the first natural Harvester run once.
+
+Rollback/downgrade:
+
+1. Ask Finnhub support to downgrade/cancel under the written quote terms.
+2. Expect no refund, at least 30 days' email notice, and immediate API access
+   revocation on cancellation under the public terms.
+3. Remove or rotate only the server-side secret if required.
+4. Delete licensed data when the subscription ends unless the written contract
+   grants retention; keep OOS comparison blocked rather than fabricating
+   continuity.
+
+### Symbol-Change Alternative Priority
+
+| Rank | Source | Why it ranks here | Blocking evidence |
+|---:|---|---|---|
+| 1 | FMP Symbol Changes | Existing vendor and dedicated stable endpoint; materially lower public plan prices | Exact endpoint tier, five-year completeness, and display/redistribution rights require confirmation |
+| 2 | Nasdaq Daily List + NYSE Group Corporate Actions | Highest-authority exchange evidence and long history | Fragmented exchange scope, multiple contracts, and no single all-U.S. no-event contract |
+| 3 | Existing Massive/Polygon Ticker Events | Existing credential and ticker-change event support | Experimental/partial contract; no verified five-year completeness |
+
+No alternative may be promoted from this ranking alone.
 
 ### Package B: Delisting Entitlement
 
@@ -272,10 +358,9 @@ do not delete previously captured positive-event evidence.
 
 ## Runtime And OOS Gate
 
-- The first natural `schedule` or `repository_dispatch` run after the dispatch
-  refresh fix is the only remaining Finnhub runtime proof.
-- No `workflow_dispatch`, forced run, rerun, or repeated artifact download is
-  authorized by this package.
+- Run `30497551790` completed the entitlement one-shot and returned HTTP 403.
+- No additional probe, `workflow_dispatch`, forced run, rerun, or repeated
+  artifact download is authorized before entitlement changes.
 - Existing unverified Stage7 rows remain comparison-excluded.
 - OOS readiness remains:
   - `EXECUTABLE_COHORT`: 0/30
@@ -285,3 +370,6 @@ do not delete previously captured positive-event evidence.
 - A future row becomes comparison-eligible only after every required source
   supplies complete, fresh, source-backed evidence under the existing
   consumer contract.
+- After an approved entitlement change, verify only the first natural
+  `schedule` or `repository_dispatch` artifact. Do not backfill historical
+  decisions or change Stage6 policy.
