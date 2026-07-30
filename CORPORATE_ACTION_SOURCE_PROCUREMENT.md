@@ -44,9 +44,10 @@ coverage instead of invoking the merged producer, so it is evidence of a
 dispatch refresh defect rather than Finnhub runtime entitlement proof.
 
 Run `30497551790` includes merge `53bd087d` and is the completed natural
-runtime proof. It made one server-side request for the configured five-year
-window and returned HTTP 403. The local and runtime entitlement decisions now
-agree. No additional probe is authorized.
+runtime proof. It attempted the configured five-year collection, stopped
+safely when its first bounded request returned HTTP 403, and made no later
+segment requests. The local and runtime entitlement decisions now agree. No
+additional probe is authorized.
 
 ## Official Feasibility Matrix
 
