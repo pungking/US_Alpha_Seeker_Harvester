@@ -214,6 +214,9 @@ HARVESTER_TARGET_LINEAGE_MAX_AGE_HOURS = _read_positive_int_env("HARVESTER_TARGE
 HARVESTER_EXTERNAL_CORPORATE_ACTION_ENABLED = _read_bool_env(
     "HARVESTER_EXTERNAL_CORPORATE_ACTION_ENABLED", True
 )
+FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED = _read_bool_env(
+    "FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED", False
+)
 HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS = _read_positive_int_env(
     "HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS", 5
 )
@@ -1706,6 +1709,7 @@ def _fetch_finnhub_symbol_change_coverage(
     coverage_end,
     retrieved_at,
     previous_coverage,
+    premium_enabled=None,
 ) -> tuple[dict, list[dict]]:
     previous_rows = previous_coverage.get("events", {}).get("symbolChanges", [])
     failure_context = {
@@ -1713,6 +1717,24 @@ def _fetch_finnhub_symbol_change_coverage(
         "coverageEnd": coverage_end.isoformat(),
         "paginationComplete": False,
     }
+    premium_enabled = (
+        FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED
+        if premium_enabled is None
+        else bool(premium_enabled)
+    )
+    if not premium_enabled:
+        return (
+            _source_failure(
+                "FINNHUB_SYMBOL_CHANGE",
+                "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                "premium_source_disabled_free_tier",
+                retrieved_at=retrieved_at,
+                requestCount=0,
+                capabilityMode="FREE_TIER",
+                **failure_context,
+            ),
+            previous_rows,
+        )
     if not api_key:
         return (
             _source_failure(
@@ -2377,7 +2399,11 @@ def _refresh_dispatch_external_corporate_action_coverage(
         (coverage.get("sources") or {}).get("symbolChange") or {}
     )
     if symbol_source.get("source") == "FINNHUB_SYMBOL_CHANGE":
-        return coverage
+        if FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED:
+            if symbol_source.get("status") == "SUCCESS":
+                return coverage
+        elif symbol_source.get("reason") == "premium_source_disabled_free_tier":
+            return coverage
     return fetch_external_corporate_action_coverage(
         active_symbols,
         previous_coverage=coverage,

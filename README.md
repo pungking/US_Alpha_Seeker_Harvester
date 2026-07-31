@@ -123,10 +123,12 @@ remain unverified.
 
 Current source chain:
 
-- Finnhub Symbol Change with deterministic one-year request windows across the
-  configured lookback. Each response must echo the requested date window, stay
-  below the documented row limit, and pass schema/hash checks. Authentication,
-  entitlement, malformed, or limit-saturated responses remain unverified.
+- Finnhub Symbol Change Premium is disabled by default because the current
+  account is free-tier. `FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED=false` makes no
+  Premium request, preserves prior positive evidence, and keeps no-event
+  coverage unverified. A reviewed paid entitlement must explicitly enable the
+  source; successful responses must still pass the existing window, row-limit,
+  schema, and hash checks.
 - FMP Delisted Companies for delisting events and coverage.
 - Nasdaq Trader official current-halt RSS plus the documented one-year halt
   search for H4/H9/H10/H11/M1/T6/T12 regulatory, listing, corporate-action, or
@@ -142,9 +144,9 @@ Current source chain:
   retained with explicit preservation provenance until the configured global
   retention cutoff, but current suspension status is determined by the fresh
   complete current feed rather than by a preserved historical row.
-If the Finnhub symbol-change endpoint is unavailable or the account lacks
-entitlement, the audit reports `BLOCKED_EXTERNAL_SOURCE_CONTRACT` and does not
-manufacture `VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE`. The existing
+If the Finnhub symbol-change source is disabled, unavailable, or not entitled,
+the audit reports `BLOCKED_EXTERNAL_SOURCE_CONTRACT` and does not manufacture
+`VERIFIED_NO_SYMBOL_CHANGE_AS_OF_SOURCE`. The existing
 `TICKER_MAPPING_REFRESH_AUDIT.json` carries source summaries and compact event
 rows, so removed/delisted symbols are not lost when the active ticker mapping
 is replaced.

@@ -68,6 +68,8 @@ jobs:
           # Earnings event map vendor lineage. Missing keys degrade to yfinance-only coverage.
           FMP_KEY: ${{ secrets.FMP_KEY || secrets.FMP_API_KEY }}
           FINNHUB_KEY: ${{ secrets.FINNHUB_KEY || secrets.FINNHUB_API_KEY }}
+          # The current account is free-tier; Premium activation requires a reviewed contract change.
+          FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED: 'false'
           
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           # Harvester collection notifications must go to simulation/private channel.

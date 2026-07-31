@@ -47,6 +47,7 @@ def _evidence_for_symbol(base: dict, symbol: str) -> dict:
 
 
 def main() -> int:
+    assert harvester_module.FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED is False
     fixture = json.loads(
         Path("fixtures/corporate_action_lineage_contract.json").read_text(encoding="utf-8")
     )
@@ -407,6 +408,14 @@ def main() -> int:
         "source": "FINNHUB_SYMBOL_CHANGE",
         "reason": "entitlement_or_auth_http_403",
     }
+    free_tier_dispatch_coverage = json.loads(json.dumps(coverage))
+    free_tier_dispatch_coverage["sources"]["symbolChange"] = {
+        "status": "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+        "source": "FINNHUB_SYMBOL_CHANGE",
+        "reason": "premium_source_disabled_free_tier",
+        "requestCount": 0,
+        "capabilityMode": "FREE_TIER",
+    }
     original_external_fetch = harvester_module.fetch_external_corporate_action_coverage
     dispatch_refresh_calls = []
     try:
@@ -418,7 +427,7 @@ def main() -> int:
                         "previous": kwargs.get("previous_coverage"),
                     }
                 )
-                or current_dispatch_coverage
+                or free_tier_dispatch_coverage
             )
         )
         refreshed_dispatch_coverage = _refresh_dispatch_external_corporate_action_coverage(
@@ -429,13 +438,19 @@ def main() -> int:
             ["SYNTH"],
             current_dispatch_coverage,
         )
+        stable_free_tier_coverage = _refresh_dispatch_external_corporate_action_coverage(
+            ["SYNTH"],
+            free_tier_dispatch_coverage,
+        )
     finally:
         harvester_module.fetch_external_corporate_action_coverage = original_external_fetch
-    assert len(dispatch_refresh_calls) == 1
+    assert len(dispatch_refresh_calls) == 2
     assert dispatch_refresh_calls[0]["symbols"] == ["SYNTH"]
     assert dispatch_refresh_calls[0]["previous"] == legacy_dispatch_coverage
-    assert refreshed_dispatch_coverage == current_dispatch_coverage
-    assert reused_dispatch_coverage == current_dispatch_coverage
+    assert dispatch_refresh_calls[1]["previous"] == current_dispatch_coverage
+    assert refreshed_dispatch_coverage == free_tier_dispatch_coverage
+    assert reused_dispatch_coverage == free_tier_dispatch_coverage
+    assert stable_free_tier_coverage == free_tier_dispatch_coverage
 
     blocked_comparison_audit = build_corporate_action_runtime_audit(
         [unverified],
@@ -649,7 +664,11 @@ def main() -> int:
             )
 
     class _FinnhubSession:
+        def __init__(self):
+            self.request_count = 0
+
         def get(self, *_args, **kwargs):
+            self.request_count += 1
             params = kwargs["params"]
             data = []
             if params["from"] <= "2026-07-01" <= params["to"]:
@@ -668,13 +687,15 @@ def main() -> int:
                 }
             )
 
+    enabled_finnhub_session = _FinnhubSession()
     symbol_summary, symbol_rows = _fetch_finnhub_symbol_change_coverage(
-        _FinnhubSession(),
+        enabled_finnhub_session,
         api_key="fixture-key",
         coverage_start=datetime.date(2021, 7, 20),
         coverage_end=datetime.date(2026, 7, 21),
         retrieved_at="2026-07-21T11:00:00Z",
         previous_coverage={},
+        premium_enabled=True,
     )
     assert symbol_summary["status"] == "SUCCESS"
     assert symbol_summary["partialResponse"] is False
@@ -688,6 +709,59 @@ def main() -> int:
             "eventEffectiveAt": "2026-07-01",
         }
     ]
+    assert enabled_finnhub_session.request_count > 0
+
+    class _NoRequestFinnhubSession:
+        def __init__(self):
+            self.request_count = 0
+
+        def get(self, *_args, **_kwargs):
+            self.request_count += 1
+            raise AssertionError("free-tier mode must not call the Premium endpoint")
+
+    disabled_finnhub_session = _NoRequestFinnhubSession()
+    disabled_previous = {
+        "events": {
+            "symbolChanges": [
+                {
+                    "oldSymbol": "PRESERVED-OLD",
+                    "newSymbol": "PRESERVED",
+                    "eventEffectiveAt": "2026-01-02",
+                }
+            ]
+        }
+    }
+    disabled_symbol_summary, disabled_symbol_rows = (
+        _fetch_finnhub_symbol_change_coverage(
+            disabled_finnhub_session,
+            api_key="fixture-key",
+            coverage_start=datetime.date(2021, 7, 20),
+            coverage_end=datetime.date(2026, 7, 21),
+            retrieved_at="2026-07-21T11:00:00Z",
+            previous_coverage=disabled_previous,
+            premium_enabled=False,
+        )
+    )
+    assert disabled_finnhub_session.request_count == 0
+    assert disabled_symbol_summary["status"] == "BLOCKED_EXTERNAL_SOURCE_CONTRACT"
+    assert disabled_symbol_summary["reason"] == "premium_source_disabled_free_tier"
+    assert disabled_symbol_summary["requestCount"] == 0
+    assert disabled_symbol_summary["capabilityMode"] == "FREE_TIER"
+    assert disabled_symbol_rows == disabled_previous["events"]["symbolChanges"]
+    repeated_disabled_summary, repeated_disabled_rows = (
+        _fetch_finnhub_symbol_change_coverage(
+            disabled_finnhub_session,
+            api_key="fixture-key",
+            coverage_start=datetime.date(2021, 7, 20),
+            coverage_end=datetime.date(2026, 7, 21),
+            retrieved_at="2026-07-21T11:00:00Z",
+            previous_coverage=disabled_previous,
+            premium_enabled=False,
+        )
+    )
+    assert repeated_disabled_summary == disabled_symbol_summary
+    assert repeated_disabled_rows == disabled_symbol_rows
+    assert disabled_finnhub_session.request_count == 0
 
     class _BlockedFinnhubSession:
         def get(self, *_args, **_kwargs):
@@ -701,11 +775,47 @@ def main() -> int:
             coverage_end=datetime.date(2026, 7, 21),
             retrieved_at="2026-07-21T11:00:00Z",
             previous_coverage={},
+            premium_enabled=True,
         )
     )
     assert blocked_symbol_summary["status"] == "BLOCKED_EXTERNAL_SOURCE_CONTRACT"
     assert blocked_symbol_summary["reason"] == "entitlement_or_auth_http_403"
     assert blocked_symbol_rows == []
+
+    class _StatusFinnhubSession:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.request_count = 0
+
+        def get(self, *_args, **_kwargs):
+            self.request_count += 1
+            return _FixtureResponse(status_code=self.status_code, payload={})
+
+    rate_limited_session = _StatusFinnhubSession(429)
+    rate_limited_summary, _ = _fetch_finnhub_symbol_change_coverage(
+        rate_limited_session,
+        api_key="fixture-key",
+        coverage_start=datetime.date(2021, 7, 20),
+        coverage_end=datetime.date(2026, 7, 21),
+        retrieved_at="2026-07-21T11:00:00Z",
+        previous_coverage={},
+        premium_enabled=True,
+    )
+    assert rate_limited_session.request_count == 3
+    assert rate_limited_summary["status"] == "UNVERIFIED_SOURCE_RESPONSE"
+    assert rate_limited_summary["reason"] == "http_429"
+
+    server_error_summary, _ = _fetch_finnhub_symbol_change_coverage(
+        _StatusFinnhubSession(503),
+        api_key="fixture-key",
+        coverage_start=datetime.date(2021, 7, 20),
+        coverage_end=datetime.date(2026, 7, 21),
+        retrieved_at="2026-07-21T11:00:00Z",
+        previous_coverage={},
+        premium_enabled=True,
+    )
+    assert server_error_summary["status"] == "UNVERIFIED_SOURCE_RESPONSE"
+    assert server_error_summary["reason"] == "http_503"
 
     class _TimeoutFinnhubSession:
         def get(self, *_args, **_kwargs):
@@ -729,6 +839,7 @@ def main() -> int:
                     ]
                 }
             },
+            premium_enabled=True,
         )
     )
     assert timeout_symbol_summary["status"] == "UNVERIFIED_SOURCE_RESPONSE"
