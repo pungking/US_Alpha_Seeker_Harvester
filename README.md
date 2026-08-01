@@ -129,7 +129,10 @@ Current source chain:
   coverage unverified. A reviewed paid entitlement must explicitly enable the
   source; successful responses must still pass the existing window, row-limit,
   schema, and hash checks.
-- FMP Delisted Companies for delisting events and coverage.
+- FMP Delisted Companies is also disabled by default in free-tier mode.
+  `FMP_DELISTED_PREMIUM_ENABLED=false` prevents repeated paid-endpoint probes,
+  preserves prior positive events, and leaves historical delisting no-event
+  coverage unverified.
 - Nasdaq Trader official current-halt RSS plus the documented one-year halt
   search for H4/H9/H10/H11/M1/T6/T12 regulatory, listing, corporate-action, or
   extended halt evidence. The current feed catches unresolved halts older than
@@ -161,6 +164,17 @@ Compatibility/migration note: this is an additive extension of
 older rows without the request-proof envelope remain valid historical
 artifacts but are not eligible for OOS comparison. Consumers must not backfill
 the new proof fields or upgrade legacy rows by inference.
+
+`prospective-corporate-action-surveillance-v1` is an additive free-source
+contract stored under the existing mapping refresh audit. It records an
+activation hash and one deterministic observation per completed market
+session. Complete Nasdaq Trader listing snapshots provide prospective exact
+symbol continuity for symbol-change/delisting no-event checks; the official
+current halt feed provides prospective suspension evidence. A removed symbol,
+source gap, partial response, stale response, or active suspension remains
+unverified for that decision-to-horizon window. This contract never upgrades
+historical five-year evidence and never turns a missing source into a verified
+no-event result.
 
 Runtime audit artifacts:
 

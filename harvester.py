@@ -217,6 +217,9 @@ HARVESTER_EXTERNAL_CORPORATE_ACTION_ENABLED = _read_bool_env(
 FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED = _read_bool_env(
     "FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED", False
 )
+FMP_DELISTED_PREMIUM_ENABLED = _read_bool_env(
+    "FMP_DELISTED_PREMIUM_ENABLED", False
+)
 HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS = _read_positive_int_env(
     "HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS", 5
 )
@@ -830,6 +833,9 @@ EXCHANGE_CODE_LABELS = {
 }
 
 EXTERNAL_CORPORATE_ACTION_SCHEMA_VERSION = "external-corporate-action-coverage-v1"
+PROSPECTIVE_CORPORATE_ACTION_SURVEILLANCE_SCHEMA_VERSION = (
+    "prospective-corporate-action-surveillance-v1"
+)
 FINNHUB_SYMBOL_CHANGE_ENDPOINT = "https://finnhub.io/api/v1/ca/symbol-change"
 FMP_DELISTED_ENDPOINT = "https://financialmodelingprep.com/stable/delisted-companies"
 NASDAQ_HALT_SEARCH_PAGE = "https://www.nasdaqtrader.com/Trader.aspx?id=TradingHaltSearch"
@@ -1646,6 +1652,10 @@ def fetch_authoritative_listing_rows():
                     "status": "ok",
                     "rowCount": len(parsed_rows),
                     "sourceCreationTime": creation_time,
+                    "responseSha256": hashlib.sha256(response.content).hexdigest(),
+                    "partialResponse": False,
+                    "paginationComplete": True,
+                    "sourceScopeComplete": True,
                 }
             )
         except Exception as e:
@@ -1665,6 +1675,351 @@ def _previous_external_coverage(previous_audit) -> dict:
         return {}
     coverage = previous_audit.get("externalCorporateActionCoverage")
     return coverage if isinstance(coverage, dict) else {}
+
+
+def _free_source_status(source: dict) -> str:
+    status = str(source.get("status") or "").upper()
+    reason = str(source.get("reason") or "").lower()
+    if reason == "premium_source_disabled_free_tier":
+        return "FREE_DISABLED_PREMIUM"
+    if status == "SUCCESS":
+        return (
+            "FREE_READY"
+            if source.get("partialResponse") is False
+            and source.get("sourceScopeComplete") is True
+            and source.get("paginationComplete") is True
+            else "FREE_PARTIAL"
+        )
+    if "429" in reason or "rate_limit" in reason:
+        return "FREE_RATE_LIMITED"
+    return "FREE_SOURCE_CONTRACT_UNAVAILABLE"
+
+
+def _historical_free_source_status(source: dict) -> str:
+    status = _free_source_status(source)
+    if (
+        status == "FREE_READY"
+        and source.get("requestedCoverageStart")
+        and source.get("coverageStart")
+        and str(source["coverageStart"]) > str(source["requestedCoverageStart"])
+    ):
+        return "FREE_PARTIAL"
+    return status
+
+
+def build_free_source_prospective_surveillance(
+    *,
+    mapping: dict,
+    added_symbols: list[str],
+    removed_symbols: list[str],
+    source_summaries: list[dict],
+    external_coverage: dict,
+    generated_at: str,
+    session_date: str,
+    previous_surveillance: dict | None = None,
+    activation_commit: str | None = None,
+) -> dict:
+    """Record free-source session evidence without upgrading historical lineage."""
+    previous = (
+        previous_surveillance
+        if isinstance(previous_surveillance, dict)
+        and previous_surveillance.get("schemaVersion")
+        == PROSPECTIVE_CORPORATE_ACTION_SURVEILLANCE_SCHEMA_VERSION
+        else {}
+    )
+    expected_listing_sources = {spec["name"] for spec in LISTING_SOURCE_SPECS}
+    listing_sources = {
+        str(row.get("name") or ""): row
+        for row in source_summaries
+        if isinstance(row, dict)
+    }
+    listing_complete = bool(
+        expected_listing_sources
+        and expected_listing_sources.issubset(listing_sources)
+        and all(
+            listing_sources[name].get("status") == "ok"
+            and int(listing_sources[name].get("rowCount") or 0) > 0
+            and listing_sources[name].get("partialResponse") is False
+            and listing_sources[name].get("paginationComplete") is True
+            and listing_sources[name].get("sourceScopeComplete") is True
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(listing_sources[name].get("responseSha256") or "").lower(),
+            )
+            for name in expected_listing_sources
+        )
+    )
+    sources = (
+        external_coverage.get("sources")
+        if isinstance(external_coverage.get("sources"), dict)
+        else {}
+    )
+    symbol_source = sources.get("symbolChange") or {}
+    delisting_source = sources.get("delisting") or {}
+    suspension_source = sources.get("suspension") or {}
+    suspension_prospective_ready = _free_source_status(suspension_source) == "FREE_READY"
+    prospective_listing_status = "FREE_READY" if listing_complete else "FREE_PARTIAL"
+    capability_matrix = {
+        "symbolChange": {
+            "historicalFullLookback": _historical_free_source_status(symbol_source),
+            "prospectiveDecisionToHorizon": prospective_listing_status,
+            "source": "NASDAQ_TRADER_ACTIVE_LISTING_CONTINUITY",
+            "evidenceMode": "CONTINUOUS_EXACT_SYMBOL_PRESENCE",
+        },
+        "delisting": {
+            "historicalFullLookback": _historical_free_source_status(delisting_source),
+            "prospectiveDecisionToHorizon": prospective_listing_status,
+            "source": "NASDAQ_TRADER_ACTIVE_LISTING_CONTINUITY",
+            "evidenceMode": "CONTINUOUS_EXACT_SYMBOL_PRESENCE",
+        },
+        "suspension": {
+            "historicalFullLookback": _historical_free_source_status(suspension_source),
+            "prospectiveDecisionToHorizon": (
+                "FREE_READY" if suspension_prospective_ready else "FREE_PARTIAL"
+            ),
+            "source": str(suspension_source.get("source") or "NASDAQ_TRADER_HALT_CURRENT_FEED"),
+            "evidenceMode": "SESSION_CURRENT_HALT_FEED",
+        },
+        "splitDividendAdjustedOhlcv": {
+            "historicalFullLookback": "FREE_READY",
+            "prospectiveDecisionToHorizon": "FREE_READY",
+            "source": "YFINANCE_AUTO_ADJUSTED_OHLCV",
+            "evidenceMode": "PER_SYMBOL_OHLCV_LINEAGE",
+        },
+    }
+    active_mapping = {
+        str(symbol).strip().upper(): row
+        for symbol, row in mapping.items()
+        if isinstance(symbol, str)
+        and symbol
+        and not symbol.startswith("_")
+        and isinstance(row, dict)
+        and row.get("group")
+    }
+    active_symbols = sorted(active_mapping)
+    suspension_events = (
+        (external_coverage.get("events") or {}).get("suspensions") or []
+    )
+    suspension_source_as_of = _parse_iso_datetime(suspension_source.get("sourceAsOf"))
+    active_suspensions = []
+    for row in suspension_events:
+        if not isinstance(row, dict) or row.get("currentFeedObserved") is not True:
+            continue
+        symbol = _normalize_event_symbol(row.get("symbol"))
+        resumed_at = _parse_iso_datetime(row.get("resumedAt"))
+        if symbol and (
+            resumed_at is None
+            or suspension_source_as_of is None
+            or resumed_at > suspension_source_as_of
+        ):
+            active_suspensions.append(symbol)
+    active_suspensions = sorted(set(active_suspensions))
+    source_scope_complete = bool(listing_complete and suspension_prospective_ready)
+    normalized_added = {
+        str(value).strip().upper() for value in added_symbols if value
+    }
+    normalized_removed = {
+        str(value).strip().upper() for value in removed_symbols if value
+    }
+    prospective_events = {
+        "listingAddedSymbols": sorted(normalized_added),
+        "listingRemovedSymbols": sorted(normalized_removed),
+        "activeSuspensionSymbols": active_suspensions,
+    }
+    normalized_listing_sources = [
+        {
+            key: row.get(key)
+            for key in (
+                "name",
+                "status",
+                "rowCount",
+                "sourceCreationTime",
+                "responseSha256",
+                "partialResponse",
+                "paginationComplete",
+                "sourceScopeComplete",
+            )
+            if row.get(key) is not None
+        }
+        for row in sorted(source_summaries, key=lambda item: str(item.get("name") or ""))
+        if isinstance(row, dict)
+    ]
+    response_sha = _canonical_sha256(
+        {
+            "listingSources": normalized_listing_sources,
+            "externalResponseHashes": {
+                key: (value or {}).get("responseSha256")
+                for key, value in sorted(sources.items())
+            },
+        }
+    )
+    session = {
+        "sessionDate": session_date,
+        "marketTimezone": "America/New_York",
+        "universeSnapshotSha256": _canonical_sha256(active_symbols),
+        "tickerMappingSha256": _canonical_sha256(
+            {
+                symbol: {
+                    "sourceSymbol": active_mapping[symbol].get("sourceSymbol"),
+                    "listingStatus": active_mapping[symbol].get("listingStatus"),
+                    "exchange": active_mapping[symbol].get("exchange"),
+                }
+                for symbol in active_symbols
+            }
+        ),
+        "source": "FREE_SOURCE_PROSPECTIVE_SURVEILLANCE",
+        "sourceAsOf": session_date,
+        "retrievedAt": generated_at,
+        "requestStatus": "SUCCESS" if source_scope_complete else "PARTIAL_OR_UNAVAILABLE",
+        "sourceScopeComplete": source_scope_complete,
+        "paginationComplete": source_scope_complete,
+        "responseSha256": response_sha,
+        "partial": not source_scope_complete,
+        "stale": any(
+            str((value or {}).get("status") or "").upper() == "UNVERIFIED_STALE_SOURCE"
+            for value in sources.values()
+        ),
+        "conflict": bool(
+            normalized_added.intersection(normalized_removed)
+            or any(
+                str((value or {}).get("status") or "").upper()
+                == "UNVERIFIED_SOURCE_CONFLICT"
+                for value in sources.values()
+            )
+        ),
+        "addedSymbols": sorted(normalized_added),
+        "removedSymbols": sorted(normalized_removed),
+        "activeSuspensionSymbols": active_suspensions,
+        "positiveEventCounts": {
+            key: len(value) for key, value in prospective_events.items()
+        },
+        "positiveEventsSha256": _canonical_sha256(prospective_events),
+        "sourceCapabilitySnapshotSha256": _canonical_sha256(capability_matrix),
+    }
+    sessions_by_date = {
+        str(row.get("sessionDate")): dict(row)
+        for row in previous.get("sessions") or []
+        if isinstance(row, dict) and row.get("sessionDate")
+    }
+    sessions_by_date[session_date] = session
+    sessions = [sessions_by_date[key] for key in sorted(sessions_by_date)]
+    activation_at = previous.get("activationAt") or generated_at
+    activation_commit = previous.get("activationCommit") or activation_commit or os.getenv("GITHUB_SHA") or "UNAVAILABLE"
+    activation_artifact = previous.get("activationArtifact") or TICKER_MAPPING_REFRESH_AUDIT_FILENAME
+    activation_sha = previous.get("activationArtifactSha256") or _canonical_sha256(
+        {
+            "activationAt": activation_at,
+            "activationCommit": activation_commit,
+            "activationArtifact": activation_artifact,
+            "sourceCapabilitySnapshot": capability_matrix,
+            "universeSnapshotSha256": session["universeSnapshotSha256"],
+            "tickerMappingSha256": session["tickerMappingSha256"],
+        }
+    )
+    complete_sessions = sum(1 for row in sessions if row.get("sourceScopeComplete") is True)
+    status = (
+        "PROSPECTIVE_ACCUMULATION_PATH_VERIFIED"
+        if session.get("sourceScopeComplete") is True
+        else "FREE_SOURCE_PROSPECTIVE_COVERAGE_INCOMPLETE"
+    )
+    return {
+        "schemaVersion": PROSPECTIVE_CORPORATE_ACTION_SURVEILLANCE_SCHEMA_VERSION,
+        "status": status,
+        "activationAt": activation_at,
+        "activationCommit": activation_commit,
+        "activationArtifact": activation_artifact,
+        "activationArtifactSha256": activation_sha,
+        "freeSourceCapabilityMatrix": capability_matrix,
+        "sessionCount": len(sessions),
+        "completeSessionCount": complete_sessions,
+        "sourceGapSessionCount": len(sessions) - complete_sessions,
+        "latestSessionComplete": session.get("sourceScopeComplete") is True,
+        "sessions": sessions,
+    }
+
+
+def build_prospective_symbol_surveillance(contract: dict, symbol: str) -> dict | None:
+    if (
+        not isinstance(contract, dict)
+        or contract.get("schemaVersion")
+        != PROSPECTIVE_CORPORATE_ACTION_SURVEILLANCE_SCHEMA_VERSION
+    ):
+        return None
+    normalized_symbol = _normalize_event_symbol(symbol)
+    if not normalized_symbol:
+        return None
+    sessions = []
+    for row in contract.get("sessions") or []:
+        if not isinstance(row, dict):
+            continue
+        added = {str(value).strip().upper() for value in row.get("addedSymbols") or []}
+        removed = {str(value).strip().upper() for value in row.get("removedSymbols") or []}
+        suspended = {
+            str(value).strip().upper()
+            for value in row.get("activeSuspensionSymbols") or []
+        }
+        identity_status = (
+            "REMOVED_FROM_ACTIVE_LISTING_REQUIRES_EVENT_EVIDENCE"
+            if normalized_symbol in removed
+            else "ACTIVE_LISTING_OBSERVED_NEW_OR_RESTORED"
+            if normalized_symbol in added
+            else "ACTIVE_LISTING_CONTINUITY_OBSERVED"
+        )
+        sessions.append(
+            {
+                key: row.get(key)
+                for key in (
+                    "sessionDate",
+                    "marketTimezone",
+                    "universeSnapshotSha256",
+                    "tickerMappingSha256",
+                    "source",
+                    "sourceAsOf",
+                    "retrievedAt",
+                    "requestStatus",
+                    "sourceScopeComplete",
+                    "paginationComplete",
+                    "responseSha256",
+                    "positiveEventsSha256",
+                    "partial",
+                    "stale",
+                    "conflict",
+                    "sourceCapabilitySnapshotSha256",
+                )
+            }
+        )
+        sessions[-1].update(
+            {
+                "symbolObserved": bool(
+                    row.get("sourceScopeComplete") is True
+                    and normalized_symbol not in removed
+                ),
+                "identityStatus": identity_status,
+                "suspensionStatus": (
+                    "ACTIVE_SUSPENSION_OBSERVED"
+                    if normalized_symbol in suspended
+                    else "NO_ACTIVE_SUSPENSION_IN_COMPLETE_SESSION"
+                    if row.get("sourceScopeComplete") is True
+                    else "UNVERIFIED_SESSION_SOURCE_GAP"
+                ),
+            }
+        )
+    return {
+        key: json.loads(json.dumps(contract.get(key), sort_keys=True))
+        for key in (
+            "schemaVersion",
+            "status",
+            "activationAt",
+            "activationCommit",
+            "activationArtifact",
+            "activationArtifactSha256",
+            "freeSourceCapabilityMatrix",
+            "sessionCount",
+            "completeSessionCount",
+            "sourceGapSessionCount",
+            "latestSessionComplete",
+        )
+    } | {"symbol": normalized_symbol, "sessions": sessions}
 
 
 def _merge_external_events(previous_rows, current_rows, key_fields) -> list[dict]:
@@ -1859,6 +2214,7 @@ def _fetch_finnhub_symbol_change_coverage(
             "coverageEnd": coverage_end.isoformat(),
             "partialResponse": False,
             "paginationComplete": True,
+            "sourceScopeComplete": True,
             "responseSha256": _canonical_sha256(
                 {"responseHashes": response_hashes, "events": rows}
             ),
@@ -1879,7 +2235,26 @@ def _fetch_fmp_delisting_coverage(
     coverage_end,
     retrieved_at,
     previous_coverage,
+    premium_enabled=None,
 ) -> tuple[dict, list[dict]]:
+    previous_rows = previous_coverage.get("events", {}).get("delistings", [])
+    premium_enabled = (
+        FMP_DELISTED_PREMIUM_ENABLED
+        if premium_enabled is None
+        else bool(premium_enabled)
+    )
+    if not premium_enabled:
+        return (
+            _source_failure(
+                "FMP_DELISTED_COMPANIES",
+                "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                "premium_source_disabled_free_tier",
+                retrieved_at=retrieved_at,
+                requestCount=0,
+                capabilityMode="FREE_TIER",
+            ),
+            previous_rows,
+        )
     if not api_key:
         return (
             _source_failure(
@@ -1888,7 +2263,7 @@ def _fetch_fmp_delisting_coverage(
                 "credential_missing",
                 retrieved_at=retrieved_at,
             ),
-            previous_coverage.get("events", {}).get("delistings", []),
+            previous_rows,
         )
     page_hashes = []
     fetched_rows = []
@@ -1977,6 +2352,8 @@ def _fetch_fmp_delisting_coverage(
         "coverageStart": coverage_start.isoformat(),
         "coverageEnd": coverage_end.isoformat(),
         "partialResponse": not completed,
+        "paginationComplete": completed,
+        "sourceScopeComplete": completed,
         "responseSha256": response_sha,
         "queryScope": "US_DELISTED_COMPANIES_ALL",
         "requestCount": len(page_hashes),
@@ -2262,6 +2639,8 @@ def _fetch_nasdaq_suspension_coverage(
             "coverageStart": history_coverage_start.isoformat(),
             "coverageEnd": coverage_end.isoformat(),
             "partialResponse": False,
+            "paginationComplete": True,
+            "sourceScopeComplete": True,
             "responseSha256": response_sha,
             "queryScope": (
                 "CURRENT_ALL_CODES_PLUS_LAST_YEAR_REGULATORY_EXTENDED_"
@@ -2404,10 +2783,17 @@ def _refresh_dispatch_external_corporate_action_coverage(
                 return coverage
         elif symbol_source.get("reason") == "premium_source_disabled_free_tier":
             return coverage
-    return fetch_external_corporate_action_coverage(
+    refreshed = fetch_external_corporate_action_coverage(
         active_symbols,
         previous_coverage=coverage,
     )
+    if coverage.get("prospectiveSurveillance") and not refreshed.get(
+        "prospectiveSurveillance"
+    ):
+        refreshed["prospectiveSurveillance"] = coverage[
+            "prospectiveSurveillance"
+        ]
+    return refreshed
 
 
 def refresh_ticker_mapping_from_authoritative_sources(
@@ -2505,6 +2891,19 @@ def refresh_ticker_mapping_from_authoritative_sources(
         refreshed_map,
         external_coverage,
     )
+    external_coverage = dict(external_coverage)
+    external_coverage["prospectiveSurveillance"] = (
+        build_free_source_prospective_surveillance(
+            mapping=refreshed_map,
+            added_symbols=added_symbols,
+            removed_symbols=removed_symbols,
+            source_summaries=source_summaries,
+            external_coverage=external_coverage,
+            generated_at=now_utc,
+            session_date=get_expected_market_date_str(),
+            previous_surveillance=previous_external.get("prospectiveSurveillance"),
+        )
+    )
     external_sources = external_coverage.get("sources") or {}
     refreshed_map["_meta"] = {
         "schemaVersion": 2,
@@ -2532,6 +2931,9 @@ def refresh_ticker_mapping_from_authoritative_sources(
                 for key, value in external_sources.items()
             },
             "applicationSummary": external_application_summary,
+            "prospectiveSurveillance": external_coverage.get(
+                "prospectiveSurveillance"
+            ),
         },
     }
 
@@ -3746,6 +4148,11 @@ def build_corporate_action_lineage(
         "symbolChangeEvidence": _normalized_external_evidence(listing_evidence.get("symbolChangeEvidence")),
         "delistingEvidence": _normalized_external_evidence(listing_evidence.get("delistingEvidence")),
         "suspensionEvidence": _normalized_external_evidence(listing_evidence.get("suspensionEvidence")),
+        "prospectiveSurveillance": (
+            json.loads(json.dumps(listing_evidence.get("prospectiveSurveillance"), sort_keys=True))
+            if isinstance(listing_evidence.get("prospectiveSurveillance"), dict)
+            else None
+        ),
         "sourceFreshnessStatus": source_freshness_status,
         "historyCoverageStatus": history_coverage_status,
         "survivorshipBiasStatus": "UNVERIFIED_INCOMPLETE_CORPORATE_ACTION_COVERAGE",
@@ -3826,6 +4233,10 @@ def refresh_corporate_action_lineage_evidence(
         )
         if isinstance(evidence, dict) and _parse_iso_datetime(evidence.get("retrievedAt")):
             evaluation_times.append(evidence["retrievedAt"])
+    if isinstance(listing_evidence.get("prospectiveSurveillance"), dict):
+        lineage["prospectiveSurveillance"] = json.loads(
+            json.dumps(listing_evidence["prospectiveSurveillance"], sort_keys=True)
+        )
     if evaluation_times:
         latest = max(
             evaluation_times,
@@ -3890,6 +4301,7 @@ def build_corporate_action_runtime_audit(
             "activeSymbolCount",
             "sources",
             "summary",
+            "prospectiveSurveillance",
         )
         if external_source_coverage.get(key) is not None
     }
@@ -4985,6 +5397,14 @@ def run_harvester():
                             listing_evidence["listingSourceAsOf"] = (
                                 listing_evidence.get("lastMappedAt") or mapping_meta.get("generatedAt")
                             )
+                            prospective_surveillance = build_prospective_symbol_surveillance(
+                                external_source_coverage.get("prospectiveSurveillance") or {},
+                                st,
+                            )
+                            if prospective_surveillance:
+                                listing_evidence["prospectiveSurveillance"] = (
+                                    prospective_surveillance
+                                )
                             sync_status = sync_ohlcv_incremental(
                                 st,
                                 ohlcv_dir_id,
@@ -5943,6 +6363,18 @@ def run_harvester():
         )
         summary_payload["corporateActionExternalApplication"] = (
             mapping_refresh_audit.get("externalCorporateActionApplication") or {}
+        )
+        prospective_surveillance = external_coverage.get(
+            "prospectiveSurveillance"
+        ) or {}
+        summary_payload["corporateActionProspectiveStatus"] = (
+            prospective_surveillance.get("status")
+        )
+        summary_payload["corporateActionProspectiveSessionCount"] = (
+            prospective_surveillance.get("sessionCount", 0)
+        )
+        summary_payload["corporateActionProspectiveSourceGapSessionCount"] = (
+            prospective_surveillance.get("sourceGapSessionCount", 0)
         )
         summary_payload["corporateActionLineageAuditPath"] = (
             HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH
