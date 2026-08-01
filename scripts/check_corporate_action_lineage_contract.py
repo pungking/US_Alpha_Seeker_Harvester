@@ -22,6 +22,8 @@ from harvester import (  # noqa: E402
     _parse_nasdaq_halt_rows,
     _refresh_dispatch_external_corporate_action_coverage,
     apply_external_corporate_action_coverage,
+    build_free_source_prospective_surveillance,
+    build_prospective_symbol_surveillance,
     build_corporate_action_lineage,
     build_corporate_action_runtime_audit,
     build_mapping_corporate_action_runtime_audit,
@@ -48,6 +50,7 @@ def _evidence_for_symbol(base: dict, symbol: str) -> dict:
 
 def main() -> int:
     assert harvester_module.FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED is False
+    assert harvester_module.FMP_DELISTED_PREMIUM_ENABLED is False
     fixture = json.loads(
         Path("fixtures/corporate_action_lineage_contract.json").read_text(encoding="utf-8")
     )
@@ -748,6 +751,125 @@ def main() -> int:
     assert disabled_symbol_summary["requestCount"] == 0
     assert disabled_symbol_summary["capabilityMode"] == "FREE_TIER"
     assert disabled_symbol_rows == disabled_previous["events"]["symbolChanges"]
+
+    source_hash = "a" * 64
+    complete_listing_sources = [
+        {
+            "name": "nasdaqtrader_nasdaqlisted",
+            "status": "ok",
+            "rowCount": 1,
+            "responseSha256": source_hash,
+            "partialResponse": False,
+            "paginationComplete": True,
+            "sourceScopeComplete": True,
+        },
+        {
+            "name": "nasdaqtrader_otherlisted",
+            "status": "ok",
+            "rowCount": 1,
+            "responseSha256": "b" * 64,
+            "partialResponse": False,
+            "paginationComplete": True,
+            "sourceScopeComplete": True,
+        },
+    ]
+    free_tier_coverage = {
+        "sources": {
+            "symbolChange": disabled_symbol_summary,
+            "delisting": {
+                "source": "FMP_DELISTED_COMPANIES",
+                "status": "BLOCKED_EXTERNAL_SOURCE_CONTRACT",
+                "reason": "entitlement_or_auth_http_402",
+            },
+            "suspension": {
+                "source": "NASDAQ_TRADER_HALT_HISTORY_AND_CURRENT_FEED",
+                "status": "SUCCESS",
+                "retrievedAt": "2026-07-21T22:00:00Z",
+                "sourceAsOf": "2026-07-21T21:59:00Z",
+                "coverageStart": "2025-07-21",
+                "coverageEnd": "2026-07-21",
+                "partialResponse": False,
+                "paginationComplete": True,
+                "sourceScopeComplete": True,
+                "responseSha256": "c" * 64,
+                "currentFeedRows": 0,
+            },
+        },
+        "events": {"symbolChanges": [], "delistings": [], "suspensions": []},
+    }
+    prospective = build_free_source_prospective_surveillance(
+        mapping={"SYNTH": {"group": "S"}, "OTHER": {"group": "O"}},
+        added_symbols=["SYNTH"],
+        removed_symbols=[],
+        source_summaries=complete_listing_sources,
+        external_coverage=free_tier_coverage,
+        generated_at="2026-07-21T22:00:00Z",
+        session_date="2026-07-21",
+        activation_commit="fixture-commit",
+    )
+    assert prospective["schemaVersion"] == "prospective-corporate-action-surveillance-v1"
+    assert prospective["status"] == "PROSPECTIVE_ACCUMULATION_PATH_VERIFIED"
+    assert prospective["activationAt"] == "2026-07-21T22:00:00Z"
+    assert prospective["activationCommit"] == "fixture-commit"
+    assert len(prospective["activationArtifactSha256"]) == 64
+    assert prospective["freeSourceCapabilityMatrix"]["symbolChange"] == {
+        "historicalFullLookback": "FREE_DISABLED_PREMIUM",
+        "prospectiveDecisionToHorizon": "FREE_READY",
+        "source": "NASDAQ_TRADER_ACTIVE_LISTING_CONTINUITY",
+        "evidenceMode": "CONTINUOUS_EXACT_SYMBOL_PRESENCE",
+    }
+    assert prospective["freeSourceCapabilityMatrix"]["delisting"]["prospectiveDecisionToHorizon"] == "FREE_READY"
+    assert prospective["freeSourceCapabilityMatrix"]["suspension"]["prospectiveDecisionToHorizon"] == "FREE_READY"
+    assert prospective["sessions"][0]["sourceScopeComplete"] is True
+    assert prospective["sessions"][0]["paginationComplete"] is True
+    assert prospective["sessions"][0]["addedSymbols"] == ["SYNTH"]
+    assert prospective["sessions"][0]["removedSymbols"] == []
+    symbol_surveillance = build_prospective_symbol_surveillance(prospective, "SYNTH")
+    assert symbol_surveillance["symbol"] == "SYNTH"
+    assert symbol_surveillance["sessions"][0]["identityStatus"] == "ACTIVE_LISTING_OBSERVED_NEW_OR_RESTORED"
+    assert "addedSymbols" not in symbol_surveillance["sessions"][0]
+    prospective_lineage = build_corporate_action_lineage(
+        frame,
+        record_symbol="SYNTH",
+        source_symbol="SYNTH",
+        requested_period=fixture["period"],
+        retrieved_at=fixture["retrievedAt"],
+        listing_evidence={
+            **fixture["verifiedListingEvidence"],
+            "prospectiveSurveillance": symbol_surveillance,
+        },
+        observation_count=fixture["observationCount"],
+    )
+    assert prospective_lineage["prospectiveSurveillance"] == symbol_surveillance
+
+    repeated = build_free_source_prospective_surveillance(
+        mapping={"SYNTH": {"group": "S"}, "OTHER": {"group": "O"}},
+        added_symbols=["SYNTH"],
+        removed_symbols=[],
+        source_summaries=complete_listing_sources,
+        external_coverage=free_tier_coverage,
+        generated_at="2026-07-21T22:00:00Z",
+        session_date="2026-07-21",
+        previous_surveillance=prospective,
+        activation_commit="fixture-commit",
+    )
+    assert repeated == prospective
+    assert len(repeated["sessions"]) == 1
+
+    incomplete = build_free_source_prospective_surveillance(
+        mapping={"SYNTH": {"group": "S"}},
+        added_symbols=[],
+        removed_symbols=["OTHER"],
+        source_summaries=complete_listing_sources[:-1],
+        external_coverage=free_tier_coverage,
+        generated_at="2026-07-22T22:00:00Z",
+        session_date="2026-07-22",
+        previous_surveillance=prospective,
+        activation_commit="fixture-commit",
+    )
+    assert incomplete["status"] == "FREE_SOURCE_PROSPECTIVE_COVERAGE_INCOMPLETE"
+    assert incomplete["sessions"][-1]["sourceScopeComplete"] is False
+    assert incomplete["sessions"][-1]["removedSymbols"] == ["OTHER"]
     repeated_disabled_summary, repeated_disabled_rows = (
         _fetch_finnhub_symbol_change_coverage(
             disabled_finnhub_session,
@@ -859,6 +981,7 @@ def main() -> int:
         coverage_end=datetime.date(2026, 7, 21),
         retrieved_at="2026-07-21T11:00:00Z",
         previous_coverage={},
+        premium_enabled=True,
     )
     assert fmp_summary["status"] == "SUCCESS"
     assert fmp_summary["partialResponse"] is False
@@ -876,6 +999,7 @@ def main() -> int:
         coverage_end=datetime.date(2026, 7, 21),
         retrieved_at="2026-07-21T11:00:00Z",
         previous_coverage={},
+        premium_enabled=True,
     )
     assert malformed_fmp_summary["status"] == "UNVERIFIED_SOURCE_RESPONSE"
     assert malformed_fmp_summary["reason"] == "response_schema_invalid"
@@ -906,6 +1030,7 @@ def main() -> int:
         coverage_end=datetime.date(2026, 7, 21),
         retrieved_at="2026-07-21T11:00:00Z",
         previous_coverage=partial_previous,
+        premium_enabled=True,
     )
     assert restarted_summary["status"] == "SUCCESS"
     assert restarted_rows == delisted_rows
@@ -941,6 +1066,7 @@ def main() -> int:
                     ]
                 }
             },
+            premium_enabled=True,
         )
     finally:
         harvester_module.HARVESTER_FMP_DELISTED_MAX_PAGES = original_page_cap
@@ -953,6 +1079,31 @@ def main() -> int:
             "eventEffectiveAt": "2024-01-15",
         }
     ]
+
+    class _NoRequestFmpSession:
+        def __init__(self):
+            self.request_count = 0
+
+        def get(self, *_args, **_kwargs):
+            self.request_count += 1
+            raise AssertionError("free-tier mode must not call the paid delisting endpoint")
+
+    no_request_fmp = _NoRequestFmpSession()
+    disabled_fmp_summary, disabled_fmp_rows = _fetch_fmp_delisting_coverage(
+        no_request_fmp,
+        api_key="fixture-key",
+        coverage_start=datetime.date(2021, 7, 20),
+        coverage_end=datetime.date(2026, 7, 21),
+        retrieved_at="2026-07-21T11:00:00Z",
+        previous_coverage={"events": {"delistings": delisted_rows}},
+        premium_enabled=False,
+    )
+    assert no_request_fmp.request_count == 0
+    assert disabled_fmp_summary["status"] == "BLOCKED_EXTERNAL_SOURCE_CONTRACT"
+    assert disabled_fmp_summary["reason"] == "premium_source_disabled_free_tier"
+    assert disabled_fmp_summary["requestCount"] == 0
+    assert disabled_fmp_summary["capabilityMode"] == "FREE_TIER"
+    assert disabled_fmp_rows == delisted_rows
 
     class _NasdaqSession:
         def __init__(self, *, rss_text=None, mutate_history_rows=None):
@@ -1371,12 +1522,23 @@ def main() -> int:
                     "analysisEligible": True,
                 }
             },
-            [{"name": "fixture_directory", "status": "ok", "rowCount": 1}],
+            [
+                {
+                    "name": spec["name"],
+                    "status": "ok",
+                    "rowCount": 1,
+                    "responseSha256": str(index + 1) * 64,
+                    "partialResponse": False,
+                    "paginationComplete": True,
+                    "sourceScopeComplete": True,
+                }
+                for index, spec in enumerate(harvester_module.LISTING_SOURCE_SPECS)
+            ],
         )
         harvester_module.fetch_external_corporate_action_coverage = (
             lambda *_args, **_kwargs: coverage
         )
-        refreshed_mapping, _ = harvester_module.refresh_ticker_mapping_from_authoritative_sources(
+        refreshed_mapping, refreshed_mapping_audit = harvester_module.refresh_ticker_mapping_from_authoritative_sources(
             {"SYNTH": {"group": "S", **fixture["verifiedListingEvidence"]}},
             "2026-07-21",
         )
@@ -1389,6 +1551,16 @@ def main() -> int:
     )
     assert refreshed_mapping["SYNTH"]["delistingEvidence"]["status"] == "VERIFIED_NOT_DELISTED_AS_OF_SOURCE"
     assert refreshed_mapping["SYNTH"]["suspensionEvidence"]["status"] == "VERIFIED_NOT_SUSPENDED_AS_OF_SOURCE"
+    assert (
+        refreshed_mapping_audit["externalCorporateActionCoverage"]
+        ["prospectiveSurveillance"]["schemaVersion"]
+        == "prospective-corporate-action-surveillance-v1"
+    )
+    assert (
+        refreshed_mapping["_meta"]["externalCorporateActionCoverage"]
+        ["prospectiveSurveillance"]["activationArtifact"]
+        == "TICKER_MAPPING_REFRESH_AUDIT.json"
+    )
 
     daily_audit = build_mapping_corporate_action_runtime_audit(
         refreshed_mapping,
@@ -1476,6 +1648,7 @@ def main() -> int:
     workflow = Path(".github/workflows/main.yml").read_text(encoding="utf-8")
     assert "python scripts/check_corporate_action_lineage_contract.py" in workflow
     assert "HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH" in workflow
+    assert "FMP_DELISTED_PREMIUM_ENABLED: 'false'" in workflow
     assert "state/corporate-action-lineage-runtime-audit.json" in workflow
     harvester_source = Path("harvester.py").read_text(encoding="utf-8")
     assert '"CONTRACT_READY_OOS_VERIFIED"' in harvester_source
