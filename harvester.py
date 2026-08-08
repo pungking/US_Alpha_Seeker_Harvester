@@ -24,6 +24,10 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
 from scripts.target_lineage import build_target_lineage, build_target_lineage_runtime_audit
+from scripts.toss_read_only_capability import (
+    SCHEMA_VERSION as TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
+    probe_toss_read_only_capability,
+)
 
 # 로그 실시간 출력 설정
 # 항상 line buffering을 켜서 GitHub Actions/터미널에 진행 로그가 즉시 보이게 한다.
@@ -67,6 +71,10 @@ HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH = (
 HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH = (
     os.getenv("HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH")
     or "state/corporate-action-lineage-runtime-audit.json"
+).strip()
+HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH = (
+    os.getenv("HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH")
+    or "state/toss-read-only-capability.json"
 ).strip()
 
 # Raw-first policy:
@@ -180,6 +188,8 @@ HARVESTER_MAPPING_FRESHNESS_AUDIT_FILENAME = "HARVESTER_MAPPING_FRESHNESS_AUDIT.
 TICKER_MAPPING_REFRESH_AUDIT_FILENAME = "TICKER_MAPPING_REFRESH_AUDIT.json"
 FMP_API_KEY = os.getenv("FMP_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_KEY") or os.getenv("FINNHUB_API_KEY")
+TOSS_CLIENT_ID = os.getenv("TOSS_CLIENT_ID")
+TOSS_CLIENT_SECRET = os.getenv("TOSS_CLIENT_SECRET")
 
 
 def _read_bool_env(name, default=False):
@@ -219,6 +229,9 @@ FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED = _read_bool_env(
 )
 FMP_DELISTED_PREMIUM_ENABLED = _read_bool_env(
     "FMP_DELISTED_PREMIUM_ENABLED", False
+)
+TOSS_READ_ONLY_CAPABILITY_PROBE_ENABLED = _read_bool_env(
+    "TOSS_READ_ONLY_CAPABILITY_PROBE_ENABLED", False
 )
 HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS = _read_positive_int_env(
     "HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS", 5
@@ -635,6 +648,98 @@ def upload_json(filename, data, parent_id):
         f"Drive 업로드 최종 실패(upload_json:{filename}, parent={parent_id}) "
         f"after {DRIVE_RETRY_ATTEMPTS} attempts: {type(last_error).__name__ if last_error else 'Unknown'}: {last_error}"
     )
+
+
+TOSS_READ_ONLY_CAPABILITY_FILENAME = "TOSS_READ_ONLY_CAPABILITY.json"
+
+
+def ensure_toss_read_only_capability_once(sys_id, candidate_symbols, session=None):
+    existing_id = find_file_id(TOSS_READ_ONLY_CAPABILITY_FILENAME, sys_id)
+    existing = download_json(existing_id) if existing_id else None
+    if (
+        isinstance(existing, dict)
+        and existing.get("schemaVersion") == TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION
+        and existing.get("oneShotReservedAt")
+    ):
+        reused = dict(existing)
+        reused["runtimeAction"] = "REUSED_ONE_SHOT_RESULT"
+        reused["thisRunRequestCounts"] = {"oauth": 0, "marketData": 0}
+        write_json_report(
+            HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH,
+            reused,
+            "Toss read-only capability reused",
+        )
+        return reused
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    symbols = sorted(
+        {
+            str(symbol).strip().upper()
+            for symbol in candidate_symbols
+            if isinstance(symbol, str) and str(symbol).strip()
+        }
+    )
+    reservation = {
+        "schemaVersion": TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
+        "probeStatus": "TOSS_TRANSIENT_FAILURE",
+        "reason": "one_shot_reserved_before_network",
+        "oneShotReservedAt": now_utc,
+        "source": "TOSS_OPEN_API_CANDLES",
+        "capabilityMode": "READ_ONLY_MARKET_DATA",
+        "shadowProviderEnabled": False,
+        "requestCounts": {"oauth": 0, "marketData": 0},
+        "thisRunRequestCounts": {"oauth": 0, "marketData": 0},
+        "accountHeaderUsed": False,
+        "orderEndpointUsed": False,
+    }
+    write_json_report(
+        HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH,
+        reservation,
+        "Toss read-only capability reservation",
+    )
+    upload_json(TOSS_READ_ONLY_CAPABILITY_FILENAME, reservation, sys_id)
+
+    if not TOSS_CLIENT_ID or not TOSS_CLIENT_SECRET:
+        result = {
+            **reservation,
+            "probeStatus": "TOSS_AUTH_OR_ENTITLEMENT_BLOCKED",
+            "reason": "server_side_credentials_missing",
+            "safeErrorCategory": "credentials_missing",
+        }
+    elif not symbols:
+        result = {
+            **reservation,
+            "probeStatus": "TOSS_RESPONSE_CONTRACT_INVALID",
+            "reason": "no_dynamic_common_stock_probe_symbol",
+            "safeErrorCategory": "probe_symbol_missing",
+        }
+    else:
+        result = probe_toss_read_only_capability(
+            session or requests.Session(),
+            client_id=TOSS_CLIENT_ID,
+            client_secret=TOSS_CLIENT_SECRET,
+            symbol=symbols[0],
+            retrieved_at=now_utc,
+        )
+        result.update(
+            {
+                "oneShotReservedAt": now_utc,
+                "capabilityMode": "READ_ONLY_MARKET_DATA",
+                "shadowProviderEnabled": False,
+                "reason": result.get("safeErrorCategory") or "capability_contract_pass",
+            }
+        )
+        result["thisRunRequestCounts"] = dict(result.get("requestCounts") or {})
+
+    write_json_report(
+        HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH,
+        result,
+        "Toss read-only capability result",
+    )
+    upload_json(TOSS_READ_ONLY_CAPABILITY_FILENAME, result, sys_id)
+    return result
 
 def summarize_key_coverage(records, keys):
     total = len(records)
@@ -5310,6 +5415,7 @@ def run_harvester():
     daily_batch_mode = DAILY_BATCH_MODE or "auto"
     daily_target_count = 0
     daily_corporate_action_audit = {}
+    toss_read_only_capability = {"runtimeAction": "NOT_ENABLED"}
     corporate_action_runtime_audit_written = False
     mapping_refresh_audit = {"status": "not_run"}
 
@@ -5704,6 +5810,11 @@ def run_harvester():
             and ((t[0].upper() in target_chars) or (not t[0].isalpha() and "0123456789" in target_chars))
         }
         daily_target_count = len(filtered_tickers)
+        if TOSS_READ_ONLY_CAPABILITY_PROBE_ENABLED:
+            toss_read_only_capability = ensure_toss_read_only_capability_once(
+                sys_id,
+                filtered_tickers.keys(),
+            )
         daily_corporate_action_audit = build_mapping_corporate_action_runtime_audit(
             full_map,
             expected_symbols=list(filtered_tickers),
@@ -6393,6 +6504,7 @@ def run_harvester():
         summary_payload["mappingFreshnessActionCounts"] = mapping_audit.get("actionCounts", {})
         summary_payload["targetLineageRuntimeAuditPath"] = HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH
         summary_payload["targetLineageRuntime"] = target_lineage_runtime
+        summary_payload["tossReadOnlyCapability"] = toss_read_only_capability
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
         write_harvester_run_summary(summary_payload)
 

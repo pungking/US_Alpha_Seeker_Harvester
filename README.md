@@ -181,3 +181,11 @@ Runtime audit artifacts:
 - `state/ticker-mapping-refresh-audit.json`
 - `state/corporate-action-lineage-runtime-audit.json`
 - `System_Identity_Maps/CORPORATE_ACTION_LINEAGE_RUNTIME_AUDIT.json`
+
+## Toss read-only capability probe
+
+The scheduled Harvester reserves `System_Identity_Maps/TOSS_READ_ONLY_CAPABILITY.json`
+before making at most one OAuth request and one adjusted daily-candle request.
+Later runs reuse that result with zero Toss requests. The probe never sends
+`X-Tossinvest-Account`, never calls account/order endpoints, redacts the selected
+symbol to a SHA-256, and does not replace the canonical Google Drive OHLCV source.
