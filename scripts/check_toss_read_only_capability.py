@@ -54,6 +54,7 @@ def main() -> int:
     assert "TOSS_CLIENT_SECRET: ${{ secrets.TOSS_CLIENT_SECRET }}" in workflow_source
     assert "X-Tossinvest-Account" not in capability_source
     assert "/api/v1/orders" not in capability_source
+    assert "oauth_ip_not_allowed" not in capability_source
 
     success = _Session(
         _Response(
@@ -114,7 +115,17 @@ def main() -> int:
     assert "secret-token" not in serialized_result
     assert "client-secret" not in serialized_result
 
-    blocked = _Session(_Response(403, {"error": "access_denied"}))
+    blocked = _Session(
+        _Response(
+            403,
+            {
+                "error": {
+                    "code": "edge-blocked",
+                    "message": "request blocked",
+                }
+            },
+        )
+    )
     blocked_result = probe_toss_read_only_capability(
         blocked,
         client_id="client-id",
@@ -123,9 +134,30 @@ def main() -> int:
         retrieved_at="2026-08-08T00:00:00Z",
     )
     assert blocked_result["probeStatus"] == "TOSS_AUTH_OR_ENTITLEMENT_BLOCKED"
-    assert blocked_result["safeErrorCategory"] == "oauth_ip_not_allowed"
+    assert blocked_result["safeErrorCategory"] == "oauth_http_403"
+    assert blocked_result["oauthErrorCode"] == "edge-blocked"
     assert blocked_result["requestCounts"] == {"oauth": 1, "marketData": 0}
     assert len(blocked.get_calls) == 0
+    assert "request blocked" not in json.dumps(blocked_result, sort_keys=True)
+
+    unauthorized = _Session(
+        _Response(
+            401,
+            {"error": {"code": "invalid-token", "message": "token rejected"}},
+        )
+    )
+    unauthorized_result = probe_toss_read_only_capability(
+        unauthorized,
+        client_id="client-id",
+        client_secret="client-secret",
+        symbol="SYNTH",
+        retrieved_at="2026-08-08T00:00:00Z",
+    )
+    assert unauthorized_result["probeStatus"] == "TOSS_AUTH_OR_ENTITLEMENT_BLOCKED"
+    assert unauthorized_result["safeErrorCategory"] == "oauth_http_401"
+    assert unauthorized_result["oauthErrorCode"] == "invalid-token"
+    assert unauthorized_result["requestCounts"] == {"oauth": 1, "marketData": 0}
+    assert "token rejected" not in json.dumps(unauthorized_result, sort_keys=True)
 
     limited = _Session(
         _Response(
