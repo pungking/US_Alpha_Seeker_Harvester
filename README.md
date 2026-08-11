@@ -253,6 +253,15 @@ artifact field. The existing top-level `requestScopeSha256` keeps its legacy
 symbols-plus-calendar semantics; `requestLineage.requestScopeSha256` is the
 symbols-only scope hash used to reconcile Stage3 and provider batches.
 
+Toss symbol adaptation is provider-only and preserves the canonical Stage3
+universe. A US class-share symbol ending in a single hyphenated class letter is
+requested from Toss with the equivalent dot separator, then mapped back to the
+canonical symbol before the SHADOW artifact is built. The request lineage keeps
+separate canonical and provider scope hashes, stores provider symbols only as
+SHA-256 evidence, and blocks before network access if two canonical symbols
+would collide after adaptation. This additive mapping does not authorize Toss
+eligibility, canonical-source replacement, or any Stage6 policy impact.
+
 Before another registered-Mac one-shot, operators should confirm the macOS
 `timed` service, timezone, and network-time configuration without changing the
 clock. A running daemon alone does not prove offset accuracy. If the exact

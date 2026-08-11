@@ -683,6 +683,61 @@ def main() -> int:
     assert "SYNTH" not in json.dumps(partial_lineage, sort_keys=True)
     assert "RENAMED" not in json.dumps(partial_lineage, sort_keys=True)
 
+    alias_session = _Session(
+        prices=lambda symbols, _: _Response(
+            200,
+            {
+                "result": [
+                    _price_row(symbols[0].replace("-", "."))
+                ]
+            },
+            headers=RATE_HEADERS,
+        )
+    )
+    alias_result = _collect(alias_session, ["CLASS-A"])
+    assert alias_result["status"] == "TOSS_SHADOW_PASS"
+    assert alias_result["summary"]["matchedRows"] == 1
+    assert alias_result["summary"]["missingRows"] == 0
+    assert alias_result["prices"][0]["symbol"] == "CLASS-A"
+    assert alias_session.get_calls[-1][1]["params"]["symbols"] == "CLASS.A"
+    alias_lineage = alias_result["requestLineage"]
+    assert alias_lineage["providerSymbolMappingStatus"] == (
+        "VERIFIED_DOT_HYPHEN_ALIAS"
+    )
+    assert alias_lineage["providerMappedRows"] == 1
+    assert alias_lineage["providerRequestScopeSha256"] == (
+        _symbol_scope_sha256(["CLASS.A"])
+    )
+    assert alias_lineage["batches"][0]["batchRequestScopeSha256"] == (
+        _symbol_scope_sha256(["CLASS-A"])
+    )
+    assert alias_lineage["batches"][0]["batchProviderRequestScopeSha256"] == (
+        _symbol_scope_sha256(["CLASS.A"])
+    )
+    assert alias_lineage["batches"][0]["batchReturnedScopeSha256"] == (
+        _symbol_scope_sha256(["CLASS.A"])
+    )
+    assert alias_lineage["batches"][0]["batchCanonicalReturnedScopeSha256"] == (
+        _symbol_scope_sha256(["CLASS-A"])
+    )
+    assert alias_lineage["batches"][0]["missingSymbolSha256"] == []
+    assert "CLASS-A" not in json.dumps(alias_lineage, sort_keys=True)
+    assert "CLASS.A" not in json.dumps(alias_lineage, sort_keys=True)
+
+    collision_session = _Session()
+    collision_mapping = _collect(collision_session, ["CLASS-A", "CLASS.A"])
+    assert collision_mapping["status"] == "TOSS_SHADOW_SCHEMA_INVALID"
+    assert collision_mapping["safeErrorCategory"] == (
+        "provider_symbol_mapping_collision"
+    )
+    assert collision_mapping["requestCounts"] == {
+        "oauth": 0,
+        "marketCalendar": 0,
+        "prices": 0,
+    }
+    assert collision_session.post_calls == []
+    assert collision_session.get_calls == []
+
     mixed_clock_and_partial = _collect(
         _Session(
             prices=lambda symbols, _: _Response(
@@ -833,6 +888,28 @@ def main() -> int:
     assert "canonical analysis continued=true" in sent[0]
     assert "HTTP: `4xx`" in sent[0]
     assert "SYNTH" not in sent[0]
+
+    partial_alert_messages: list[str] = []
+
+    def partial_delivered(message: str, *, channel: str) -> dict[str, Any]:
+        assert channel == "alert"
+        partial_alert_messages.append(message)
+        return {"attempted": True, "delivered": True, "safeErrorCategory": None}
+
+    partial_alert = dispatch_toss_shadow_alert(
+        partial,
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=partial_delivered,
+    )
+    assert partial_alert["status"] == "ALERT_DELIVERED"
+    assert len(partial_alert_messages) == 1
+    assert "verify hashed missing-symbol lineage and provider symbol mapping" in (
+        partial_alert_messages[0]
+    )
+    assert "registered egress, credentials, rate limit" not in (
+        partial_alert_messages[0]
+    )
 
     duplicate = dispatch_toss_shadow_alert(
         blocked,
