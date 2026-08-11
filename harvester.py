@@ -18,6 +18,7 @@ from collections import Counter
 from html.parser import HTMLParser
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
+from typing import Any, Callable, Iterable, Mapping
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -27,6 +28,13 @@ from scripts.target_lineage import build_target_lineage, build_target_lineage_ru
 from scripts.toss_read_only_capability import (
     SCHEMA_VERSION as TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
     probe_toss_read_only_capability,
+)
+from scripts.toss_shadow_market_data import (
+    SCHEMA_VERSION as TOSS_SHADOW_MARKET_DATA_SCHEMA_VERSION,
+    build_toss_shadow_blocked_result,
+    collect_toss_shadow_market_data,
+    dispatch_toss_shadow_alert,
+    toss_shadow_runtime_decision,
 )
 
 # 로그 실시간 출력 설정
@@ -75,6 +83,10 @@ HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH = (
 HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH = (
     os.getenv("HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH")
     or "state/toss-read-only-capability.json"
+).strip()
+HARVESTER_TOSS_SHADOW_PATH = (
+    os.getenv("HARVESTER_TOSS_SHADOW_PATH")
+    or "state/toss-market-data-shadow.json"
 ).strip()
 
 # Raw-first policy:
@@ -233,6 +245,13 @@ FMP_DELISTED_PREMIUM_ENABLED = _read_bool_env(
 TOSS_READ_ONLY_CAPABILITY_PROBE_ENABLED = _read_bool_env(
     "TOSS_READ_ONLY_CAPABILITY_PROBE_ENABLED", False
 )
+TOSS_SHADOW_PROVIDER_ENABLED = _read_bool_env(
+    "TOSS_SHADOW_PROVIDER_ENABLED", False
+)
+TOSS_SHADOW_MAX_PRICE_REQUESTS = _read_positive_int_env(
+    "TOSS_SHADOW_MAX_PRICE_REQUESTS", 2
+)
+TOSS_SHADOW_MAX_PRICE_REQUESTS = min(TOSS_SHADOW_MAX_PRICE_REQUESTS, 2)
 HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS = _read_positive_int_env(
     "HARVESTER_EXTERNAL_CORPORATE_ACTION_COVERAGE_YEARS", 5
 )
@@ -498,20 +517,73 @@ def _resolve_telegram_chat_id(channel="ops"):
     return TELEGRAM_SIMULATION_CHAT_ID
 
 
-def send_telegram(message, channel="ops"):
+def send_telegram(
+    message: str,
+    channel: str = "ops",
+    session: Any | None = None,
+) -> dict[str, Any]:
     chat_id = _resolve_telegram_chat_id(channel)
     if not TELEGRAM_TOKEN or not chat_id:
         print(f"ℹ️ Telegram skip: token/chat missing (channel={channel})", flush=True)
-        return
+        return {
+            "attempted": False,
+            "delivered": False,
+            "safeErrorCategory": "config_missing",
+        }
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    chat_mask = f"{str(chat_id)[:3]}***{str(chat_id)[-3:]}" if len(str(chat_id)) >= 7 else str(chat_id)
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        print(f"📨 Telegram sent (channel={channel}, chat={chat_mask})", flush=True)
-    except requests.RequestException as e:
-        print(f"⚠️ Telegram 알림 실패 (channel={channel}, chat={chat_mask}): {type(e).__name__}: {e}", flush=True)
+        response = (session or requests).post(url, json=payload, timeout=10)
+    except Exception as exc:
+        safe_category = type(exc).__name__
+        print(
+            f"⚠️ Telegram delivery failed (channel={channel}, category={safe_category})",
+            flush=True,
+        )
+        return {
+            "attempted": True,
+            "delivered": False,
+            "safeErrorCategory": safe_category,
+        }
+
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if not 200 <= status_code < 300:
+        safe_category = (
+            f"http_{status_code // 100}xx"
+            if 100 <= status_code <= 599
+            else "http_status_invalid"
+        )
+        print(
+            f"⚠️ Telegram delivery failed (channel={channel}, category={safe_category})",
+            flush=True,
+        )
+        return {
+            "attempted": True,
+            "delivered": False,
+            "safeErrorCategory": safe_category,
+        }
+
+    try:
+        body = response.json()
+    except (TypeError, ValueError):
+        body = None
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        print(
+            f"⚠️ Telegram delivery failed (channel={channel}, category=response_contract_invalid)",
+            flush=True,
+        )
+        return {
+            "attempted": True,
+            "delivered": False,
+            "safeErrorCategory": "response_contract_invalid",
+        }
+
+    print(f"📨 Telegram delivered (channel={channel})", flush=True)
+    return {
+        "attempted": True,
+        "delivered": True,
+        "safeErrorCategory": None,
+    }
 
 # --- [2. 드라이브 유틸리티] ---
 def find_file_id(name, parent_id=None):
@@ -651,6 +723,7 @@ def upload_json(filename, data, parent_id):
 
 
 TOSS_READ_ONLY_CAPABILITY_FILENAME = "TOSS_READ_ONLY_CAPABILITY.json"
+TOSS_MARKET_DATA_SHADOW_FILENAME = "TOSS_MARKET_DATA_SHADOW.json"
 
 
 def ensure_toss_read_only_capability_once(sys_id, candidate_symbols, session=None):
@@ -739,6 +812,157 @@ def ensure_toss_read_only_capability_once(sys_id, candidate_symbols, session=Non
         "Toss read-only capability result",
     )
     upload_json(TOSS_READ_ONLY_CAPABILITY_FILENAME, result, sys_id)
+    return result
+
+
+def _toss_shadow_not_run_result(reason: str) -> dict[str, Any]:
+    return {
+        "schemaVersion": TOSS_SHADOW_MARKET_DATA_SCHEMA_VERSION,
+        "status": "NOT_RUN",
+        "mode": "SHADOW_ONLY",
+        "provider": "TOSS_OPEN_API",
+        "priceSemantics": "LATEST_QUOTE_NOT_HISTORICAL_ADJUSTED_CANDLE",
+        "adjustedPriceSemantics": "NOT_APPLICABLE_TO_PRICES_ENDPOINT",
+        "runtimeAction": "NOT_RUN",
+        "runtimeReason": reason,
+        "requestCounts": {"oauth": 0, "marketCalendar": 0, "prices": 0},
+        "eligible": False,
+        "tossEvidenceExcluded": True,
+        "analysisContinued": True,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "accountHeaderUsed": False,
+        "orderEndpointUsed": False,
+        "alertDelivery": {
+            "status": "ALERT_NOT_REQUIRED",
+            "alertType": None,
+            "alertFingerprint": None,
+            "safeErrorCategory": None,
+        },
+    }
+
+
+def load_latest_stage3_shadow_symbols(root_id: str) -> list[str]:
+    stage3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
+    if not stage3_folder_id:
+        return []
+    query = (
+        f"'{stage3_folder_id}' in parents and "
+        "name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
+    )
+    files = drive_service.files().list(
+        q=query,
+        fields="files(id, name)",
+        orderBy="createdTime desc",
+        pageSize=1,
+    ).execute().get("files", [])
+    if not files:
+        return []
+    payload = download_json(files[0].get("id"))
+    if isinstance(payload, dict):
+        rows = payload.get("fundamental_universe") or payload.get("stocks") or []
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        rows = []
+    return sorted(
+        {
+            str(row.get("symbol") or "").strip().upper()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("symbol") or "").strip()
+        }
+    )
+
+
+def ensure_toss_shadow_market_data(
+    sys_id: str,
+    candidate_symbols: Iterable[str],
+    session: Any | None = None,
+    alert_sender: Callable[..., Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    enabled, runtime_reason = toss_shadow_runtime_decision(os.environ)
+    if not enabled:
+        return _toss_shadow_not_run_result(runtime_reason)
+
+    previous_id = find_file_id(TOSS_MARKET_DATA_SHADOW_FILENAME, sys_id)
+    previous = download_json(previous_id) if previous_id else None
+    previous_status = (
+        str(previous.get("status") or "").strip() if isinstance(previous, dict) else None
+    ) or None
+
+    capability_id = find_file_id(TOSS_READ_ONLY_CAPABILITY_FILENAME, sys_id)
+    capability = download_json(capability_id) if capability_id else None
+    capability_payload = capability if isinstance(capability, dict) else {}
+    capability_sha256 = _canonical_sha256(capability_payload)
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+
+    if capability_payload.get("probeStatus") != "TOSS_READ_ONLY_CAPABILITY_PASS":
+        result = build_toss_shadow_blocked_result(
+            status="TOSS_SHADOW_AUTH_OR_NETWORK_BLOCKED",
+            safe_error_category="phase1_capability_not_pass",
+            capability_artifact_sha256=capability_sha256,
+            retrieved_at=now_utc,
+        )
+    elif not TOSS_CLIENT_ID or not TOSS_CLIENT_SECRET:
+        result = build_toss_shadow_blocked_result(
+            status="TOSS_SHADOW_AUTH_OR_NETWORK_BLOCKED",
+            safe_error_category="server_side_credentials_missing",
+            capability_artifact_sha256=capability_sha256,
+            retrieved_at=now_utc,
+        )
+    else:
+        calendar_date = datetime.datetime.now(
+            ZoneInfo("America/New_York")
+        ).date().isoformat()
+        result = collect_toss_shadow_market_data(
+            session or requests.Session(),
+            client_id=TOSS_CLIENT_ID,
+            client_secret=TOSS_CLIENT_SECRET,
+            symbols=list(candidate_symbols),
+            retrieved_at=now_utc,
+            calendar_date=calendar_date,
+            capability_artifact_sha256=capability_sha256,
+            max_price_requests=TOSS_SHADOW_MAX_PRICE_REQUESTS,
+        )
+        result["runtimeAction"] = "COLLECTED_REGISTERED_MAC_SHADOW"
+
+    result["runtimeReason"] = runtime_reason
+    result["capabilityArtifact"] = {
+        "file": TOSS_READ_ONLY_CAPABILITY_FILENAME,
+        "schemaVersion": capability_payload.get("schemaVersion"),
+        "probeStatus": capability_payload.get("probeStatus"),
+        "sha256": capability_sha256,
+        "hashBasis": "CANONICAL_JSON",
+    }
+    result["alertDelivery"] = dispatch_toss_shadow_alert(
+        result,
+        previous_status=previous_status,
+        sent_fingerprints=set(),
+        sender=alert_sender or send_telegram,
+    )
+    result["artifactPersistenceStatus"] = "LOCAL_AND_DRIVE_COMPLETE"
+    write_json_report(
+        HARVESTER_TOSS_SHADOW_PATH,
+        result,
+        "Toss market-data shadow",
+    )
+    try:
+        upload_json(TOSS_MARKET_DATA_SHADOW_FILENAME, result, sys_id)
+    except Exception as exc:
+        result["artifactPersistenceStatus"] = "LOCAL_ONLY_DRIVE_FAILED"
+        result["artifactPersistenceErrorCategory"] = type(exc).__name__
+        write_json_report(
+            HARVESTER_TOSS_SHADOW_PATH,
+            result,
+            "Toss market-data shadow fail-open",
+        )
+        print(
+            "⚠️ Toss SHADOW Drive persistence failed; canonical analysis continues "
+            f"(category={type(exc).__name__})",
+            flush=True,
+        )
     return result
 
 def summarize_key_coverage(records, keys):
@@ -5416,6 +5640,9 @@ def run_harvester():
     daily_target_count = 0
     daily_corporate_action_audit = {}
     toss_read_only_capability = {"runtimeAction": "NOT_ENABLED"}
+    toss_market_data_shadow = _toss_shadow_not_run_result(
+        "shadow_provider_not_evaluated"
+    )
     corporate_action_runtime_audit_written = False
     mapping_refresh_audit = {"status": "not_run"}
 
@@ -5731,6 +5958,7 @@ def run_harvester():
                 "successCount": total_success,
                 "errorCount": total_error,
                 "durationMinutes": round(duration, 2),
+                "tossMarketDataShadow": toss_market_data_shadow,
             }
             failure_report = build_harvester_failure_report(summary_payload)
             write_harvester_failure_report(failure_report)
@@ -5815,6 +6043,55 @@ def run_harvester():
                 sys_id,
                 filtered_tickers.keys(),
             )
+        if TOSS_SHADOW_PROVIDER_ENABLED:
+            try:
+                toss_shadow_symbols = load_latest_stage3_shadow_symbols(root_id)
+                toss_market_data_shadow = ensure_toss_shadow_market_data(
+                    sys_id,
+                    toss_shadow_symbols,
+                )
+            except Exception as exc:
+                toss_market_data_shadow = build_toss_shadow_blocked_result(
+                    status="TOSS_SHADOW_TRANSIENT_FAILURE",
+                    safe_error_category=f"producer_{type(exc).__name__}",
+                    capability_artifact_sha256="0" * 64,
+                    retrieved_at=datetime.datetime.now(datetime.timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                )
+                toss_market_data_shadow["runtimeAction"] = (
+                    "PRODUCER_EXCEPTION_FAIL_OPEN"
+                )
+                toss_market_data_shadow["runtimeReason"] = (
+                    "producer_exception_fail_open"
+                )
+                toss_market_data_shadow["alertDelivery"] = (
+                    dispatch_toss_shadow_alert(
+                        toss_market_data_shadow,
+                        previous_status=None,
+                        sent_fingerprints=set(),
+                        sender=send_telegram,
+                    )
+                )
+                try:
+                    write_json_report(
+                        HARVESTER_TOSS_SHADOW_PATH,
+                        toss_market_data_shadow,
+                        "Toss market-data shadow producer failure",
+                    )
+                except Exception as write_exc:
+                    toss_market_data_shadow["artifactPersistenceStatus"] = (
+                        "LOCAL_WRITE_FAILED"
+                    )
+                    toss_market_data_shadow["artifactPersistenceErrorCategory"] = (
+                        type(write_exc).__name__
+                    )
+                print(
+                    "⚠️ Toss SHADOW producer failed; canonical analysis continues "
+                    f"(category={type(exc).__name__})",
+                    flush=True,
+                )
         daily_corporate_action_audit = build_mapping_corporate_action_runtime_audit(
             full_map,
             expected_symbols=list(filtered_tickers),
@@ -6505,12 +6782,16 @@ def run_harvester():
         summary_payload["targetLineageRuntimeAuditPath"] = HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH
         summary_payload["targetLineageRuntime"] = target_lineage_runtime
         summary_payload["tossReadOnlyCapability"] = toss_read_only_capability
+        summary_payload["tossMarketDataShadow"] = toss_market_data_shadow
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
         write_harvester_run_summary(summary_payload)
 
     except Exception as e:
         record_symbol_failure("RUN", "fatal", "RUN_FATAL", f"{type(e).__name__}: {e}")
-        send_telegram(f"🚨 *에러 발생:* `{str(e)}` ", channel="alert")
+        send_telegram(
+            f"🚨 *Harvester error:* `{type(e).__name__}`",
+            channel="alert",
+        )
         if not corporate_action_runtime_audit_written:
             failure_audit = build_corporate_action_runtime_audit(
                 [],
@@ -6547,6 +6828,7 @@ def run_harvester():
             "durationMinutes": round(duration, 2),
             "errorType": type(e).__name__,
             "errorMessage": str(e),
+            "tossMarketDataShadow": toss_market_data_shadow,
         }
         failure_report = build_harvester_failure_report(summary_payload)
         write_harvester_failure_report(failure_report)

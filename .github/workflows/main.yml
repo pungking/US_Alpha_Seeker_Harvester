@@ -60,6 +60,8 @@ jobs:
         run: python scripts/check_corporate_action_lineage_contract.py
       - name: Toss read-only capability contract
         run: python scripts/check_toss_read_only_capability.py
+      - name: Toss Phase2a shadow market-data contract
+        run: python scripts/check_toss_shadow_market_data.py
         
       - name: Run Master Harvester
         env:
@@ -77,6 +79,10 @@ jobs:
           FMP_DELISTED_PREMIUM_ENABLED: 'false'
           # One-shot Drive reservation prevents repeat OAuth/market-data probes.
           TOSS_READ_ONLY_CAPABILITY_PROBE_ENABLED: 'true'
+          # GitHub-hosted egress is not registered with Toss. Phase2a remains Mac-only.
+          TOSS_SHADOW_PROVIDER_ENABLED: 'false'
+          TOSS_SHADOW_REGISTERED_EGRESS_CONFIRMED: 'false'
+          TOSS_SHADOW_MAX_PRICE_REQUESTS: '2'
           
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           # Harvester collection notifications must go to simulation/private channel.
@@ -94,6 +100,7 @@ jobs:
           HARVESTER_TARGET_LINEAGE_RUNTIME_AUDIT_PATH: state/target-lineage-runtime-audit.json
           HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH: state/corporate-action-lineage-runtime-audit.json
           HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH: state/toss-read-only-capability.json
+          HARVESTER_TOSS_SHADOW_PATH: state/toss-market-data-shadow.json
         run: |
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
@@ -126,6 +133,7 @@ jobs:
             state/target-lineage-runtime-audit.json
             state/corporate-action-lineage-runtime-audit.json
             state/toss-read-only-capability.json
+            state/toss-market-data-shadow.json
             state/symbol-agnostic-runtime-check.json
             state/symbol-agnostic-runtime-check.md
             state/telegram-routing-policy-audit.*

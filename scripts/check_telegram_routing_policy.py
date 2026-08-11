@@ -18,6 +18,12 @@ def add(check_id: str, status: str, detail: str) -> None:
 
 workflow = read(".github/workflows/main.yml")
 harvester = read("harvester.py")
+send_telegram_match = re.search(
+    r"def send_telegram\(.*?\n(?=# --- \[2\. 드라이브 유틸리티\] ---)",
+    harvester,
+    flags=re.DOTALL,
+)
+send_telegram_source = send_telegram_match.group(0) if send_telegram_match else ""
 
 add(
     "workflow_no_primary_chat_fallback",
@@ -38,6 +44,33 @@ add(
     "harvester_alert_no_primary_fallback",
     "PASS" if not re.search(r"TELEGRAM_ALERT_CHAT_ID\s+or\s+TELEGRAM_CHAT_ID", harvester) else "FAIL",
     "Harvester errors may use alert then simulation, but never primary.",
+)
+add(
+    "telegram_receipt_contract",
+    "PASS"
+    if send_telegram_source
+    and "response.json()" in send_telegram_source
+    and "body.get(\"ok\") is not True" in send_telegram_source
+    and '"delivered": True' in send_telegram_source
+    else "FAIL",
+    "Delivery succeeds only after both HTTP success and Telegram ok=true.",
+)
+add(
+    "telegram_safe_error_logging",
+    "PASS"
+    if send_telegram_source
+    and "chat_mask" not in send_telegram_source
+    and not re.search(r"\{(?:e|exc)\}", send_telegram_source)
+    else "FAIL",
+    "Telegram logs must not include chat identifiers or exception text containing the bot URL.",
+)
+add(
+    "toss_shadow_uses_alert_route",
+    "PASS"
+    if "dispatch_toss_shadow_alert" in harvester
+    and 'sender=send_telegram' in harvester
+    else "FAIL",
+    "Toss SHADOW failures must reuse the aggregate alert route.",
 )
 
 fail = sum(1 for check in checks if check["status"] == "FAIL")
