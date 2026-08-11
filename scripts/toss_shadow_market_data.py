@@ -131,6 +131,49 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _symbol_scope_sha256(symbols: list[str]) -> str:
+    encoded = "\n".join(sorted(set(symbols))).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sanitize_request_source_artifact(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    file_name = value.get("file")
+    sha256 = value.get("sha256")
+    hash_basis = value.get("hashBasis")
+    generated_at = value.get("generatedAt")
+    generated_at_source = value.get("generatedAtSource")
+    request_scope_sha256 = value.get("requestScopeSha256")
+    if (
+        not isinstance(file_name, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", file_name)
+        or not file_name.startswith("STAGE3_FUNDAMENTAL_FULL_")
+        or not isinstance(sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+        or hash_basis not in {"CANONICAL_JSON", "RAW_BYTES"}
+        or (generated_at is not None and _parse_timestamp(generated_at) is None)
+        or generated_at_source not in {
+            None,
+            "ARTIFACT_FIELD",
+            "GOOGLE_DRIVE_CREATED_TIME",
+        }
+        or not isinstance(request_scope_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", request_scope_sha256)
+    ):
+        return None
+    safe = {
+        "file": file_name,
+        "sha256": sha256,
+        "hashBasis": hash_basis,
+        "generatedAt": generated_at,
+        "requestScopeSha256": request_scope_sha256,
+    }
+    if generated_at_source is not None:
+        safe["generatedAtSource"] = generated_at_source
+    return safe
+
+
 def _rate_limit_evidence(response: _Response) -> dict[str, Any]:
     headers = {
         str(key).lower(): str(value)
@@ -288,6 +331,12 @@ def _base_result(
         "requestScopeSha256": _canonical_sha256(
             {"symbols": symbols, "calendarDate": calendar_date}
         ),
+        "requestLineage": {
+            "status": "REQUEST_SCOPE_LINEAGE_INCOMPLETE",
+            "requestSourceArtifact": None,
+            "requestScopeSha256": _symbol_scope_sha256(symbols),
+            "batches": [],
+        },
         "collectionStartedAt": retrieved_at,
         "retrievedAt": retrieved_at,
         "responseReceivedAt": {
@@ -488,6 +537,7 @@ def collect_toss_shadow_market_data(
     retrieved_at: str,
     calendar_date: str,
     capability_artifact_sha256: str,
+    request_source_artifact: Mapping[str, Any] | None = None,
     max_price_requests: int = 2,
     clock: Callable[[], datetime.datetime] | None = None,
     monotonic_clock: Callable[[], float] | None = None,
@@ -499,9 +549,26 @@ def collect_toss_shadow_market_data(
         calendar_date=calendar_date,
         capability_artifact_sha256=capability_artifact_sha256,
     )
+    safe_request_source = _sanitize_request_source_artifact(
+        request_source_artifact
+    )
+    request_scope_matches = (
+        safe_request_source is not None
+        and safe_request_source.get("requestScopeSha256")
+        == result["requestLineage"]["requestScopeSha256"]
+    )
+    if request_scope_matches:
+        result["requestLineage"].update(
+            {
+                "status": "VERIFIED_STAGE3_REQUEST_SCOPE",
+                "requestSourceArtifact": safe_request_source,
+            }
+        )
     retrieved_timestamp = _parse_timestamp(retrieved_at)
     if (
         not normalized_symbols
+        or safe_request_source is None
+        or not request_scope_matches
         or retrieved_timestamp is None
         or _parse_date(calendar_date) is None
         or not re.fullmatch(r"[0-9a-f]{64}", capability_artifact_sha256)
@@ -512,7 +579,13 @@ def collect_toss_shadow_market_data(
         return _mark_failure(
             result,
             status="TOSS_SHADOW_SCHEMA_INVALID",
-            category="request_contract_invalid",
+            category=(
+                "request_source_lineage_invalid"
+                if safe_request_source is None
+                else "request_scope_hash_mismatch"
+                if not request_scope_matches
+                else "request_contract_invalid"
+            ),
             endpoint_group="LOCAL_CONTRACT",
         )
 
@@ -739,6 +812,15 @@ def collect_toss_shadow_market_data(
 
     for offset in range(0, len(normalized_symbols), MAX_SYMBOLS_PER_PRICE_REQUEST):
         batch = normalized_symbols[offset : offset + MAX_SYMBOLS_PER_PRICE_REQUEST]
+        batch_lineage = {
+            "batchIndex": offset // MAX_SYMBOLS_PER_PRICE_REQUEST,
+            "requestedCount": len(batch),
+            "returnedCount": 0,
+            "batchRequestScopeSha256": _symbol_scope_sha256(batch),
+            "batchReturnedScopeSha256": None,
+            "missingSymbolSha256": [],
+        }
+        result["requestLineage"]["batches"].append(batch_lineage)
         price_timing = begin_request()
         if price_timing is None:
             return _mark_failure(
@@ -796,6 +878,7 @@ def collect_toss_shadow_market_data(
         if isinstance(local_to_http_offset, int):
             local_to_http_offsets_ms.append(local_to_http_offset)
         batch_payload_timestamps: list[datetime.datetime] = []
+        batch_returned_symbols: set[str] = set()
         batch_payload_to_local_offsets_ms: list[int] = []
         batch_payload_to_http_offsets_ms: list[int] = []
         price_status = int(getattr(price_response, "status_code", 0) or 0)
@@ -839,6 +922,7 @@ def collect_toss_shadow_market_data(
                 duplicate_rows += 1
                 continue
             returned_symbols.add(symbol)
+            batch_returned_symbols.add(symbol)
             price = _decimal(row.get("lastPrice"))
             currency = row.get("currency")
             if price is None or price <= 0 or not isinstance(currency, str):
@@ -906,6 +990,20 @@ def collect_toss_shadow_market_data(
             }
             seen[symbol] = safe_row
             source_timestamps.append((timestamp, row["timestamp"]))
+
+        batch_missing_symbols = sorted(set(batch).difference(batch_returned_symbols))
+        batch_lineage.update(
+            {
+                "returnedCount": len(batch_returned_symbols),
+                "batchReturnedScopeSha256": _symbol_scope_sha256(
+                    sorted(batch_returned_symbols)
+                ),
+                "missingSymbolSha256": [
+                    hashlib.sha256(symbol.encode("utf-8")).hexdigest()
+                    for symbol in batch_missing_symbols
+                ],
+            }
+        )
 
         price_clock_evidence.update(
             {
