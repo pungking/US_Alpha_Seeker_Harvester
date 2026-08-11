@@ -218,3 +218,11 @@ failure opens a run-level circuit breaker, excludes all Toss evidence for that
 run, sends at most one aggregate alert through the existing alert route, and
 lets canonical collection continue. Alert failures are recorded safely and do
 not trigger recursive alerts.
+
+The official `PriceResponse.timestamp` field is nullable. Phase2a therefore
+does not combine every unusable row into a generic stale/future bucket: safe
+aggregate diagnostics distinguish missing timestamps, timestamps after local
+response receipt, dates outside the verified market-calendar window, and
+symbols omitted from the response. Any of those conditions still excludes the
+entire Toss contribution for the run; the diagnostics do not add clock-skew
+tolerance or weaken evidence eligibility.
