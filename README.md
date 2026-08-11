@@ -242,6 +242,17 @@ source semantics are unchanged. The root-cause counts distinguish local receipt
 behind a valid server reference, payload ahead of both references, missing or
 invalid HTTP `Date`, nullable payload timestamps, and partial symbol responses.
 
+The additive `requestLineage` envelope binds each Toss request to the selected
+Stage3 file, canonical artifact hash, source time, deterministic request-scope
+hash, and per-batch requested/returned scope hashes. Missing provider rows are
+stored only as individual SHA-256 values; raw symbols remain absent from public
+artifacts. A partial response still excludes the entire Toss contribution. When
+Stage3 has no embedded generation timestamp, `generatedAtSource` explicitly
+identifies the Google Drive creation time rather than presenting it as an
+artifact field. The existing top-level `requestScopeSha256` keeps its legacy
+symbols-plus-calendar semantics; `requestLineage.requestScopeSha256` is the
+symbols-only scope hash used to reconcile Stage3 and provider batches.
+
 Before another registered-Mac one-shot, operators should confirm the macOS
 `timed` service, timezone, and network-time configuration without changing the
 clock. A running daemon alone does not prove offset accuracy. If the exact

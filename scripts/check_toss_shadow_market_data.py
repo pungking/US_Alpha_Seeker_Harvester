@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -24,6 +25,24 @@ RATE_HEADERS = {
 }
 RETRIEVED_AT = "2026-08-12T00:00:00Z"
 CAPABILITY_SHA = "a" * 64
+REQUEST_SOURCE_ARTIFACT_BASE = {
+    "file": "STAGE3_FUNDAMENTAL_FULL_FIXTURE.json",
+    "sha256": "b" * 64,
+    "hashBasis": "CANONICAL_JSON",
+    "generatedAt": "2026-08-11T23:59:00Z",
+}
+
+
+def _symbol_scope_sha256(symbols: list[str]) -> str:
+    normalized = sorted({symbol.strip().upper() for symbol in symbols})
+    return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
+
+
+def _request_source_artifact(symbols: list[str]) -> dict[str, Any]:
+    return {
+        **REQUEST_SOURCE_ARTIFACT_BASE,
+        "requestScopeSha256": _symbol_scope_sha256(symbols),
+    }
 
 
 class _Response:
@@ -151,14 +170,16 @@ class _Session:
 
 
 def _collect(session: _Session, symbols: list[str] | None = None) -> dict[str, Any]:
+    requested_symbols = symbols or ["SYNTH"]
     return collect_toss_shadow_market_data(
         session,
         client_id="client-id",
         client_secret="client-secret",
-        symbols=symbols or ["SYNTH"],
+        symbols=requested_symbols,
         retrieved_at=RETRIEVED_AT,
         calendar_date="2026-08-11",
         capability_artifact_sha256=CAPABILITY_SHA,
+        request_source_artifact=_request_source_artifact(requested_symbols),
         max_price_requests=2,
         clock=lambda: datetime.datetime.fromisoformat(
             "2026-08-12T00:00:01+00:00"
@@ -190,6 +211,8 @@ def main() -> int:
     assert "TOSS_MARKET_DATA_SHADOW.json" in harvester_source
     assert "ensure_toss_shadow_market_data" in harvester_source
     assert "load_latest_stage3_shadow_symbols" in harvester_source
+    assert "load_latest_stage3_shadow_scope" in harvester_source
+    assert "request_source_artifact" in harvester_source
     assert "TOSS_SHADOW_PROVIDER_ENABLED: 'false'" in workflow_source
     assert "TOSS_SHADOW_REGISTERED_EGRESS_CONFIRMED: 'false'" in workflow_source
     assert "state/toss-market-data-shadow.json" in workflow_source
@@ -212,12 +235,80 @@ def main() -> int:
     assert capability_blocked["eligible"] is False
     assert capability_blocked["analysisContinued"] is True
 
-    symbols = [f"S{index:03d}" for index in range(201)]
+    invalid_source_session = _Session()
+    invalid_source = collect_toss_shadow_market_data(
+        invalid_source_session,
+        client_id="client-id",
+        client_secret="client-secret",
+        symbols=["SYNTH"],
+        retrieved_at=RETRIEVED_AT,
+        calendar_date="2026-08-11",
+        capability_artifact_sha256=CAPABILITY_SHA,
+        request_source_artifact={"file": "missing-lineage.json"},
+        max_price_requests=2,
+    )
+    assert invalid_source["status"] == "TOSS_SHADOW_SCHEMA_INVALID"
+    assert invalid_source["safeErrorCategory"] == (
+        "request_source_lineage_invalid"
+    )
+    assert invalid_source["requestCounts"] == {
+        "oauth": 0,
+        "marketCalendar": 0,
+        "prices": 0,
+    }
+    assert invalid_source_session.post_calls == []
+    assert invalid_source_session.get_calls == []
+
+    mismatched_scope_session = _Session()
+    mismatched_scope = collect_toss_shadow_market_data(
+        mismatched_scope_session,
+        client_id="client-id",
+        client_secret="client-secret",
+        symbols=["SYNTH"],
+        retrieved_at=RETRIEVED_AT,
+        calendar_date="2026-08-11",
+        capability_artifact_sha256=CAPABILITY_SHA,
+        request_source_artifact=_request_source_artifact(["RENAMED"]),
+        max_price_requests=2,
+    )
+    assert mismatched_scope["status"] == "TOSS_SHADOW_SCHEMA_INVALID"
+    assert mismatched_scope["safeErrorCategory"] == (
+        "request_scope_hash_mismatch"
+    )
+    assert mismatched_scope["requestCounts"] == {
+        "oauth": 0,
+        "marketCalendar": 0,
+        "prices": 0,
+    }
+    assert mismatched_scope_session.post_calls == []
+    assert mismatched_scope_session.get_calls == []
+
+    symbols = [f"S{index:03d}" for index in range(300)]
     success_session = _Session()
     success = _collect(success_session, symbols)
     assert success["schemaVersion"] == "toss-market-data-shadow-v1"
     assert success["status"] == "TOSS_SHADOW_PASS"
     assert success["mode"] == "SHADOW_ONLY"
+    request_lineage = success["requestLineage"]
+    assert request_lineage["status"] == "VERIFIED_STAGE3_REQUEST_SCOPE"
+    assert request_lineage["requestSourceArtifact"] == _request_source_artifact(
+        symbols
+    )
+    assert request_lineage["requestScopeSha256"] == _symbol_scope_sha256(symbols)
+    assert [row["requestedCount"] for row in request_lineage["batches"]] == [
+        200,
+        100,
+    ]
+    assert [row["returnedCount"] for row in request_lineage["batches"]] == [
+        200,
+        100,
+    ]
+    assert all(row["missingSymbolSha256"] == [] for row in request_lineage["batches"])
+    assert all(
+        len(row["batchRequestScopeSha256"]) == 64
+        and len(row["batchReturnedScopeSha256"]) == 64
+        for row in request_lineage["batches"]
+    )
     assert success["provider"] == "TOSS_OPEN_API"
     assert success["adjustedPriceSemantics"] == "NOT_APPLICABLE_TO_PRICES_ENDPOINT"
     assert success["eligible"] is True
@@ -231,8 +322,8 @@ def main() -> int:
         "prices": ["2xx", "2xx"],
     }
     assert success["summary"] == {
-        "requestedRows": 201,
-        "matchedRows": 201,
+        "requestedRows": 300,
+        "matchedRows": 300,
         "missingRows": 0,
         "invalidRows": 0,
         "duplicateRows": 0,
@@ -262,7 +353,7 @@ def main() -> int:
     assert first_price_clock["httpDateParseStatus"] == "VALID"
     assert first_price_clock["parsedHttpDateAt"] == "2026-08-12T00:00:01Z"
     assert first_price_clock["requestDurationMs"] >= 0
-    assert len(success["prices"]) == 201
+    assert len(success["prices"]) == 300
     assert len(success_session.post_calls) == 1
     assert len(success_session.get_calls) == 3
     assert all(
@@ -274,6 +365,20 @@ def main() -> int:
     assert "never-persist-this" not in serialized
     assert "client-secret" not in serialized
     assert "Wed, 12 Aug 2026" not in serialized
+
+    provider_format = _collect(_Session(), ["CLASS.A", "CLASS-B"])
+    assert provider_format["status"] == "TOSS_SHADOW_PASS"
+    assert provider_format["summary"]["requestedRows"] == 2
+    assert provider_format["requestLineage"]["requestScopeSha256"] == (
+        _symbol_scope_sha256(["CLASS.A", "CLASS-B"])
+    )
+
+    normalized_duplicate = _collect(_Session(), ["synth", "SYNTH"])
+    assert normalized_duplicate["status"] == "TOSS_SHADOW_PASS"
+    assert normalized_duplicate["summary"]["requestedRows"] == 1
+    assert normalized_duplicate["requestLineage"]["requestScopeSha256"] == (
+        _symbol_scope_sha256(["SYNTH"])
+    )
 
     blocked = _collect(
         _Session(token=_Response(403, {"error": "access_denied"}, headers=RATE_HEADERS))
@@ -555,6 +660,28 @@ def main() -> int:
         "unknownOrUnclassifiedRows"
     ] == 0
     assert partial["prices"] == []
+    partial_lineage = partial["requestLineage"]
+    assert partial_lineage["status"] == "VERIFIED_STAGE3_REQUEST_SCOPE"
+    assert partial_lineage["requestSourceArtifact"] == _request_source_artifact(
+        ["SYNTH", "RENAMED"]
+    )
+    assert partial_lineage["requestScopeSha256"] == _symbol_scope_sha256(
+        ["SYNTH", "RENAMED"]
+    )
+    assert len(partial_lineage["batches"]) == 1
+    assert partial_lineage["batches"][0]["requestedCount"] == 2
+    assert partial_lineage["batches"][0]["returnedCount"] == 1
+    assert partial_lineage["batches"][0]["missingSymbolSha256"] == [
+        hashlib.sha256(b"SYNTH").hexdigest()
+    ]
+    assert partial_lineage["batches"][0]["batchRequestScopeSha256"] == (
+        _symbol_scope_sha256(["SYNTH", "RENAMED"])
+    )
+    assert partial_lineage["batches"][0]["batchReturnedScopeSha256"] == (
+        _symbol_scope_sha256(["RENAMED"])
+    )
+    assert "SYNTH" not in json.dumps(partial_lineage, sort_keys=True)
+    assert "RENAMED" not in json.dumps(partial_lineage, sort_keys=True)
 
     mixed_clock_and_partial = _collect(
         _Session(
@@ -629,6 +756,7 @@ def main() -> int:
         retrieved_at="2026-08-11T13:29:59Z",
         calendar_date="2026-08-11",
         capability_artifact_sha256=CAPABILITY_SHA,
+        request_source_artifact=_request_source_artifact(["SYNTH"]),
         max_price_requests=2,
         clock=lambda: datetime.datetime.fromisoformat(
             "2026-08-11T13:30:01+00:00"
@@ -658,6 +786,7 @@ def main() -> int:
         retrieved_at=RETRIEVED_AT,
         calendar_date="2026-08-11",
         capability_artifact_sha256=CAPABILITY_SHA,
+        request_source_artifact=_request_source_artifact(["SYNTH"]),
         max_price_requests=2,
         clock=lambda: next(reversal_clock_values),
         monotonic_clock=lambda: 1.0,

@@ -842,22 +842,22 @@ def _toss_shadow_not_run_result(reason: str) -> dict[str, Any]:
     }
 
 
-def load_latest_stage3_shadow_symbols(root_id: str) -> list[str]:
+def load_latest_stage3_shadow_scope(root_id: str) -> dict[str, Any]:
     stage3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
     if not stage3_folder_id:
-        return []
+        return {"symbols": [], "sourceArtifact": None}
     query = (
         f"'{stage3_folder_id}' in parents and "
         "name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
     )
     files = drive_service.files().list(
         q=query,
-        fields="files(id, name)",
+        fields="files(id, name, createdTime)",
         orderBy="createdTime desc",
         pageSize=1,
     ).execute().get("files", [])
     if not files:
-        return []
+        return {"symbols": [], "sourceArtifact": None}
     payload = download_json(files[0].get("id"))
     if isinstance(payload, dict):
         rows = payload.get("fundamental_universe") or payload.get("stocks") or []
@@ -865,13 +865,44 @@ def load_latest_stage3_shadow_symbols(root_id: str) -> list[str]:
         rows = payload
     else:
         rows = []
-    return sorted(
+    symbols = sorted(
         {
             str(row.get("symbol") or "").strip().upper()
             for row in rows
             if isinstance(row, dict) and str(row.get("symbol") or "").strip()
         }
     )
+    payload_generated_at = (
+        payload.get("generated_at") or payload.get("generatedAt")
+        if isinstance(payload, dict)
+        else None
+    )
+    if _parse_iso_datetime(payload_generated_at) is not None:
+        generated_at = str(payload_generated_at)
+        generated_at_source = "ARTIFACT_FIELD"
+    elif _parse_iso_datetime(files[0].get("createdTime")) is not None:
+        generated_at = str(files[0]["createdTime"])
+        generated_at_source = "GOOGLE_DRIVE_CREATED_TIME"
+    else:
+        generated_at = None
+        generated_at_source = None
+    source_artifact = {
+        "file": str(files[0].get("name") or ""),
+        "sha256": _canonical_sha256(payload),
+        "hashBasis": "CANONICAL_JSON",
+        "generatedAt": generated_at,
+        "requestScopeSha256": hashlib.sha256(
+            "\n".join(symbols).encode("utf-8")
+        ).hexdigest(),
+    }
+    if generated_at_source is not None:
+        source_artifact["generatedAtSource"] = generated_at_source
+    return {"symbols": symbols, "sourceArtifact": source_artifact}
+
+
+def load_latest_stage3_shadow_symbols(root_id: str) -> list[str]:
+    scope = load_latest_stage3_shadow_scope(root_id)
+    return list(scope.get("symbols") or [])
 
 
 def ensure_toss_shadow_market_data(
@@ -879,6 +910,7 @@ def ensure_toss_shadow_market_data(
     candidate_symbols: Iterable[str],
     session: Any | None = None,
     alert_sender: Callable[..., Mapping[str, Any]] | None = None,
+    request_source_artifact: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     enabled, runtime_reason = toss_shadow_runtime_decision(os.environ)
     if not enabled:
@@ -924,6 +956,7 @@ def ensure_toss_shadow_market_data(
             retrieved_at=now_utc,
             calendar_date=calendar_date,
             capability_artifact_sha256=capability_sha256,
+            request_source_artifact=request_source_artifact,
             max_price_requests=TOSS_SHADOW_MAX_PRICE_REQUESTS,
         )
         result["runtimeAction"] = "COLLECTED_REGISTERED_MAC_SHADOW"
@@ -6045,10 +6078,13 @@ def run_harvester():
             )
         if TOSS_SHADOW_PROVIDER_ENABLED:
             try:
-                toss_shadow_symbols = load_latest_stage3_shadow_symbols(root_id)
+                toss_shadow_scope = load_latest_stage3_shadow_scope(root_id)
                 toss_market_data_shadow = ensure_toss_shadow_market_data(
                     sys_id,
-                    toss_shadow_symbols,
+                    toss_shadow_scope.get("symbols") or [],
+                    request_source_artifact=toss_shadow_scope.get(
+                        "sourceArtifact"
+                    ),
                 )
             except Exception as exc:
                 toss_market_data_shadow = build_toss_shadow_blocked_result(
