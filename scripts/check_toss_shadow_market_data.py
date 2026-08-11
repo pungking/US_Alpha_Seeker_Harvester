@@ -20,6 +20,7 @@ RATE_HEADERS = {
     "X-RateLimit-Limit": "15",
     "X-RateLimit-Remaining": "14",
     "X-RateLimit-Reset": "0.1",
+    "Date": "Wed, 12 Aug 2026 00:00:01 GMT",
 }
 RETRIEVED_AT = "2026-08-12T00:00:00Z"
 CAPABILITY_SHA = "a" * 64
@@ -162,6 +163,7 @@ def _collect(session: _Session, symbols: list[str] | None = None) -> dict[str, A
         clock=lambda: datetime.datetime.fromisoformat(
             "2026-08-12T00:00:01+00:00"
         ),
+        monotonic_clock=lambda: 1.0,
     )
 
 
@@ -181,6 +183,7 @@ def main() -> int:
     harvester_source = (root / "harvester.py").read_text(encoding="utf-8")
     workflow_source = (root / ".github/workflows/main.yml").read_text(encoding="utf-8")
     shadow_source = (root / "scripts/toss_shadow_market_data.py").read_text(encoding="utf-8")
+    readme_source = (root / "README.md").read_text(encoding="utf-8")
     assert "collect_toss_shadow_market_data" in harvester_source
     assert "dispatch_toss_shadow_alert" in harvester_source
     assert "toss_shadow_runtime_decision" in harvester_source
@@ -192,6 +195,9 @@ def main() -> int:
     assert "state/toss-market-data-shadow.json" in workflow_source
     assert "X-Tossinvest-Account" not in shadow_source
     assert "/api/v1/orders" not in shadow_source
+    assert "HTTP Date is diagnostic-only" in readme_source
+    assert "MAC_CLOCK_SYNC_UNVERIFIED" in readme_source
+    assert "No timestamp tolerance is authorized" in readme_source
 
     capability_blocked = build_toss_shadow_blocked_result(
         status="TOSS_SHADOW_AUTH_OR_NETWORK_BLOCKED",
@@ -237,6 +243,25 @@ def main() -> int:
     assert success["rateLimitHeadersComplete"] is True
     assert success["accountHeaderUsed"] is False
     assert success["orderEndpointUsed"] is False
+    clock_evidence = success["clockDomainEvidence"]
+    assert clock_evidence["httpDatePrecision"] == "SECONDS"
+    assert clock_evidence["summary"]["responseBatchCount"] == 4
+    assert clock_evidence["summary"]["httpDatePresentResponses"] == 4
+    assert clock_evidence["summary"]["httpDateValidResponses"] == 4
+    assert clock_evidence["summary"]["unknownOrUnclassifiedRows"] == 0
+    assert clock_evidence["summary"]["rootCauseCountMatches"] is True
+    assert clock_evidence["summary"]["clockReferenceStatus"] == (
+        "HTTP_DATE_REFERENCE_VALID"
+    )
+    first_price_clock = clock_evidence["responses"]["prices"][0]
+    assert first_price_clock["requestStartedAt"] == "2026-08-12T00:00:01Z"
+    assert first_price_clock["localResponseReceivedAt"] == (
+        "2026-08-12T00:00:01Z"
+    )
+    assert first_price_clock["httpDateHeaderPresent"] is True
+    assert first_price_clock["httpDateParseStatus"] == "VALID"
+    assert first_price_clock["parsedHttpDateAt"] == "2026-08-12T00:00:01Z"
+    assert first_price_clock["requestDurationMs"] >= 0
     assert len(success["prices"]) == 201
     assert len(success_session.post_calls) == 1
     assert len(success_session.get_calls) == 3
@@ -248,6 +273,7 @@ def main() -> int:
     serialized = json.dumps(success, sort_keys=True)
     assert "never-persist-this" not in serialized
     assert "client-secret" not in serialized
+    assert "Wed, 12 Aug 2026" not in serialized
 
     blocked = _collect(
         _Session(token=_Response(403, {"error": "access_denied"}, headers=RATE_HEADERS))
@@ -258,6 +284,10 @@ def main() -> int:
     assert blocked["eligible"] is False
     assert blocked["analysisContinued"] is True
     assert blocked["circuitBreaker"] == "OPEN_FOR_RUN"
+    assert blocked["clockDomainEvidence"]["summary"]["responseBatchCount"] == 1
+    assert blocked["clockDomainEvidence"]["summary"][
+        "httpDateValidResponses"
+    ] == 1
 
     unauthorized = _collect(
         _Session(token=_Response(401, {"error": "invalid_client"}, headers=RATE_HEADERS))
@@ -328,7 +358,132 @@ def main() -> int:
         "minFutureSkewMs": 1000,
         "maxFutureSkewMs": 1000,
     }
+    assert future["clockDomainEvidence"]["summary"]["primaryRootCause"] == (
+        "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES"
+    )
+    assert future["clockDomainEvidence"]["summary"]["rootCauseCounts"] == {
+        "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE": 0,
+        "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES": 1,
+        "HTTP_DATE_REFERENCE_MISSING_OR_INVALID": 0,
+        "PAYLOAD_TIMESTAMP_MISSING": 0,
+        "PARTIAL_SYMBOL_RESPONSE": 0,
+        "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT": 0,
+    }
     assert future["prices"] == []
+
+    local_clock_behind = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(symbol, timestamp="2026-08-12T00:00:02Z")
+                        for symbol in symbols
+                    ]
+                },
+                headers={
+                    **RATE_HEADERS,
+                    "Date": "Wed, 12 Aug 2026 00:00:03 GMT",
+                },
+            )
+        )
+    )
+    local_clock_summary = local_clock_behind["clockDomainEvidence"]["summary"]
+    assert local_clock_summary["clockReferenceStatus"] == (
+        "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"
+    )
+    assert local_clock_summary["primaryRootCause"] == (
+        "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"
+    )
+    assert local_clock_summary["rootCauseCounts"][
+        "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"
+    ] == 1
+    assert local_clock_summary["payloadAfterLocalReceiptRows"] == 1
+    assert local_clock_summary["payloadAfterHttpDateRows"] == 0
+    assert local_clock_summary["payloadToLocalReceiptMinOffsetMs"] == 1000
+    assert local_clock_summary["payloadToHttpDateMaxOffsetMs"] == -1000
+    assert local_clock_summary["unknownOrUnclassifiedRows"] == 0
+    assert local_clock_behind["eligible"] is False
+    assert local_clock_behind["sourceAsOf"] is None
+
+    future_without_http_date = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(symbol, timestamp="2026-08-12T00:00:02Z")
+                        for symbol in symbols
+                    ]
+                },
+                headers={
+                    key: value for key, value in RATE_HEADERS.items() if key != "Date"
+                },
+            )
+        )
+    )
+    missing_http_summary = future_without_http_date["clockDomainEvidence"][
+        "summary"
+    ]
+    assert missing_http_summary["primaryRootCause"] == (
+        "HTTP_DATE_REFERENCE_MISSING_OR_INVALID"
+    )
+    assert missing_http_summary["rootCauseCounts"][
+        "HTTP_DATE_REFERENCE_MISSING_OR_INVALID"
+    ] == 1
+    assert missing_http_summary["payloadComparedToHttpDateRows"] == 0
+    assert missing_http_summary["unknownOrUnclassifiedRows"] == 0
+
+    future_with_invalid_http_date = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(symbol, timestamp="2026-08-12T00:00:02Z")
+                        for symbol in symbols
+                    ]
+                },
+                headers={**RATE_HEADERS, "Date": "not-an-http-date"},
+            )
+        )
+    )
+    invalid_http_price_clock = future_with_invalid_http_date[
+        "clockDomainEvidence"
+    ]["responses"]["prices"][0]
+    assert invalid_http_price_clock["httpDateHeaderPresent"] is True
+    assert invalid_http_price_clock["httpDateParseStatus"] == "INVALID"
+    assert invalid_http_price_clock["parsedHttpDateAt"] is None
+    assert future_with_invalid_http_date["clockDomainEvidence"]["summary"][
+        "primaryRootCause"
+    ] == "HTTP_DATE_REFERENCE_MISSING_OR_INVALID"
+
+    precision_boundary = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(
+                            symbol,
+                            timestamp="2026-08-12T00:00:02.500000Z",
+                        )
+                        for symbol in symbols
+                    ]
+                },
+                headers={
+                    **RATE_HEADERS,
+                    "Date": "Wed, 12 Aug 2026 00:00:02 GMT",
+                },
+            )
+        )
+    )
+    precision_summary = precision_boundary["clockDomainEvidence"]["summary"]
+    assert precision_summary["primaryRootCause"] == (
+        "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES"
+    )
+    assert precision_summary["payloadToHttpDateMinOffsetMs"] == 500
+    assert precision_boundary["eligible"] is False
 
     missing_timestamp = _collect(
         _Session(
@@ -345,6 +500,12 @@ def main() -> int:
     assert missing_timestamp["diagnostics"]["futureTimestampRows"] == 0
     assert missing_timestamp["diagnostics"]["outOfCalendarDateRows"] == 0
     assert missing_timestamp["diagnostics"]["unreturnedSymbolRows"] == 0
+    assert missing_timestamp["clockDomainEvidence"]["summary"][
+        "primaryRootCause"
+    ] == "PAYLOAD_TIMESTAMP_MISSING"
+    assert missing_timestamp["clockDomainEvidence"]["summary"][
+        "unknownOrUnclassifiedRows"
+    ] == 0
 
     outside_calendar = _collect(
         _Session(
@@ -366,6 +527,12 @@ def main() -> int:
     assert outside_calendar["diagnostics"]["futureTimestampRows"] == 0
     assert outside_calendar["diagnostics"]["outOfCalendarDateRows"] == 1
     assert outside_calendar["diagnostics"]["unreturnedSymbolRows"] == 0
+    assert outside_calendar["clockDomainEvidence"]["summary"][
+        "primaryRootCause"
+    ] == "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT"
+    assert outside_calendar["clockDomainEvidence"]["summary"][
+        "unknownOrUnclassifiedRows"
+    ] == 0
 
     partial = _collect(
         _Session(prices=lambda symbols, _: _Response(200, {"result": [_price_row(symbols[0])]}, headers=RATE_HEADERS)),
@@ -378,7 +545,46 @@ def main() -> int:
     assert partial["diagnostics"]["timestampMissingRows"] == 0
     assert partial["diagnostics"]["futureTimestampRows"] == 0
     assert partial["diagnostics"]["outOfCalendarDateRows"] == 0
+    assert partial["clockDomainEvidence"]["summary"]["primaryRootCause"] == (
+        "PARTIAL_SYMBOL_RESPONSE"
+    )
+    assert partial["clockDomainEvidence"]["summary"]["rootCauseCounts"][
+        "PARTIAL_SYMBOL_RESPONSE"
+    ] == 1
+    assert partial["clockDomainEvidence"]["summary"][
+        "unknownOrUnclassifiedRows"
+    ] == 0
     assert partial["prices"] == []
+
+    mixed_clock_and_partial = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(
+                            symbols[0],
+                            timestamp="2026-08-12T00:00:02Z",
+                        )
+                    ]
+                },
+                headers=RATE_HEADERS,
+            )
+        ),
+        ["SYNTH", "RENAMED"],
+    )
+    mixed_summary = mixed_clock_and_partial["clockDomainEvidence"]["summary"]
+    assert mixed_summary["primaryRootCause"] == (
+        "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES"
+    )
+    assert mixed_summary["rootCauseCounts"][
+        "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES"
+    ] == 1
+    assert mixed_summary["rootCauseCounts"]["PARTIAL_SYMBOL_RESPONSE"] == 1
+    assert mixed_summary["unknownOrUnclassifiedRows"] == 0
+    assert mixed_summary["classifiableFailureRows"] == 2
+    assert mixed_summary["classifiedRootCauseRows"] == 2
+    assert mixed_summary["rootCauseCountMatches"] is True
 
     conflict = _collect(
         _Session(
@@ -437,6 +643,29 @@ def main() -> int:
         during_request["retrievedAt"].replace("Z", "+00:00")
     )
 
+    reversal_clock_values = iter(
+        [
+            datetime.datetime.fromisoformat("2026-08-12T00:00:01+00:00"),
+            datetime.datetime.fromisoformat("2026-08-12T00:00:00+00:00"),
+        ]
+    )
+    reversal_session = _Session()
+    reversal = collect_toss_shadow_market_data(
+        reversal_session,
+        client_id="client-id",
+        client_secret="client-secret",
+        symbols=["SYNTH"],
+        retrieved_at=RETRIEVED_AT,
+        calendar_date="2026-08-11",
+        capability_artifact_sha256=CAPABILITY_SHA,
+        max_price_requests=2,
+        clock=lambda: next(reversal_clock_values),
+        monotonic_clock=lambda: 1.0,
+    )
+    assert reversal["status"] == "TOSS_SHADOW_SCHEMA_INVALID"
+    assert reversal["safeErrorCategory"] == "oauth_received_at_invalid"
+    assert reversal["eligible"] is False
+
     enabled, reason = toss_shadow_runtime_decision(
         {
             "TOSS_SHADOW_PROVIDER_ENABLED": "true",
@@ -475,6 +704,7 @@ def main() -> int:
     assert "canonical analysis continued=true" in sent[0]
     assert "HTTP: `4xx`" in sent[0]
     assert "SYNTH" not in sent[0]
+
     duplicate = dispatch_toss_shadow_alert(
         blocked,
         previous_status="TOSS_SHADOW_PASS",
@@ -483,6 +713,18 @@ def main() -> int:
     )
     assert duplicate["status"] == "ALERT_SUPPRESSED_DUPLICATE"
     assert len(sent) == 1
+
+    clock_alert = dispatch_toss_shadow_alert(
+        local_clock_behind,
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=delivered,
+    )
+    assert clock_alert["status"] == "ALERT_DELIVERED"
+    assert "ClockReference: `LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE`" in sent[-1]
+    assert "AffectedRows: `1`" in sent[-1]
+    assert "OffsetMs: `1000..1000`" in sent[-1]
+    assert "SYNTH" not in sent[-1]
 
     recovery = dispatch_toss_shadow_alert(
         success,

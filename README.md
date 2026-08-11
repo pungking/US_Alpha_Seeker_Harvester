@@ -226,3 +226,25 @@ response receipt, dates outside the verified market-calendar window, and
 symbols omitted from the response. Any of those conditions still excludes the
 entire Toss contribution for the run; the diagnostics do not add clock-skew
 tolerance or weaken evidence eligibility.
+
+The additive `clockDomainEvidence` envelope records request start, local response
+receipt, parsed HTTP `Date`, request duration, and aggregate payload timestamp
+offsets for each response. HTTP Date is diagnostic-only: it is not rewritten as
+`sourceAsOf`, does not adjust the local clock, and does not make a failed row
+eligible. No timestamp tolerance is authorized; a payload after the strict local
+receipt remains excluded until a separately reviewed provider clock contract is
+proven. Raw headers, symbols, IP addresses, credentials, and response bodies are
+not included in public clock diagnostics.
+
+This is an additive, non-breaking extension of `toss-market-data-shadow-v1`.
+Existing consumers may ignore `clockDomainEvidence`; eligibility and canonical
+source semantics are unchanged. The root-cause counts distinguish local receipt
+behind a valid server reference, payload ahead of both references, missing or
+invalid HTTP `Date`, nullable payload timestamps, and partial symbol responses.
+
+Before another registered-Mac one-shot, operators should confirm the macOS
+`timed` service, timezone, and network-time configuration without changing the
+clock. A running daemon alone does not prove offset accuracy. If the exact
+network-time state or offset cannot be verified without privileged or external
+checks, report `MAC_CLOCK_SYNC_UNVERIFIED`; do not infer synchronization and do
+not compensate timestamps in code.
