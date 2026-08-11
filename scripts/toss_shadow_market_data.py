@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import datetime
+import email.utils
 import hashlib
 import json
 import re
+import time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping, Protocol
 from zoneinfo import ZoneInfo
@@ -16,6 +18,14 @@ US_CALENDAR_ENDPOINT = "https://openapi.tossinvest.com/api/v1/market-calendar/US
 MAX_SYMBOLS_PER_PRICE_REQUEST = 200
 MAX_PRICE_REQUESTS_PER_RUN = 2
 PASS_STATUS = "TOSS_SHADOW_PASS"
+CLOCK_ROOT_CAUSES = (
+    "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE",
+    "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES",
+    "HTTP_DATE_REFERENCE_MISSING_OR_INVALID",
+    "PAYLOAD_TIMESTAMP_MISSING",
+    "PARTIAL_SYMBOL_RESPONSE",
+    "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT",
+)
 FAILURE_STATUSES = {
     "TOSS_SHADOW_AUTH_OR_NETWORK_BLOCKED",
     "TOSS_SHADOW_RATE_LIMITED",
@@ -138,6 +148,128 @@ def _rate_limit_evidence(response: _Response) -> dict[str, Any]:
     return evidence
 
 
+def _utc_iso(value: datetime.datetime) -> str:
+    return value.astimezone(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _http_date_evidence(
+    response: _Response,
+    *,
+    local_received_at: datetime.datetime,
+) -> dict[str, Any]:
+    headers = {
+        str(key).lower(): str(value)
+        for key, value in (getattr(response, "headers", {}) or {}).items()
+    }
+    raw_date = headers.get("date")
+    evidence: dict[str, Any] = {
+        "httpDateHeaderPresent": raw_date is not None,
+        "httpDateParseStatus": "MISSING" if raw_date is None else "INVALID",
+        "parsedHttpDateAt": None,
+        "httpDatePrecision": "SECONDS",
+        "localToHttpDateOffsetMs": None,
+    }
+    if raw_date is None:
+        return evidence
+    try:
+        parsed = email.utils.parsedate_to_datetime(raw_date)
+    except (TypeError, ValueError, OverflowError):
+        return evidence
+    if not isinstance(parsed, datetime.datetime) or parsed.utcoffset() is None:
+        return evidence
+    parsed_utc = parsed.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    local_utc = local_received_at.astimezone(datetime.timezone.utc)
+    evidence.update(
+        {
+            "httpDateParseStatus": "VALID",
+            "parsedHttpDateAt": _utc_iso(parsed_utc),
+            "localToHttpDateOffsetMs": int(
+                round((parsed_utc - local_utc).total_seconds() * 1000)
+            ),
+        }
+    )
+    return evidence
+
+
+def _clock_summary_template() -> dict[str, Any]:
+    return {
+        "responseBatchCount": 0,
+        "httpDatePresentResponses": 0,
+        "httpDateValidResponses": 0,
+        "httpDateInvalidResponses": 0,
+        "payloadTimestampRows": 0,
+        "payloadTimestampMin": None,
+        "payloadTimestampMax": None,
+        "payloadAfterLocalReceiptRows": 0,
+        "payloadComparedToHttpDateRows": 0,
+        "payloadAfterHttpDateRows": 0,
+        "localToHttpDateMinOffsetMs": None,
+        "localToHttpDateMaxOffsetMs": None,
+        "payloadToLocalReceiptMinOffsetMs": None,
+        "payloadToLocalReceiptMaxOffsetMs": None,
+        "payloadToHttpDateMinOffsetMs": None,
+        "payloadToHttpDateMaxOffsetMs": None,
+        "clockReferenceStatus": "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT",
+        "primaryRootCause": None,
+        "rootCauseCounts": {cause: 0 for cause in CLOCK_ROOT_CAUSES},
+        "classifiableFailureRows": 0,
+        "classifiedRootCauseRows": 0,
+        "rootCauseCountMatches": True,
+        "unknownOrUnclassifiedRows": 0,
+    }
+
+
+def _response_clock_rows(result: Mapping[str, Any]) -> list[dict[str, Any]]:
+    clock_domain = result.get("clockDomainEvidence")
+    responses = (
+        clock_domain.get("responses")
+        if isinstance(clock_domain, Mapping)
+        and isinstance(clock_domain.get("responses"), Mapping)
+        else {}
+    )
+    rows = [responses.get("oauth"), responses.get("marketCalendar")]
+    price_rows = responses.get("prices")
+    if isinstance(price_rows, list):
+        rows.extend(price_rows)
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _refresh_response_clock_summary(result: dict[str, Any]) -> None:
+    rows = _response_clock_rows(result)
+    offsets = [
+        row["localToHttpDateOffsetMs"]
+        for row in rows
+        if isinstance(row.get("localToHttpDateOffsetMs"), int)
+    ]
+    summary = result["clockDomainEvidence"]["summary"]
+    summary.update(
+        {
+            "responseBatchCount": len(rows),
+            "httpDatePresentResponses": sum(
+                row.get("httpDateHeaderPresent") is True for row in rows
+            ),
+            "httpDateValidResponses": sum(
+                row.get("httpDateParseStatus") == "VALID" for row in rows
+            ),
+            "httpDateInvalidResponses": sum(
+                row.get("httpDateParseStatus") == "INVALID" for row in rows
+            ),
+            "localToHttpDateMinOffsetMs": min(offsets) if offsets else None,
+            "localToHttpDateMaxOffsetMs": max(offsets) if offsets else None,
+            "clockReferenceStatus": (
+                "HTTP_DATE_REFERENCE_MISSING_OR_INVALID"
+                if rows
+                and any(row.get("httpDateParseStatus") != "VALID" for row in rows)
+                else "HTTP_DATE_REFERENCE_VALID"
+                if rows
+                else "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT"
+            ),
+        }
+    )
+
+
 def _base_result(
     *,
     symbols: list[str],
@@ -162,6 +294,15 @@ def _base_result(
             "oauth": None,
             "marketCalendar": None,
             "prices": [],
+        },
+        "clockDomainEvidence": {
+            "httpDatePrecision": "SECONDS",
+            "responses": {
+                "oauth": None,
+                "marketCalendar": None,
+                "prices": [],
+            },
+            "summary": _clock_summary_template(),
         },
         "sourceAsOf": None,
         "marketTimezone": "America/New_York",
@@ -349,6 +490,7 @@ def collect_toss_shadow_market_data(
     capability_artifact_sha256: str,
     max_price_requests: int = 2,
     clock: Callable[[], datetime.datetime] | None = None,
+    monotonic_clock: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     normalized_symbols = _normalize_symbols(symbols)
     result = _base_result(
@@ -377,24 +519,70 @@ def collect_toss_shadow_market_data(
     response_clock = clock or (
         lambda: datetime.datetime.now(datetime.timezone.utc)
     )
+    duration_clock = monotonic_clock or time.monotonic
 
-    def record_response_received(endpoint: str) -> datetime.datetime | None:
+    def begin_request() -> tuple[datetime.datetime, float] | None:
+        started = response_clock()
+        if (
+            not isinstance(started, datetime.datetime)
+            or started.utcoffset() is None
+            or started < retrieved_timestamp
+        ):
+            return None
+        monotonic_started = duration_clock()
+        if not isinstance(monotonic_started, (int, float)):
+            return None
+        return started.astimezone(datetime.timezone.utc), float(monotonic_started)
+
+    def record_response_received(
+        endpoint: str,
+        response: _Response,
+        request_timing: tuple[datetime.datetime, float],
+    ) -> tuple[datetime.datetime, dict[str, Any]] | None:
+        request_started_at, monotonic_started = request_timing
         received = response_clock()
+        monotonic_finished = duration_clock()
         if (
             not isinstance(received, datetime.datetime)
             or received.utcoffset() is None
-            or received < retrieved_timestamp
+            or received < request_started_at
+            or not isinstance(monotonic_finished, (int, float))
+            or float(monotonic_finished) < monotonic_started
         ):
             return None
         received_utc = received.astimezone(datetime.timezone.utc)
-        received_iso = received_utc.isoformat().replace("+00:00", "Z")
+        received_iso = _utc_iso(received_utc)
+        clock_evidence = {
+            "requestStartedAt": _utc_iso(request_started_at),
+            "localResponseReceivedAt": received_iso,
+            "requestDurationMs": int(
+                round((float(monotonic_finished) - monotonic_started) * 1000)
+            ),
+            **_http_date_evidence(
+                response,
+                local_received_at=received_utc,
+            ),
+        }
         if endpoint == "prices":
             result["responseReceivedAt"]["prices"].append(received_iso)
+            result["clockDomainEvidence"]["responses"]["prices"].append(
+                clock_evidence
+            )
         else:
             result["responseReceivedAt"][endpoint] = received_iso
+            result["clockDomainEvidence"]["responses"][endpoint] = clock_evidence
         result["retrievedAt"] = received_iso
-        return received
+        _refresh_response_clock_summary(result)
+        return received_utc, clock_evidence
 
+    token_timing = begin_request()
+    if token_timing is None:
+        return _mark_failure(
+            result,
+            status="TOSS_SHADOW_SCHEMA_INVALID",
+            category="oauth_request_started_at_invalid",
+            endpoint_group="AUTH",
+        )
     result["requestCounts"]["oauth"] = 1
     try:
         token_response = session.post(
@@ -415,7 +603,7 @@ def collect_toss_shadow_market_data(
             endpoint_group="AUTH",
         )
 
-    if record_response_received("oauth") is None:
+    if record_response_received("oauth", token_response, token_timing) is None:
         return _mark_failure(
             result,
             status="TOSS_SHADOW_SCHEMA_INVALID",
@@ -460,6 +648,14 @@ def collect_toss_shadow_market_data(
         )
 
     authorization = {"Authorization": f"Bearer {access_token}"}
+    calendar_timing = begin_request()
+    if calendar_timing is None:
+        return _mark_failure(
+            result,
+            status="TOSS_SHADOW_SCHEMA_INVALID",
+            category="market_calendar_request_started_at_invalid",
+            endpoint_group="MARKET_INFO",
+        )
     result["requestCounts"]["marketCalendar"] = 1
     try:
         calendar_response = session.get(
@@ -475,7 +671,9 @@ def collect_toss_shadow_market_data(
             category=type(exc).__name__,
             endpoint_group="MARKET_INFO",
         )
-    if record_response_received("marketCalendar") is None:
+    if record_response_received(
+        "marketCalendar", calendar_response, calendar_timing
+    ) is None:
         return _mark_failure(
             result,
             status="TOSS_SHADOW_SCHEMA_INVALID",
@@ -533,9 +731,22 @@ def collect_toss_shadow_market_data(
     future_skew_ms: list[int] = []
     currency_conflicts = 0
     source_timestamps: list[tuple[datetime.datetime, str]] = []
+    payload_timestamps: list[datetime.datetime] = []
+    payload_to_local_offsets_ms: list[int] = []
+    payload_to_http_offsets_ms: list[int] = []
+    local_to_http_offsets_ms: list[int] = []
+    root_cause_counts = {cause: 0 for cause in CLOCK_ROOT_CAUSES}
 
     for offset in range(0, len(normalized_symbols), MAX_SYMBOLS_PER_PRICE_REQUEST):
         batch = normalized_symbols[offset : offset + MAX_SYMBOLS_PER_PRICE_REQUEST]
+        price_timing = begin_request()
+        if price_timing is None:
+            return _mark_failure(
+                result,
+                status="TOSS_SHADOW_SCHEMA_INVALID",
+                category="prices_request_started_at_invalid",
+                endpoint_group="MARKET_DATA",
+            )
         result["requestCounts"]["prices"] += 1
         try:
             price_response = session.get(
@@ -551,14 +762,42 @@ def collect_toss_shadow_market_data(
                 category=type(exc).__name__,
                 endpoint_group="MARKET_DATA",
             )
-        price_received_at = record_response_received("prices")
-        if price_received_at is None:
+        price_clock_result = record_response_received(
+            "prices", price_response, price_timing
+        )
+        if price_clock_result is None:
             return _mark_failure(
                 result,
                 status="TOSS_SHADOW_SCHEMA_INVALID",
                 category="prices_received_at_invalid",
                 endpoint_group="MARKET_DATA",
             )
+        price_received_at, price_clock_evidence = price_clock_result
+        price_clock_evidence.update(
+            {
+                "payloadTimestampRows": 0,
+                "payloadTimestampMin": None,
+                "payloadTimestampMax": None,
+                "payloadAfterLocalReceiptRows": 0,
+                "payloadComparedToHttpDateRows": 0,
+                "payloadAfterHttpDateRows": 0,
+                "payloadToLocalReceiptMinOffsetMs": None,
+                "payloadToLocalReceiptMaxOffsetMs": None,
+                "payloadToHttpDateMinOffsetMs": None,
+                "payloadToHttpDateMaxOffsetMs": None,
+            }
+        )
+        parsed_http_date = _parse_timestamp(
+            price_clock_evidence.get("parsedHttpDateAt")
+        )
+        local_to_http_offset = price_clock_evidence.get(
+            "localToHttpDateOffsetMs"
+        )
+        if isinstance(local_to_http_offset, int):
+            local_to_http_offsets_ms.append(local_to_http_offset)
+        batch_payload_timestamps: list[datetime.datetime] = []
+        batch_payload_to_local_offsets_ms: list[int] = []
+        batch_payload_to_http_offsets_ms: list[int] = []
         price_status = int(getattr(price_response, "status_code", 0) or 0)
         result["httpStatusCategories"]["prices"].append(
             _status_category(price_status)
@@ -611,7 +850,23 @@ def collect_toss_shadow_market_data(
             timestamp = _parse_timestamp(row.get("timestamp"))
             if timestamp is None:
                 timestamp_missing_rows += 1
+                root_cause_counts["PAYLOAD_TIMESTAMP_MISSING"] += 1
                 continue
+            timestamp_utc = timestamp.astimezone(datetime.timezone.utc)
+            batch_payload_timestamps.append(timestamp_utc)
+            payload_timestamps.append(timestamp_utc)
+            payload_to_local = int(
+                round((timestamp_utc - price_received_at).total_seconds() * 1000)
+            )
+            batch_payload_to_local_offsets_ms.append(payload_to_local)
+            payload_to_local_offsets_ms.append(payload_to_local)
+            payload_to_http: int | None = None
+            if parsed_http_date is not None:
+                payload_to_http = int(
+                    round((timestamp_utc - parsed_http_date).total_seconds() * 1000)
+                )
+                batch_payload_to_http_offsets_ms.append(payload_to_http)
+                payload_to_http_offsets_ms.append(payload_to_http)
             if timestamp > price_received_at:
                 future_timestamp_rows += 1
                 future_skew_ms.append(
@@ -620,12 +875,25 @@ def collect_toss_shadow_market_data(
                         int(round((timestamp - price_received_at).total_seconds() * 1000)),
                     )
                 )
+                if parsed_http_date is None:
+                    root_cause_counts[
+                        "HTTP_DATE_REFERENCE_MISSING_OR_INVALID"
+                    ] += 1
+                elif timestamp_utc <= parsed_http_date:
+                    root_cause_counts[
+                        "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"
+                    ] += 1
+                else:
+                    root_cause_counts[
+                        "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES"
+                    ] += 1
                 continue
             if (
                 timestamp.astimezone(ZoneInfo("America/New_York")).date()
                 not in allowed_price_dates
             ):
                 out_of_calendar_date_rows += 1
+                root_cause_counts["CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT"] += 1
                 continue
             safe_row = {
                 "symbol": symbol,
@@ -639,8 +907,54 @@ def collect_toss_shadow_market_data(
             seen[symbol] = safe_row
             source_timestamps.append((timestamp, row["timestamp"]))
 
+        price_clock_evidence.update(
+            {
+                "payloadTimestampRows": len(batch_payload_timestamps),
+                "payloadTimestampMin": (
+                    _utc_iso(min(batch_payload_timestamps))
+                    if batch_payload_timestamps
+                    else None
+                ),
+                "payloadTimestampMax": (
+                    _utc_iso(max(batch_payload_timestamps))
+                    if batch_payload_timestamps
+                    else None
+                ),
+                "payloadAfterLocalReceiptRows": sum(
+                    value > 0 for value in batch_payload_to_local_offsets_ms
+                ),
+                "payloadComparedToHttpDateRows": len(
+                    batch_payload_to_http_offsets_ms
+                ),
+                "payloadAfterHttpDateRows": sum(
+                    value > 0 for value in batch_payload_to_http_offsets_ms
+                ),
+                "payloadToLocalReceiptMinOffsetMs": (
+                    min(batch_payload_to_local_offsets_ms)
+                    if batch_payload_to_local_offsets_ms
+                    else None
+                ),
+                "payloadToLocalReceiptMaxOffsetMs": (
+                    max(batch_payload_to_local_offsets_ms)
+                    if batch_payload_to_local_offsets_ms
+                    else None
+                ),
+                "payloadToHttpDateMinOffsetMs": (
+                    min(batch_payload_to_http_offsets_ms)
+                    if batch_payload_to_http_offsets_ms
+                    else None
+                ),
+                "payloadToHttpDateMaxOffsetMs": (
+                    max(batch_payload_to_http_offsets_ms)
+                    if batch_payload_to_http_offsets_ms
+                    else None
+                ),
+            }
+        )
+
     missing = requested.difference(seen)
     unreturned_symbols = requested.difference(returned_symbols)
+    root_cause_counts["PARTIAL_SYMBOL_RESPONSE"] += len(unreturned_symbols)
     result["summary"].update(
         {
             "matchedRows": len(seen),
@@ -663,6 +977,108 @@ def collect_toss_shadow_market_data(
         "minFutureSkewMs": min(future_skew_ms) if future_skew_ms else None,
         "maxFutureSkewMs": max(future_skew_ms) if future_skew_ms else None,
     }
+    response_clock_rows = _response_clock_rows(result)
+    root_cause_precedence = (
+        "PAYLOAD_TIMESTAMP_MISSING",
+        "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES",
+        "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE",
+        "HTTP_DATE_REFERENCE_MISSING_OR_INVALID",
+        "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT",
+        "PARTIAL_SYMBOL_RESPONSE",
+    )
+    primary_root_cause = next(
+        (
+            cause
+            for cause in root_cause_precedence
+            if root_cause_counts[cause] > 0
+        ),
+        None,
+    )
+    if root_cause_counts["PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES"]:
+        clock_reference_status = "PAYLOAD_TIMESTAMP_AHEAD_OF_ALL_REFERENCES"
+    elif root_cause_counts["LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"]:
+        clock_reference_status = "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"
+    elif any(
+        row.get("httpDateParseStatus") != "VALID" for row in response_clock_rows
+    ):
+        clock_reference_status = "HTTP_DATE_REFERENCE_MISSING_OR_INVALID"
+    elif response_clock_rows:
+        clock_reference_status = "HTTP_DATE_REFERENCE_VALID"
+    else:
+        clock_reference_status = "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT"
+    classified_rows = sum(root_cause_counts.values())
+    classifiable_rows = (
+        timestamp_missing_rows
+        + future_timestamp_rows
+        + out_of_calendar_date_rows
+        + len(unreturned_symbols)
+    )
+    result["clockDomainEvidence"]["summary"] = {
+        "responseBatchCount": len(response_clock_rows),
+        "httpDatePresentResponses": sum(
+            row.get("httpDateHeaderPresent") is True for row in response_clock_rows
+        ),
+        "httpDateValidResponses": sum(
+            row.get("httpDateParseStatus") == "VALID" for row in response_clock_rows
+        ),
+        "httpDateInvalidResponses": sum(
+            row.get("httpDateParseStatus") == "INVALID" for row in response_clock_rows
+        ),
+        "payloadTimestampRows": len(payload_timestamps),
+        "payloadTimestampMin": (
+            _utc_iso(min(payload_timestamps)) if payload_timestamps else None
+        ),
+        "payloadTimestampMax": (
+            _utc_iso(max(payload_timestamps)) if payload_timestamps else None
+        ),
+        "payloadAfterLocalReceiptRows": sum(
+            value > 0 for value in payload_to_local_offsets_ms
+        ),
+        "payloadComparedToHttpDateRows": len(payload_to_http_offsets_ms),
+        "payloadAfterHttpDateRows": sum(
+            value > 0 for value in payload_to_http_offsets_ms
+        ),
+        "localToHttpDateMinOffsetMs": (
+            min(local_to_http_offsets_ms) if local_to_http_offsets_ms else None
+        ),
+        "localToHttpDateMaxOffsetMs": (
+            max(local_to_http_offsets_ms) if local_to_http_offsets_ms else None
+        ),
+        "payloadToLocalReceiptMinOffsetMs": (
+            min(payload_to_local_offsets_ms)
+            if payload_to_local_offsets_ms
+            else None
+        ),
+        "payloadToLocalReceiptMaxOffsetMs": (
+            max(payload_to_local_offsets_ms)
+            if payload_to_local_offsets_ms
+            else None
+        ),
+        "payloadToHttpDateMinOffsetMs": (
+            min(payload_to_http_offsets_ms)
+            if payload_to_http_offsets_ms
+            else None
+        ),
+        "payloadToHttpDateMaxOffsetMs": (
+            max(payload_to_http_offsets_ms)
+            if payload_to_http_offsets_ms
+            else None
+        ),
+        "clockReferenceStatus": clock_reference_status,
+        "primaryRootCause": primary_root_cause,
+        "rootCauseCounts": root_cause_counts,
+        "classifiableFailureRows": classifiable_rows,
+        "classifiedRootCauseRows": classified_rows,
+        "rootCauseCountMatches": classifiable_rows == classified_rows,
+        "unknownOrUnclassifiedRows": abs(classifiable_rows - classified_rows),
+    }
+    if classifiable_rows != classified_rows:
+        return _mark_failure(
+            result,
+            status="TOSS_SHADOW_SCHEMA_INVALID",
+            category="clock_root_cause_count_mismatch",
+            endpoint_group="LOCAL_CONTRACT",
+        )
     rate_rows = [
         result["rateLimitHeaders"]["oauth"],
         result["rateLimitHeaders"]["marketCalendar"],
@@ -800,6 +1216,30 @@ def dispatch_toss_shadow_alert(
 
     counts = result.get("requestCounts") or {}
     http_status_category = _latest_http_status_category(result)
+    clock_domain = result.get("clockDomainEvidence")
+    clock_summary = (
+        clock_domain.get("summary")
+        if isinstance(clock_domain, Mapping)
+        and isinstance(clock_domain.get("summary"), Mapping)
+        else {}
+    )
+    root_cause_counts = clock_summary.get("rootCauseCounts")
+    affected_rows = (
+        sum(
+            int(value)
+            for value in root_cause_counts.values()
+            if isinstance(value, int) and value > 0
+        )
+        if isinstance(root_cause_counts, Mapping)
+        else 0
+    )
+    offset_min = clock_summary.get("payloadToLocalReceiptMinOffsetMs")
+    offset_max = clock_summary.get("payloadToLocalReceiptMaxOffsetMs")
+    offset_range = (
+        f"{offset_min}..{offset_max}"
+        if isinstance(offset_min, int) and isinstance(offset_max, int)
+        else "not_available"
+    )
     if alert_type == "TOSS_SHADOW_RECOVERED":
         message = (
             "✅ *Toss SHADOW source recovered*\n"
@@ -814,6 +1254,9 @@ def dispatch_toss_shadow_alert(
             f"Error: `{result.get('safeErrorCategory') or 'unclassified'}`\n"
             f"HTTP: `{http_status_category}`\n"
             f"EndpointGroup: `{result.get('affectedEndpointGroup') or 'unknown'}`\n"
+            f"ClockReference: `{clock_summary.get('clockReferenceStatus') or 'not_available'}`\n"
+            f"AffectedRows: `{affected_rows}`\n"
+            f"OffsetMs: `{offset_range}`\n"
             "Requests: "
             f"oauth={int(counts.get('oauth') or 0)}, "
             f"calendar={int(counts.get('marketCalendar') or 0)}, "
