@@ -335,6 +335,10 @@ def _base_result(
             "status": "REQUEST_SCOPE_LINEAGE_INCOMPLETE",
             "requestSourceArtifact": None,
             "requestScopeSha256": _symbol_scope_sha256(symbols),
+            "providerSymbolMappingStatus": "NOT_EVALUATED",
+            "providerSymbolMappingRule": "US_CLASS_SHARE_HYPHEN_TO_DOT",
+            "providerMappedRows": 0,
+            "providerRequestScopeSha256": None,
             "batches": [],
         },
         "collectionStartedAt": retrieved_at,
@@ -528,6 +532,28 @@ def _normalize_symbols(symbols: list[str]) -> list[str]:
     return sorted(valid)
 
 
+def _toss_provider_symbol(canonical_symbol: str) -> str:
+    if re.fullmatch(r"[A-Z0-9]{1,10}-[A-Z]", canonical_symbol):
+        return canonical_symbol.replace("-", ".")
+    return canonical_symbol
+
+
+def _provider_symbol_maps(
+    canonical_symbols: list[str],
+) -> tuple[dict[str, str], dict[str, str], bool]:
+    canonical_to_provider = {
+        symbol: _toss_provider_symbol(symbol) for symbol in canonical_symbols
+    }
+    provider_to_canonical: dict[str, str] = {}
+    collision = False
+    for canonical_symbol, provider_symbol in canonical_to_provider.items():
+        if provider_symbol in provider_to_canonical:
+            collision = True
+            continue
+        provider_to_canonical[provider_symbol] = canonical_symbol
+    return canonical_to_provider, provider_to_canonical, collision
+
+
 def collect_toss_shadow_market_data(
     session: _Session,
     *,
@@ -543,6 +569,12 @@ def collect_toss_shadow_market_data(
     monotonic_clock: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     normalized_symbols = _normalize_symbols(symbols)
+    (
+        canonical_to_provider,
+        provider_to_canonical,
+        provider_mapping_collision,
+    ) = _provider_symbol_maps(normalized_symbols)
+    provider_symbols = sorted(provider_to_canonical)
     result = _base_result(
         symbols=normalized_symbols,
         retrieved_at=retrieved_at,
@@ -564,9 +596,29 @@ def collect_toss_shadow_market_data(
                 "requestSourceArtifact": safe_request_source,
             }
         )
+    result["requestLineage"].update(
+        {
+            "providerSymbolMappingStatus": (
+                "COLLISION"
+                if provider_mapping_collision
+                else "VERIFIED_DOT_HYPHEN_ALIAS"
+                if any(
+                    canonical != provider
+                    for canonical, provider in canonical_to_provider.items()
+                )
+                else "IDENTITY"
+            ),
+            "providerMappedRows": sum(
+                canonical != provider
+                for canonical, provider in canonical_to_provider.items()
+            ),
+            "providerRequestScopeSha256": _symbol_scope_sha256(provider_symbols),
+        }
+    )
     retrieved_timestamp = _parse_timestamp(retrieved_at)
     if (
         not normalized_symbols
+        or provider_mapping_collision
         or safe_request_source is None
         or not request_scope_matches
         or retrieved_timestamp is None
@@ -580,7 +632,9 @@ def collect_toss_shadow_market_data(
             result,
             status="TOSS_SHADOW_SCHEMA_INVALID",
             category=(
-                "request_source_lineage_invalid"
+                "provider_symbol_mapping_collision"
+                if provider_mapping_collision
+                else "request_source_lineage_invalid"
                 if safe_request_source is None
                 else "request_scope_hash_mismatch"
                 if not request_scope_matches
@@ -795,7 +849,8 @@ def collect_toss_shadow_market_data(
 
     requested = set(normalized_symbols)
     seen: dict[str, dict[str, Any]] = {}
-    returned_symbols: set[str] = set()
+    returned_canonical_symbols: set[str] = set()
+    returned_provider_symbols: set[str] = set()
     invalid_rows = 0
     duplicate_rows = 0
     timestamp_missing_rows = 0
@@ -812,12 +867,17 @@ def collect_toss_shadow_market_data(
 
     for offset in range(0, len(normalized_symbols), MAX_SYMBOLS_PER_PRICE_REQUEST):
         batch = normalized_symbols[offset : offset + MAX_SYMBOLS_PER_PRICE_REQUEST]
+        provider_batch = [canonical_to_provider[symbol] for symbol in batch]
         batch_lineage = {
             "batchIndex": offset // MAX_SYMBOLS_PER_PRICE_REQUEST,
             "requestedCount": len(batch),
             "returnedCount": 0,
             "batchRequestScopeSha256": _symbol_scope_sha256(batch),
+            "batchProviderRequestScopeSha256": _symbol_scope_sha256(
+                provider_batch
+            ),
             "batchReturnedScopeSha256": None,
+            "batchCanonicalReturnedScopeSha256": None,
             "missingSymbolSha256": [],
         }
         result["requestLineage"]["batches"].append(batch_lineage)
@@ -833,7 +893,7 @@ def collect_toss_shadow_market_data(
         try:
             price_response = session.get(
                 PRICES_ENDPOINT,
-                params={"symbols": ",".join(batch)},
+                params={"symbols": ",".join(provider_batch)},
                 headers=authorization,
                 timeout=20,
             )
@@ -878,7 +938,8 @@ def collect_toss_shadow_market_data(
         if isinstance(local_to_http_offset, int):
             local_to_http_offsets_ms.append(local_to_http_offset)
         batch_payload_timestamps: list[datetime.datetime] = []
-        batch_returned_symbols: set[str] = set()
+        batch_returned_canonical_symbols: set[str] = set()
+        batch_returned_provider_symbols: set[str] = set()
         batch_payload_to_local_offsets_ms: list[int] = []
         batch_payload_to_http_offsets_ms: list[int] = []
         price_status = int(getattr(price_response, "status_code", 0) or 0)
@@ -914,15 +975,25 @@ def collect_toss_shadow_market_data(
             if not isinstance(row, dict):
                 invalid_rows += 1
                 continue
-            symbol = row.get("symbol")
-            if not isinstance(symbol, str) or symbol not in requested:
+            provider_symbol = row.get("symbol")
+            canonical_symbol = (
+                provider_to_canonical.get(provider_symbol)
+                if isinstance(provider_symbol, str)
+                else None
+            )
+            if canonical_symbol is None:
                 invalid_rows += 1
                 continue
-            if symbol in returned_symbols:
+            if (
+                canonical_symbol in returned_canonical_symbols
+                or provider_symbol in returned_provider_symbols
+            ):
                 duplicate_rows += 1
                 continue
-            returned_symbols.add(symbol)
-            batch_returned_symbols.add(symbol)
+            returned_canonical_symbols.add(canonical_symbol)
+            returned_provider_symbols.add(provider_symbol)
+            batch_returned_canonical_symbols.add(canonical_symbol)
+            batch_returned_provider_symbols.add(provider_symbol)
             price = _decimal(row.get("lastPrice"))
             currency = row.get("currency")
             if price is None or price <= 0 or not isinstance(currency, str):
@@ -980,23 +1051,31 @@ def collect_toss_shadow_market_data(
                 root_cause_counts["CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT"] += 1
                 continue
             safe_row = {
-                "symbol": symbol,
+                "symbol": canonical_symbol,
                 "timestamp": row["timestamp"],
                 "lastPrice": format(price, "f"),
                 "currency": currency,
+                "providerSymbolSha256": hashlib.sha256(
+                    provider_symbol.encode("utf-8")
+                ).hexdigest(),
                 "sourceAsOfUtc": timestamp.astimezone(datetime.timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z"),
             }
-            seen[symbol] = safe_row
+            seen[canonical_symbol] = safe_row
             source_timestamps.append((timestamp, row["timestamp"]))
 
-        batch_missing_symbols = sorted(set(batch).difference(batch_returned_symbols))
+        batch_missing_symbols = sorted(
+            set(batch).difference(batch_returned_canonical_symbols)
+        )
         batch_lineage.update(
             {
-                "returnedCount": len(batch_returned_symbols),
+                "returnedCount": len(batch_returned_canonical_symbols),
                 "batchReturnedScopeSha256": _symbol_scope_sha256(
-                    sorted(batch_returned_symbols)
+                    sorted(batch_returned_provider_symbols)
+                ),
+                "batchCanonicalReturnedScopeSha256": _symbol_scope_sha256(
+                    sorted(batch_returned_canonical_symbols)
                 ),
                 "missingSymbolSha256": [
                     hashlib.sha256(symbol.encode("utf-8")).hexdigest()
@@ -1051,7 +1130,7 @@ def collect_toss_shadow_market_data(
         )
 
     missing = requested.difference(seen)
-    unreturned_symbols = requested.difference(returned_symbols)
+    unreturned_symbols = requested.difference(returned_canonical_symbols)
     root_cause_counts["PARTIAL_SYMBOL_RESPONSE"] += len(unreturned_symbols)
     result["summary"].update(
         {
@@ -1346,6 +1425,12 @@ def dispatch_toss_shadow_alert(
             "canonical analysis continued=true"
         )
     else:
+        next_action = (
+            "verify hashed missing-symbol lineage and provider symbol mapping; "
+            "do not retry full scope"
+            if result.get("safeErrorCategory") == "partial_symbol_response"
+            else "verify registered egress, credentials, rate limit, and source contract"
+        )
         message = (
             "⚠️ *Toss SHADOW source excluded*\n"
             f"Status: `{status}`\n"
@@ -1362,7 +1447,7 @@ def dispatch_toss_shadow_alert(
             "CircuitBreaker: `OPEN_FOR_RUN`\n"
             "Toss evidence excluded=true\n"
             "canonical analysis continued=true\n"
-            "Next: verify registered egress, credentials, rate limit, and source contract"
+            f"Next: {next_action}"
         )
 
     try:
