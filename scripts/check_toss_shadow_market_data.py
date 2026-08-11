@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import json
 import sys
 from pathlib import Path
@@ -154,6 +155,9 @@ def _collect(session: _Session, symbols: list[str] | None = None) -> dict[str, A
         calendar_date="2026-08-11",
         capability_artifact_sha256=CAPABILITY_SHA,
         max_price_requests=2,
+        clock=lambda: datetime.datetime.fromisoformat(
+            "2026-08-12T00:00:01+00:00"
+        ),
     )
 
 
@@ -338,6 +342,43 @@ def main() -> int:
     assert oversized["requestCounts"] == {"oauth": 0, "marketCalendar": 0, "prices": 0}
     assert oversized_session.post_calls == []
     assert oversized_session.get_calls == []
+
+    during_request_session = _Session(
+        prices=lambda symbols, _: _Response(
+            200,
+            {
+                "result": [
+                    _price_row(
+                        symbol,
+                        timestamp="2026-08-11T22:30:00+09:00",
+                    )
+                    for symbol in symbols
+                ]
+            },
+            headers=RATE_HEADERS,
+        )
+    )
+    during_request = collect_toss_shadow_market_data(
+        during_request_session,
+        client_id="client-id",
+        client_secret="client-secret",
+        symbols=["SYNTH"],
+        retrieved_at="2026-08-11T13:29:59Z",
+        calendar_date="2026-08-11",
+        capability_artifact_sha256=CAPABILITY_SHA,
+        max_price_requests=2,
+        clock=lambda: datetime.datetime.fromisoformat(
+            "2026-08-11T13:30:01+00:00"
+        ),
+    )
+    assert during_request["status"] == "TOSS_SHADOW_PASS"
+    assert during_request["collectionStartedAt"] == "2026-08-11T13:29:59Z"
+    assert during_request["retrievedAt"] == "2026-08-11T13:30:01Z"
+    assert datetime.datetime.fromisoformat(
+        during_request["sourceAsOf"]
+    ) <= datetime.datetime.fromisoformat(
+        during_request["retrievedAt"].replace("Z", "+00:00")
+    )
 
     enabled, reason = toss_shadow_runtime_decision(
         {

@@ -156,7 +156,13 @@ def _base_result(
         "requestScopeSha256": _canonical_sha256(
             {"symbols": symbols, "calendarDate": calendar_date}
         ),
+        "collectionStartedAt": retrieved_at,
         "retrievedAt": retrieved_at,
+        "responseReceivedAt": {
+            "oauth": None,
+            "marketCalendar": None,
+            "prices": [],
+        },
         "sourceAsOf": None,
         "marketTimezone": "America/New_York",
         "requestCounts": {"oauth": 0, "marketCalendar": 0, "prices": 0},
@@ -336,6 +342,7 @@ def collect_toss_shadow_market_data(
     calendar_date: str,
     capability_artifact_sha256: str,
     max_price_requests: int = 2,
+    clock: Callable[[], datetime.datetime] | None = None,
 ) -> dict[str, Any]:
     normalized_symbols = _normalize_symbols(symbols)
     result = _base_result(
@@ -361,6 +368,27 @@ def collect_toss_shadow_market_data(
             endpoint_group="LOCAL_CONTRACT",
         )
 
+    response_clock = clock or (
+        lambda: datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    def record_response_received(endpoint: str) -> datetime.datetime | None:
+        received = response_clock()
+        if (
+            not isinstance(received, datetime.datetime)
+            or received.utcoffset() is None
+            or received < retrieved_timestamp
+        ):
+            return None
+        received_utc = received.astimezone(datetime.timezone.utc)
+        received_iso = received_utc.isoformat().replace("+00:00", "Z")
+        if endpoint == "prices":
+            result["responseReceivedAt"]["prices"].append(received_iso)
+        else:
+            result["responseReceivedAt"][endpoint] = received_iso
+        result["retrievedAt"] = received_iso
+        return received
+
     result["requestCounts"]["oauth"] = 1
     try:
         token_response = session.post(
@@ -378,6 +406,14 @@ def collect_toss_shadow_market_data(
             result,
             status="TOSS_SHADOW_TRANSIENT_FAILURE",
             category=type(exc).__name__,
+            endpoint_group="AUTH",
+        )
+
+    if record_response_received("oauth") is None:
+        return _mark_failure(
+            result,
+            status="TOSS_SHADOW_SCHEMA_INVALID",
+            category="oauth_received_at_invalid",
             endpoint_group="AUTH",
         )
 
@@ -431,6 +467,13 @@ def collect_toss_shadow_market_data(
             result,
             status="TOSS_SHADOW_TRANSIENT_FAILURE",
             category=type(exc).__name__,
+            endpoint_group="MARKET_INFO",
+        )
+    if record_response_received("marketCalendar") is None:
+        return _mark_failure(
+            result,
+            status="TOSS_SHADOW_SCHEMA_INVALID",
+            category="market_calendar_received_at_invalid",
             endpoint_group="MARKET_INFO",
         )
     calendar_status = int(getattr(calendar_response, "status_code", 0) or 0)
@@ -498,6 +541,14 @@ def collect_toss_shadow_market_data(
                 category=type(exc).__name__,
                 endpoint_group="MARKET_DATA",
             )
+        price_received_at = record_response_received("prices")
+        if price_received_at is None:
+            return _mark_failure(
+                result,
+                status="TOSS_SHADOW_SCHEMA_INVALID",
+                category="prices_received_at_invalid",
+                endpoint_group="MARKET_DATA",
+            )
         price_status = int(getattr(price_response, "status_code", 0) or 0)
         result["httpStatusCategories"]["prices"].append(
             _status_category(price_status)
@@ -552,7 +603,7 @@ def collect_toss_shadow_market_data(
                 continue
             if (
                 timestamp is None
-                or timestamp > retrieved_timestamp
+                or timestamp > price_received_at
                 or timestamp.astimezone(ZoneInfo("America/New_York")).date()
                 not in allowed_price_dates
             ):
