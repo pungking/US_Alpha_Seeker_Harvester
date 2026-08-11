@@ -93,7 +93,11 @@ def _calendar_payload() -> dict[str, Any]:
     }
 
 
-def _price_row(symbol: str, *, timestamp: str = "2026-08-11T22:30:00+09:00") -> dict[str, str]:
+def _price_row(
+    symbol: str,
+    *,
+    timestamp: str | None = "2026-08-11T22:30:00+09:00",
+) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "timestamp": timestamp,
@@ -307,20 +311,73 @@ def main() -> int:
         _Session(
             prices=lambda symbols, _: _Response(
                 200,
-                {"result": [_price_row(symbol, timestamp="2026-08-13T22:30:00+09:00") for symbol in symbols]},
+                {"result": [_price_row(symbol, timestamp="2026-08-12T00:00:02Z") for symbol in symbols]},
                 headers=RATE_HEADERS,
             )
         )
     )
     assert future["status"] == "TOSS_SHADOW_STALE_OR_PARTIAL"
+    assert future["safeErrorCategory"] == "price_timestamp_after_response"
+    assert future["diagnostics"] == {
+        "timestampMissingRows": 0,
+        "futureTimestampRows": 1,
+        "outOfCalendarDateRows": 0,
+        "unreturnedSymbolRows": 0,
+        "staleOrFutureRows": 1,
+        "currencyConflictRows": 0,
+        "minFutureSkewMs": 1000,
+        "maxFutureSkewMs": 1000,
+    }
     assert future["prices"] == []
+
+    missing_timestamp = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {"result": [_price_row(symbol, timestamp=None) for symbol in symbols]},
+                headers=RATE_HEADERS,
+            )
+        )
+    )
+    assert missing_timestamp["status"] == "TOSS_SHADOW_STALE_OR_PARTIAL"
+    assert missing_timestamp["safeErrorCategory"] == "price_timestamp_missing"
+    assert missing_timestamp["diagnostics"]["timestampMissingRows"] == 1
+    assert missing_timestamp["diagnostics"]["futureTimestampRows"] == 0
+    assert missing_timestamp["diagnostics"]["outOfCalendarDateRows"] == 0
+    assert missing_timestamp["diagnostics"]["unreturnedSymbolRows"] == 0
+
+    outside_calendar = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(symbol, timestamp="2026-08-09T22:30:00+09:00")
+                        for symbol in symbols
+                    ]
+                },
+                headers=RATE_HEADERS,
+            )
+        )
+    )
+    assert outside_calendar["status"] == "TOSS_SHADOW_STALE_OR_PARTIAL"
+    assert outside_calendar["safeErrorCategory"] == "price_timestamp_outside_calendar"
+    assert outside_calendar["diagnostics"]["timestampMissingRows"] == 0
+    assert outside_calendar["diagnostics"]["futureTimestampRows"] == 0
+    assert outside_calendar["diagnostics"]["outOfCalendarDateRows"] == 1
+    assert outside_calendar["diagnostics"]["unreturnedSymbolRows"] == 0
 
     partial = _collect(
         _Session(prices=lambda symbols, _: _Response(200, {"result": [_price_row(symbols[0])]}, headers=RATE_HEADERS)),
         ["SYNTH", "RENAMED"],
     )
     assert partial["status"] == "TOSS_SHADOW_STALE_OR_PARTIAL"
+    assert partial["safeErrorCategory"] == "partial_symbol_response"
     assert partial["summary"]["missingRows"] == 1
+    assert partial["diagnostics"]["unreturnedSymbolRows"] == 1
+    assert partial["diagnostics"]["timestampMissingRows"] == 0
+    assert partial["diagnostics"]["futureTimestampRows"] == 0
+    assert partial["diagnostics"]["outOfCalendarDateRows"] == 0
     assert partial["prices"] == []
 
     conflict = _collect(

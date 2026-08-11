@@ -190,8 +190,14 @@ def _base_result(
             "responseSha256Rows": 0,
         },
         "diagnostics": {
+            "timestampMissingRows": 0,
+            "futureTimestampRows": 0,
+            "outOfCalendarDateRows": 0,
+            "unreturnedSymbolRows": len(symbols),
             "staleOrFutureRows": 0,
             "currencyConflictRows": 0,
+            "minFutureSkewMs": None,
+            "maxFutureSkewMs": None,
         },
         "eligible": False,
         "tossEvidenceExcluded": True,
@@ -518,9 +524,13 @@ def collect_toss_shadow_market_data(
 
     requested = set(normalized_symbols)
     seen: dict[str, dict[str, Any]] = {}
+    returned_symbols: set[str] = set()
     invalid_rows = 0
     duplicate_rows = 0
-    stale_rows = 0
+    timestamp_missing_rows = 0
+    future_timestamp_rows = 0
+    out_of_calendar_date_rows = 0
+    future_skew_ms: list[int] = []
     currency_conflicts = 0
     source_timestamps: list[tuple[datetime.datetime, str]] = []
 
@@ -583,31 +593,39 @@ def collect_toss_shadow_market_data(
                 invalid_rows += 1
                 continue
             symbol = row.get("symbol")
-            price = _decimal(row.get("lastPrice"))
-            currency = row.get("currency")
-            timestamp = _parse_timestamp(row.get("timestamp"))
-            if (
-                not isinstance(symbol, str)
-                or symbol not in requested
-                or price is None
-                or price <= 0
-                or not isinstance(currency, str)
-            ):
+            if not isinstance(symbol, str) or symbol not in requested:
                 invalid_rows += 1
                 continue
-            if symbol in seen:
+            if symbol in returned_symbols:
                 duplicate_rows += 1
+                continue
+            returned_symbols.add(symbol)
+            price = _decimal(row.get("lastPrice"))
+            currency = row.get("currency")
+            if price is None or price <= 0 or not isinstance(currency, str):
+                invalid_rows += 1
                 continue
             if currency != "USD":
                 currency_conflicts += 1
                 continue
+            timestamp = _parse_timestamp(row.get("timestamp"))
+            if timestamp is None:
+                timestamp_missing_rows += 1
+                continue
+            if timestamp > price_received_at:
+                future_timestamp_rows += 1
+                future_skew_ms.append(
+                    max(
+                        0,
+                        int(round((timestamp - price_received_at).total_seconds() * 1000)),
+                    )
+                )
+                continue
             if (
-                timestamp is None
-                or timestamp > price_received_at
-                or timestamp.astimezone(ZoneInfo("America/New_York")).date()
+                timestamp.astimezone(ZoneInfo("America/New_York")).date()
                 not in allowed_price_dates
             ):
-                stale_rows += 1
+                out_of_calendar_date_rows += 1
                 continue
             safe_row = {
                 "symbol": symbol,
@@ -622,6 +640,7 @@ def collect_toss_shadow_market_data(
             source_timestamps.append((timestamp, row["timestamp"]))
 
     missing = requested.difference(seen)
+    unreturned_symbols = requested.difference(returned_symbols)
     result["summary"].update(
         {
             "matchedRows": len(seen),
@@ -631,8 +650,18 @@ def collect_toss_shadow_market_data(
         }
     )
     result["diagnostics"] = {
-        "staleOrFutureRows": stale_rows,
+        "timestampMissingRows": timestamp_missing_rows,
+        "futureTimestampRows": future_timestamp_rows,
+        "outOfCalendarDateRows": out_of_calendar_date_rows,
+        "unreturnedSymbolRows": len(unreturned_symbols),
+        "staleOrFutureRows": (
+            timestamp_missing_rows
+            + future_timestamp_rows
+            + out_of_calendar_date_rows
+        ),
         "currencyConflictRows": currency_conflicts,
+        "minFutureSkewMs": min(future_skew_ms) if future_skew_ms else None,
+        "maxFutureSkewMs": max(future_skew_ms) if future_skew_ms else None,
     }
     rate_rows = [
         result["rateLimitHeaders"]["oauth"],
@@ -662,11 +691,24 @@ def collect_toss_shadow_market_data(
             category=("prices_schema_invalid" if invalid_rows else "rate_limit_headers_missing"),
             endpoint_group="MARKET_DATA",
         )
-    if stale_rows or missing:
+    if (
+        timestamp_missing_rows
+        or future_timestamp_rows
+        or out_of_calendar_date_rows
+        or missing
+    ):
+        if timestamp_missing_rows:
+            category = "price_timestamp_missing"
+        elif future_timestamp_rows:
+            category = "price_timestamp_after_response"
+        elif out_of_calendar_date_rows:
+            category = "price_timestamp_outside_calendar"
+        else:
+            category = "partial_symbol_response"
         return _mark_failure(
             result,
             status="TOSS_SHADOW_STALE_OR_PARTIAL",
-            category=("stale_or_future_timestamp" if stale_rows else "partial_symbol_response"),
+            category=category,
             endpoint_group="MARKET_DATA",
         )
 
