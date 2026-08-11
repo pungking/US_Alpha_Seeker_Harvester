@@ -195,3 +195,26 @@ error code. An HTTP 403 is not treated as proof of an IP allow-list failure beca
 the official contract also uses 403 for permission failures. Existing sticky results
 remain historical evidence and require the separately approved archive/reprobe
 procedure in `TOSS_PHASE1_AUTH_REPROBE_PACKAGE.md` before another network request.
+
+## Toss Phase2a SHADOW_ONLY market data
+
+Phase2a reads `/api/v1/prices` and `/api/v1/market-calendar/US` only from a
+server-side Mac runtime whose outbound IP is registered with Toss. The GitHub
+hosted workflow locks `TOSS_SHADOW_PROVIDER_ENABLED=false`, so its Toss Phase2a
+request count is always zero. A local run additionally requires
+`TOSS_SHADOW_REGISTERED_EGRESS_CONFIRMED=true`.
+
+The bounded run budget is one OAuth request, one US calendar request, and at
+most two `/prices` requests with up to 200 dynamically selected symbols per
+request. Current documented limits are 15 TPS for `MARKET_DATA` and 3 TPS for
+`MARKET_INFO`; runtime `X-RateLimit-*` and `Retry-After` headers remain the
+source of truth. No account header or account/order endpoint is allowed.
+
+`state/toss-market-data-shadow.json` and
+`System_Identity_Maps/TOSS_MARKET_DATA_SHADOW.json` are report-only evidence.
+They never replace Google Drive/yfinance canonical data and never affect Stage6
+policy. Any auth, rate-limit, transient, schema, stale/partial, or source-conflict
+failure opens a run-level circuit breaker, excludes all Toss evidence for that
+run, sends at most one aggregate alert through the existing alert route, and
+lets canonical collection continue. Alert failures are recorded safely and do
+not trigger recursive alerts.
