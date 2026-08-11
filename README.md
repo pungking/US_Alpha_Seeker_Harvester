@@ -189,3 +189,9 @@ before making at most one OAuth request and one adjusted daily-candle request.
 Later runs reuse that result with zero Toss requests. The probe never sends
 `X-Tossinvest-Account`, never calls account/order endpoints, redacts the selected
 symbol to a SHA-256, and does not replace the canonical Google Drive OHLCV source.
+
+OAuth failures preserve only the HTTP status category and a bounded machine-readable
+error code. An HTTP 403 is not treated as proof of an IP allow-list failure because
+the official contract also uses 403 for permission failures. Existing sticky results
+remain historical evidence and require the separately approved archive/reprobe
+procedure in `TOSS_PHASE1_AUTH_REPROBE_PACKAGE.md` before another network request.

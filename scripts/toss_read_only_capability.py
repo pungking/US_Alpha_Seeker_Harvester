@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
@@ -39,6 +40,20 @@ def _failure_status(status_code: int) -> str:
     return "TOSS_RESPONSE_CONTRACT_INVALID"
 
 
+def _safe_oauth_error_code(response: _Response) -> str | None:
+    """Return only a bounded machine-readable error code, never the message/body."""
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else error
+    if not isinstance(code, str):
+        return None
+    normalized = code.strip().lower()
+    return normalized if re.fullmatch(r"[a-z0-9_-]{1,64}", normalized) else None
+
+
 def _parse_timestamp(value: Any) -> datetime.datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -67,6 +82,7 @@ def _base_result(symbol: str, retrieved_at: str) -> dict[str, Any]:
         "probeSymbolSha256": hashlib.sha256(symbol.encode("utf-8")).hexdigest(),
         "requestCounts": {"oauth": 0, "marketData": 0},
         "oauthHttpStatusCategory": None,
+        "oauthErrorCode": None,
         "marketDataHttpStatusCategory": None,
         "schemaValid": False,
         "adjustedRequest": True,
@@ -127,13 +143,8 @@ def probe_toss_read_only_capability(
     result["oauthHttpStatusCategory"] = _status_category(token_status)
     if token_status != 200:
         result["probeStatus"] = _failure_status(token_status)
-        result["safeErrorCategory"] = (
-            "oauth_invalid_client"
-            if token_status == 401
-            else "oauth_ip_not_allowed"
-            if token_status == 403
-            else f"oauth_http_{token_status}"
-        )
+        result["oauthErrorCode"] = _safe_oauth_error_code(token_response)
+        result["safeErrorCategory"] = f"oauth_http_{token_status}"
         return result
 
     try:
