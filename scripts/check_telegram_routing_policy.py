@@ -72,6 +72,15 @@ add(
     else "FAIL",
     "Toss SHADOW failures must reuse the aggregate alert route.",
 )
+add(
+    "toss_alert_receipt_persistence",
+    "PASS"
+    if "persist_toss_shadow_alert_receipt" in harvester
+    and "ALERT_RECEIPT_PERSISTED" in harvester
+    and "ALERT_DELIVERED_RECEIPT_PERSIST_FAILED" in harvester
+    else "FAIL",
+    "Final Toss alert delivery receipts must be persisted after dispatch without resending.",
+)
 
 fail = sum(1 for check in checks if check["status"] == "FAIL")
 warn = sum(1 for check in checks if check["status"] == "WARN")

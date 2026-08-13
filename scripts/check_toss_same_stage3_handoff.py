@@ -244,6 +244,9 @@ def main() -> int:
             ["FIXTURE.A", "FIXTURE-B"],
             session=object(),
             request_source_artifact=source_artifact,
+            alert_sender=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("matched shadow reuse must not resend an alert")
+            ),
         )
         assert reused["runtimeAction"] == "EXISTING_MATCHED_SHADOW_REUSED"
         assert reused["thisRunRequestCounts"] == {
@@ -350,6 +353,198 @@ def main() -> int:
     assert "private detail" not in json.dumps(failed_publish)
     assert "TOSS_MARKET_DATA_SHADOW.json" not in failed_uploads
 
+    receipt_result = {
+        **shadow,
+        "status": "TOSS_SHADOW_STALE_OR_PARTIAL",
+        "eligible": False,
+        "tossEvidenceExcluded": True,
+        "analysisContinued": True,
+        "prices": [],
+        "alertDelivery": {
+            "status": "ALERT_DELIVERED",
+            "alertType": "TOSS_SHADOW_FAILURE",
+            "alertFingerprint": "e" * 64,
+            "safeErrorCategory": None,
+            "attempted": True,
+            "delivered": True,
+            "duplicateSuppressed": False,
+        },
+    }
+    receipt_baseline = {
+        key: receipt_result[key]
+        for key in (
+            "status",
+            "eligible",
+            "tossEvidenceExcluded",
+            "analysisContinued",
+            "canonicalSourceChanged",
+            "policyImpact",
+            "requestLineage",
+            "prices",
+        )
+    }
+    receipt_local_writes: list[dict[str, object]] = []
+    receipt_drive_writes: list[dict[str, object]] = []
+    original_write = harvester_module.write_json_report
+    original_upload = harvester_module.upload_json
+    original_window_inspector = harvester_module.inspect_same_stage3_handoff_window
+    try:
+        harvester_module.write_json_report = (
+            lambda _path, payload, _label: receipt_local_writes.append(
+                json.loads(json.dumps(payload))
+            )
+        )
+        harvester_module.upload_json = (
+            lambda name, payload, _parent: receipt_drive_writes.append(
+                {"name": name, "payload": json.loads(json.dumps(payload))}
+            )
+        )
+        harvester_module.inspect_same_stage3_handoff_window = (
+            lambda *_args, **_kwargs: {
+                "status": "HANDOFF_WINDOW_OPEN",
+                "open": True,
+                "sourceArtifactMatches": True,
+                "safeErrorCategory": None,
+            }
+        )
+        receipt_persistence = harvester_module.persist_toss_shadow_alert_receipt(
+            "root-id",
+            "system-id",
+            source_artifact,
+            receipt_result,
+            initial_canonical_published=True,
+        )
+    finally:
+        harvester_module.write_json_report = original_write
+        harvester_module.upload_json = original_upload
+        harvester_module.inspect_same_stage3_handoff_window = original_window_inspector
+
+    assert receipt_persistence["status"] == "ALERT_RECEIPT_PERSISTED"
+    assert receipt_persistence["canonicalPublished"] is True
+    assert len(receipt_drive_writes) == 1
+    assert receipt_drive_writes[0]["name"] == "TOSS_MARKET_DATA_SHADOW.json"
+    final_drive_receipt = receipt_drive_writes[0]["payload"]["alertDelivery"]
+    final_local_receipt = receipt_local_writes[-1]["alertDelivery"]
+    assert final_drive_receipt == final_local_receipt
+    assert final_drive_receipt["status"] == "ALERT_DELIVERED"
+    assert final_drive_receipt["receiptPersistenceStatus"] == (
+        "ALERT_RECEIPT_PERSISTED"
+    )
+    assert final_drive_receipt["attempted"] is True
+    assert final_drive_receipt["delivered"] is True
+    assert final_drive_receipt["duplicateSuppressed"] is False
+    assert final_drive_receipt["localArtifactPersisted"] is True
+    assert final_drive_receipt["driveArtifactPersisted"] is True
+    assert isinstance(final_drive_receipt["receiptRecordedAt"], str)
+    assert {
+        key: receipt_result[key]
+        for key in receipt_baseline
+    } == receipt_baseline
+
+    mismatch_result = json.loads(json.dumps(receipt_result))
+    mismatch_local_writes: list[dict[str, object]] = []
+    mismatch_drive_writes: list[dict[str, object]] = []
+    try:
+        harvester_module.write_json_report = (
+            lambda _path, payload, _label: mismatch_local_writes.append(
+                json.loads(json.dumps(payload))
+            )
+        )
+        harvester_module.upload_json = (
+            lambda name, payload, _parent: mismatch_drive_writes.append(
+                {"name": name, "payload": json.loads(json.dumps(payload))}
+            )
+        )
+        harvester_module.inspect_same_stage3_handoff_window = (
+            lambda *_args, **_kwargs: {
+                "status": "REQUEST_SOURCE_HASH_MISMATCH",
+                "open": False,
+                "sourceArtifactMatches": False,
+                "safeErrorCategory": None,
+            }
+        )
+        mismatch_persistence = harvester_module.persist_toss_shadow_alert_receipt(
+            "root-id",
+            "system-id",
+            source_artifact,
+            mismatch_result,
+            initial_canonical_published=True,
+        )
+    finally:
+        harvester_module.write_json_report = original_write
+        harvester_module.upload_json = original_upload
+        harvester_module.inspect_same_stage3_handoff_window = original_window_inspector
+    assert mismatch_persistence["status"] == (
+        "ALERT_DELIVERED_RECEIPT_PERSIST_FAILED"
+    )
+    assert mismatch_persistence["canonicalPublished"] is False
+    assert mismatch_drive_writes == []
+    assert mismatch_local_writes[-1]["alertDelivery"]["driveArtifactPersisted"] is False
+    assert mismatch_local_writes[-1]["alertDelivery"]["receiptPersistenceErrorCategory"] == (
+        "stage3_hash_mismatch"
+    )
+
+    drive_failure_result = json.loads(json.dumps(receipt_result))
+    drive_failure_writes: list[dict[str, object]] = []
+    try:
+        harvester_module.write_json_report = (
+            lambda _path, payload, _label: drive_failure_writes.append(
+                json.loads(json.dumps(payload))
+            )
+        )
+        harvester_module.upload_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("private Drive detail")
+        )
+        harvester_module.inspect_same_stage3_handoff_window = (
+            lambda *_args, **_kwargs: {
+                "status": "HANDOFF_WINDOW_OPEN",
+                "open": True,
+                "sourceArtifactMatches": True,
+                "safeErrorCategory": None,
+            }
+        )
+        drive_failure = harvester_module.persist_toss_shadow_alert_receipt(
+            "root-id",
+            "system-id",
+            source_artifact,
+            drive_failure_result,
+            initial_canonical_published=True,
+        )
+    finally:
+        harvester_module.write_json_report = original_write
+        harvester_module.upload_json = original_upload
+        harvester_module.inspect_same_stage3_handoff_window = original_window_inspector
+    assert drive_failure["status"] == "ALERT_DELIVERED_RECEIPT_PERSIST_FAILED"
+    assert drive_failure["safeErrorCategory"] == "RuntimeError"
+    assert drive_failure_writes[-1]["alertDelivery"]["localArtifactPersisted"] is True
+    assert drive_failure_writes[-1]["alertDelivery"]["driveArtifactPersisted"] is False
+    assert "private Drive detail" not in json.dumps(drive_failure)
+
+    local_failure_result = json.loads(json.dumps(receipt_result))
+    local_failure_uploads: list[str] = []
+    try:
+        harvester_module.write_json_report = lambda *_args, **_kwargs: (
+            _ for _ in ()
+        ).throw(OSError("private local detail"))
+        harvester_module.upload_json = (
+            lambda name, _payload, _parent: local_failure_uploads.append(name)
+        )
+        local_failure = harvester_module.persist_toss_shadow_alert_receipt(
+            "root-id",
+            "system-id",
+            source_artifact,
+            local_failure_result,
+            initial_canonical_published=True,
+        )
+    finally:
+        harvester_module.write_json_report = original_write
+        harvester_module.upload_json = original_upload
+    assert local_failure["status"] == "ALERT_DELIVERED_RECEIPT_PERSIST_FAILED"
+    assert local_failure["safeErrorCategory"] == "OSError"
+    assert local_failure_uploads == []
+    assert local_failure_result["alertDelivery"]["localArtifactPersisted"] is False
+    assert "private local detail" not in json.dumps(local_failure)
+
     assert "load_stage3_shadow_handoff_scope" in harvester_source
     assert "toss_shadow_scope = load_latest_stage3_shadow_scope(root_id)" not in (
         harvester_source
@@ -358,6 +553,14 @@ def main() -> int:
     assert "trigger_sha256" in harvester_source
     assert "trigger_request_scope_sha256" in harvester_source
     assert "EXISTING_MATCHED_SHADOW_REUSED" in harvester_source
+    pending_index = harvester_source.index('"status": "ALERT_PENDING_POST_PUBLISH"')
+    dispatch_index = harvester_source.index(
+        'result["alertDelivery"] = dispatch_toss_shadow_alert', pending_index
+    )
+    persist_index = harvester_source.index(
+        "persist_toss_shadow_alert_receipt(", dispatch_index
+    )
+    assert pending_index < dispatch_index < persist_index
     assert "specified_stage3_trigger_missing" in harvester_source
     assert "지정된 trigger_file 미발견" not in harvester_source
     assert "TOSS_SHADOW_PROVIDER_ENABLED: 'false'" in workflow_source
