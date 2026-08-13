@@ -227,6 +227,13 @@ symbols omitted from the response. Any of those conditions still excludes the
 entire Toss contribution for the run; the diagnostics do not add clock-skew
 tolerance or weaken evidence eligibility.
 
+Timestamp-shape diagnostics also separate an absent key, documented `null`,
+blank text, an unparseable value, and a valid offset-aware value. They persist
+only counts, per-batch reconciliation, safe JSON type counts, and SHA-256 hashes
+of sorted response key sets. They never persist timestamp values, symbols, or
+raw responses. The strict all-row timestamp gate remains unchanged pending the
+report-only policy decision in `TOSS_PRICE_TIMESTAMP_POLICY_REVIEW.md`.
+
 The additive `clockDomainEvidence` envelope records request start, local response
 receipt, parsed HTTP `Date`, request duration, and aggregate payload timestamp
 offsets for each response. HTTP Date is diagnostic-only: it is not rewritten as

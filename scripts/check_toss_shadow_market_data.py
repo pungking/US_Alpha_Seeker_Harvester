@@ -126,6 +126,12 @@ def _price_row(
     }
 
 
+def _price_row_without_timestamp(symbol: str) -> dict[str, Any]:
+    row = _price_row(symbol)
+    row.pop("timestamp")
+    return row
+
+
 class _Session:
     def __init__(
         self,
@@ -205,6 +211,9 @@ def main() -> int:
     workflow_source = (root / ".github/workflows/main.yml").read_text(encoding="utf-8")
     shadow_source = (root / "scripts/toss_shadow_market_data.py").read_text(encoding="utf-8")
     readme_source = (root / "README.md").read_text(encoding="utf-8")
+    policy_review_source = (root / "TOSS_PRICE_TIMESTAMP_POLICY_REVIEW.md").read_text(
+        encoding="utf-8"
+    )
     assert "collect_toss_shadow_market_data" in harvester_source
     assert "dispatch_toss_shadow_alert" in harvester_source
     assert "toss_shadow_runtime_decision" in harvester_source
@@ -220,6 +229,10 @@ def main() -> int:
     assert "HTTP Date is diagnostic-only" in readme_source
     assert "MAC_CLOCK_SYNC_UNVERIFIED" in readme_source
     assert "No timestamp tolerance is authorized" in readme_source
+    assert "DOCUMENTED_NULLABLE_TIMESTAMP_POLICY_REVIEW_REQUIRED" in (
+        policy_review_source
+    )
+    assert "No policy migration is approved here" in policy_review_source
 
     capability_blocked = build_toss_shadow_blocked_result(
         status="TOSS_SHADOW_AUTH_OR_NETWORK_BLOCKED",
@@ -353,6 +366,42 @@ def main() -> int:
     assert first_price_clock["parsedHttpDateAt"] == "2026-08-12T00:00:01Z"
     assert first_price_clock["requestDurationMs"] >= 0
     assert len(success["prices"]) == 300
+    success_timestamp_diagnostics = success["diagnostics"]
+    assert success_timestamp_diagnostics["timestampFieldPresentRows"] == 300
+    assert success_timestamp_diagnostics["timestampFieldAbsentRows"] == 0
+    assert success_timestamp_diagnostics["timestampNullRows"] == 0
+    assert success_timestamp_diagnostics["timestampBlankRows"] == 0
+    assert success_timestamp_diagnostics["timestampParseableRows"] == 300
+    assert success_timestamp_diagnostics["timestampUnparseableRows"] == 0
+    assert success_timestamp_diagnostics["timestampTypeCounts"] == {
+        "string": 300
+    }
+    assert success_timestamp_diagnostics["returnedRowsByBatch"] == [200, 100]
+    assert success_timestamp_diagnostics["missingTimestampRowsByBatch"] == [
+        0,
+        0,
+    ]
+    assert success_timestamp_diagnostics["validTimestampRowsByBatch"] == [
+        200,
+        100,
+    ]
+    assert success_timestamp_diagnostics["timestampDiagnosticStatus"] == (
+        "COMPLETE"
+    )
+    assert success_timestamp_diagnostics["timestampDiagnosticPrimaryCause"] == (
+        "TIMESTAMP_PRESENT_VALID"
+    )
+    assert success_timestamp_diagnostics["timestampDiagnosticCountMatches"] is True
+    assert success_timestamp_diagnostics["timestampUnknownOrUnclassifiedRows"] == 0
+    assert sum(
+        success_timestamp_diagnostics["responseShapeFingerprintCounts"].values()
+    ) == 300
+    assert all(
+        len(fingerprint) == 64
+        for fingerprint in success_timestamp_diagnostics[
+            "responseShapeFingerprintCounts"
+        ]
+    )
     assert len(success_session.post_calls) == 1
     assert len(success_session.get_calls) == 3
     assert all(
@@ -452,7 +501,19 @@ def main() -> int:
     )
     assert future["status"] == "TOSS_SHADOW_STALE_OR_PARTIAL"
     assert future["safeErrorCategory"] == "price_timestamp_after_response"
-    assert future["diagnostics"] == {
+    assert {
+        key: future["diagnostics"][key]
+        for key in (
+            "timestampMissingRows",
+            "futureTimestampRows",
+            "outOfCalendarDateRows",
+            "unreturnedSymbolRows",
+            "staleOrFutureRows",
+            "currencyConflictRows",
+            "minFutureSkewMs",
+            "maxFutureSkewMs",
+        )
+    } == {
         "timestampMissingRows": 0,
         "futureTimestampRows": 1,
         "outOfCalendarDateRows": 0,
@@ -610,6 +671,138 @@ def main() -> int:
     assert missing_timestamp["clockDomainEvidence"]["summary"][
         "unknownOrUnclassifiedRows"
     ] == 0
+    missing_timestamp_diagnostics = missing_timestamp["diagnostics"]
+    assert missing_timestamp_diagnostics["timestampFieldPresentRows"] == 1
+    assert missing_timestamp_diagnostics["timestampFieldAbsentRows"] == 0
+    assert missing_timestamp_diagnostics["timestampNullRows"] == 1
+    assert missing_timestamp_diagnostics["timestampBlankRows"] == 0
+    assert missing_timestamp_diagnostics["timestampParseableRows"] == 0
+    assert missing_timestamp_diagnostics["timestampUnparseableRows"] == 0
+    assert missing_timestamp_diagnostics["timestampTypeCounts"] == {"null": 1}
+    assert missing_timestamp_diagnostics["returnedRowsByBatch"] == [1]
+    assert missing_timestamp_diagnostics["missingTimestampRowsByBatch"] == [1]
+    assert missing_timestamp_diagnostics["validTimestampRowsByBatch"] == [0]
+    assert missing_timestamp_diagnostics[
+        "lastPricePresentWithoutTimestampRows"
+    ] == 1
+    assert missing_timestamp_diagnostics[
+        "currencyPresentWithoutTimestampRows"
+    ] == 1
+    assert missing_timestamp_diagnostics["timestampDiagnosticStatus"] == (
+        "CLASSIFIED"
+    )
+    assert missing_timestamp_diagnostics["timestampDiagnosticPrimaryCause"] == (
+        "DOCUMENTED_NULLABLE_TIMESTAMP"
+    )
+    assert missing_timestamp_diagnostics["timestampDiagnosticCountMatches"] is True
+    assert missing_timestamp_diagnostics["timestampUnknownOrUnclassifiedRows"] == 0
+    assert missing_timestamp["sourceAsOf"] is None
+    assert missing_timestamp["eligible"] is False
+
+    timestamp_absent = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row_without_timestamp(symbol) for symbol in symbols
+                    ]
+                },
+                headers=RATE_HEADERS,
+            )
+        )
+    )
+    absent_diagnostics = timestamp_absent["diagnostics"]
+    assert timestamp_absent["safeErrorCategory"] == "price_timestamp_missing"
+    assert absent_diagnostics["timestampFieldPresentRows"] == 0
+    assert absent_diagnostics["timestampFieldAbsentRows"] == 1
+    assert absent_diagnostics["timestampTypeCounts"] == {"absent": 1}
+    assert absent_diagnostics["timestampDiagnosticPrimaryCause"] == (
+        "TIMESTAMP_KEY_ABSENT"
+    )
+
+    timestamp_blank = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(symbol, timestamp=" ") for symbol in symbols
+                    ]
+                },
+                headers=RATE_HEADERS,
+            )
+        )
+    )
+    blank_diagnostics = timestamp_blank["diagnostics"]
+    assert blank_diagnostics["timestampBlankRows"] == 1
+    assert blank_diagnostics["timestampUnparseableRows"] == 0
+    assert blank_diagnostics["timestampDiagnosticPrimaryCause"] == (
+        "TIMESTAMP_NULL_OR_BLANK"
+    )
+
+    timestamp_unparseable = _collect(
+        _Session(
+            prices=lambda symbols, _: _Response(
+                200,
+                {
+                    "result": [
+                        _price_row(symbol, timestamp="not-a-timestamp")
+                        for symbol in symbols
+                    ]
+                },
+                headers=RATE_HEADERS,
+            )
+        )
+    )
+    unparseable_diagnostics = timestamp_unparseable["diagnostics"]
+    assert unparseable_diagnostics["timestampUnparseableRows"] == 1
+    assert unparseable_diagnostics["timestampDiagnosticPrimaryCause"] == (
+        "TIMESTAMP_FORMAT_UNPARSEABLE"
+    )
+
+    def mixed_timestamp_shapes(symbols: list[str], _: int) -> _Response:
+        rows = [_price_row(symbol) for symbol in symbols]
+        rows[0].pop("timestamp")
+        rows[1]["timestamp"] = None
+        rows[2]["timestamp"] = " "
+        rows[3]["timestamp"] = "not-a-timestamp"
+        return _Response(200, {"result": rows}, headers=RATE_HEADERS)
+
+    mixed_timestamp_result = _collect(
+        _Session(prices=mixed_timestamp_shapes),
+        [f"S{index:03d}" for index in range(300)],
+    )
+    mixed_timestamp_diagnostics = mixed_timestamp_result["diagnostics"]
+    assert mixed_timestamp_result["status"] == "TOSS_SHADOW_STALE_OR_PARTIAL"
+    assert mixed_timestamp_result["summary"]["requestedRows"] == 300
+    assert mixed_timestamp_result["summary"]["matchedRows"] == 292
+    assert mixed_timestamp_result["summary"]["missingRows"] == 8
+    assert mixed_timestamp_diagnostics["timestampMissingRows"] == 8
+    assert mixed_timestamp_diagnostics["timestampFieldPresentRows"] == 298
+    assert mixed_timestamp_diagnostics["timestampFieldAbsentRows"] == 2
+    assert mixed_timestamp_diagnostics["timestampNullRows"] == 2
+    assert mixed_timestamp_diagnostics["timestampBlankRows"] == 2
+    assert mixed_timestamp_diagnostics["timestampParseableRows"] == 292
+    assert mixed_timestamp_diagnostics["timestampUnparseableRows"] == 2
+    assert mixed_timestamp_diagnostics["timestampTypeCounts"] == {
+        "absent": 2,
+        "null": 2,
+        "string": 296,
+    }
+    assert mixed_timestamp_diagnostics["returnedRowsByBatch"] == [200, 100]
+    assert mixed_timestamp_diagnostics["missingTimestampRowsByBatch"] == [4, 4]
+    assert mixed_timestamp_diagnostics["validTimestampRowsByBatch"] == [196, 96]
+    assert mixed_timestamp_diagnostics["timestampDiagnosticPrimaryCause"] == (
+        "MIXED_RESPONSE_SCHEMA_VARIANT"
+    )
+    assert mixed_timestamp_diagnostics["timestampDiagnosticCountMatches"] is True
+    assert mixed_timestamp_diagnostics["timestampUnknownOrUnclassifiedRows"] == 0
+    assert sum(
+        mixed_timestamp_diagnostics["responseShapeFingerprintCounts"].values()
+    ) == 300
+    mixed_serialized = json.dumps(mixed_timestamp_diagnostics, sort_keys=True)
+    assert all(symbol not in mixed_serialized for symbol in ["S000", "S299"])
 
     outside_calendar = _collect(
         _Session(
