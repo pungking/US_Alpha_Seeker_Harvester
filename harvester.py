@@ -999,6 +999,131 @@ def complete_same_stage3_sentinel(
         }
 
 
+def persist_toss_shadow_alert_receipt(
+    root_id: str,
+    sys_id: str,
+    request_source_artifact: Mapping[str, Any],
+    result: dict[str, Any],
+    *,
+    initial_canonical_published: bool,
+) -> dict[str, Any]:
+    delivery = dict(result.get("alertDelivery") or {})
+    delivery_status = str(delivery.get("status") or "ALERT_RECEIPT_UNVERIFIED")
+    persisted_status = {
+        "ALERT_DELIVERED": "ALERT_RECEIPT_PERSISTED",
+        "ALERT_SUPPRESSED_DUPLICATE": (
+            "ALERT_SUPPRESSED_DUPLICATE_RECEIPT_PERSISTED"
+        ),
+        "ALERT_CONFIG_MISSING": "ALERT_CONFIG_MISSING_RECEIPT_PERSISTED",
+        "ALERT_DELIVERY_FAILED": "ALERT_DELIVERY_FAILED_RECEIPT_PERSISTED",
+        "ALERT_NOT_REQUIRED": "ALERT_NOT_REQUIRED",
+    }.get(delivery_status, "ALERT_RECEIPT_UNVERIFIED")
+    failed_status = (
+        "ALERT_DELIVERED_RECEIPT_PERSIST_FAILED"
+        if delivery.get("delivered") is True
+        else "ALERT_RECEIPT_UNVERIFIED"
+    )
+    delivery.update(
+        {
+            "attempted": delivery.get("attempted") is True,
+            "delivered": delivery.get("delivered") is True,
+            "duplicateSuppressed": delivery.get("duplicateSuppressed") is True,
+            "receiptRecordedAt": datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "receiptPersistenceStatus": "ALERT_RECEIPT_UNVERIFIED",
+            "receiptPersistenceErrorCategory": None,
+            "localArtifactPersisted": True,
+            "driveArtifactPersisted": False,
+        }
+    )
+    result["alertDelivery"] = delivery
+
+    def write_local(label: str) -> bool:
+        try:
+            write_json_report(HARVESTER_TOSS_SHADOW_PATH, result, label)
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            delivery["localArtifactPersisted"] = False
+            delivery["receiptPersistenceStatus"] = failed_status
+            delivery["receiptPersistenceErrorCategory"] = type(exc).__name__
+            return False
+
+    if not write_local("Toss alert receipt pending Drive persistence"):
+        return {
+            "status": failed_status,
+            "canonicalPublished": False,
+            "canonicalArtifactSha256": None,
+            "safeErrorCategory": delivery["receiptPersistenceErrorCategory"],
+        }
+
+    if not initial_canonical_published:
+        delivery["receiptPersistenceStatus"] = failed_status
+        delivery["receiptPersistenceErrorCategory"] = (
+            "initial_canonical_not_published"
+        )
+        write_local("Toss alert receipt persistence failed")
+        return {
+            "status": failed_status,
+            "canonicalPublished": False,
+            "canonicalArtifactSha256": None,
+            "safeErrorCategory": "initial_canonical_not_published",
+        }
+
+    receipt_window = inspect_same_stage3_handoff_window(
+        root_id,
+        sys_id,
+        request_source_artifact,
+    )
+    if receipt_window.get("open") is not True:
+        error_category = (
+            "stage3_hash_mismatch"
+            if receipt_window.get("sourceArtifactMatches") is not True
+            else "stage3_handoff_window_closed"
+        )
+        delivery["receiptPersistenceStatus"] = failed_status
+        delivery["receiptPersistenceErrorCategory"] = error_category
+        write_local("Toss alert receipt Stage3 mismatch")
+        return {
+            "status": failed_status,
+            "canonicalPublished": False,
+            "canonicalArtifactSha256": None,
+            "safeErrorCategory": error_category,
+        }
+
+    delivery["receiptPersistenceStatus"] = persisted_status
+    delivery["driveArtifactPersisted"] = True
+    try:
+        upload_json(TOSS_MARKET_DATA_SHADOW_FILENAME, result, sys_id)
+    except Exception as exc:
+        delivery["driveArtifactPersisted"] = False
+        delivery["receiptPersistenceStatus"] = failed_status
+        delivery["receiptPersistenceErrorCategory"] = type(exc).__name__
+        write_local("Toss alert receipt Drive persistence failed")
+        return {
+            "status": failed_status,
+            "canonicalPublished": False,
+            "canonicalArtifactSha256": None,
+            "safeErrorCategory": type(exc).__name__,
+        }
+
+    canonical_sha256 = _canonical_sha256(result)
+    if not write_local("Toss alert receipt persisted"):
+        return {
+            "status": failed_status,
+            "canonicalPublished": True,
+            "canonicalArtifactSha256": canonical_sha256,
+            "safeErrorCategory": delivery["receiptPersistenceErrorCategory"],
+        }
+    return {
+        "status": persisted_status,
+        "canonicalPublished": True,
+        "canonicalArtifactSha256": canonical_sha256,
+        "safeErrorCategory": None,
+    }
+
+
 def ensure_toss_shadow_market_data(
     root_id: str,
     sys_id: str,
@@ -1258,16 +1383,39 @@ def ensure_toss_shadow_market_data(
             f"(category={persistence.get('safeErrorCategory') or 'unknown'})",
             flush=True,
         )
+    previous_alert = (
+        previous.get("alertDelivery") if isinstance(previous, Mapping) else None
+    )
+    previous_fingerprint = (
+        previous_alert.get("alertFingerprint")
+        if isinstance(previous_alert, Mapping)
+        else None
+    )
+    sent_fingerprints = (
+        {previous_fingerprint}
+        if isinstance(previous_fingerprint, str)
+        and re.fullmatch(r"[0-9a-f]{64}", previous_fingerprint)
+        else set()
+    )
     result["alertDelivery"] = dispatch_toss_shadow_alert(
         result,
         previous_status=previous_status,
-        sent_fingerprints=set(),
+        sent_fingerprints=sent_fingerprints,
         sender=alert_sender or send_telegram,
+    )
+    receipt_persistence = persist_toss_shadow_alert_receipt(
+        root_id,
+        sys_id,
+        source_artifact,
+        result,
+        initial_canonical_published=(
+            persistence.get("canonicalPublished") is True
+        ),
     )
     sentinel_status = (
         "SUCCESS"
         if result.get("status") == "TOSS_SHADOW_PASS"
-        and persistence.get("canonicalPublished") is True
+        and receipt_persistence.get("canonicalPublished") is True
         else "FAILED"
     )
     result.update(
@@ -1275,7 +1423,7 @@ def ensure_toss_shadow_market_data(
             reservation,
             status=sentinel_status,
             artifact_sha256=(
-                persistence.get("canonicalArtifactSha256")
+                receipt_persistence.get("canonicalArtifactSha256")
                 if sentinel_status == "SUCCESS"
                 else None
             ),

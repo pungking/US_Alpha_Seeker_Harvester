@@ -1848,12 +1848,23 @@ def collect_toss_shadow_market_data(
     return result
 
 
-def _alert_fingerprint(status: str, category: Any, endpoint: Any) -> str:
+def _alert_fingerprint(
+    status: str,
+    category: Any,
+    endpoint: Any,
+    stage3_sha256: Any,
+) -> str:
     return _canonical_sha256(
         {
             "status": status,
             "safeErrorCategory": str(category or "none"),
             "affectedEndpointGroup": str(endpoint or "none"),
+            "stage3Sha256": (
+                stage3_sha256
+                if isinstance(stage3_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", stage3_sha256)
+                else "none"
+            ),
         }
     )
 
@@ -1883,6 +1894,17 @@ def dispatch_toss_shadow_alert(
     sender: Callable[..., Mapping[str, Any]],
 ) -> dict[str, Any]:
     status = str(result.get("status") or "TOSS_SHADOW_SCHEMA_INVALID")
+    lineage = result.get("requestLineage")
+    source_artifact = (
+        lineage.get("requestSourceArtifact")
+        if isinstance(lineage, Mapping)
+        else None
+    )
+    stage3_sha256 = (
+        source_artifact.get("sha256")
+        if isinstance(source_artifact, Mapping)
+        else None
+    )
     alert_type: str | None = None
     if status == PASS_STATUS:
         if previous_status in FAILURE_STATUSES:
@@ -1893,6 +1915,9 @@ def dispatch_toss_shadow_alert(
                 "alertType": None,
                 "alertFingerprint": None,
                 "safeErrorCategory": None,
+                "attempted": False,
+                "delivered": False,
+                "duplicateSuppressed": False,
             }
     elif status in FAILURE_STATUSES:
         alert_type = "TOSS_SHADOW_FAILURE"
@@ -1902,12 +1927,16 @@ def dispatch_toss_shadow_alert(
             "alertType": None,
             "alertFingerprint": None,
             "safeErrorCategory": None,
+            "attempted": False,
+            "delivered": False,
+            "duplicateSuppressed": False,
         }
 
     fingerprint = _alert_fingerprint(
         alert_type,
         result.get("safeErrorCategory"),
         result.get("affectedEndpointGroup"),
+        stage3_sha256,
     )
     if fingerprint in sent_fingerprints:
         return {
@@ -1915,6 +1944,9 @@ def dispatch_toss_shadow_alert(
             "alertType": alert_type,
             "alertFingerprint": fingerprint,
             "safeErrorCategory": None,
+            "attempted": False,
+            "delivered": False,
+            "duplicateSuppressed": True,
         }
     sent_fingerprints.add(fingerprint)
 
@@ -1991,6 +2023,9 @@ def dispatch_toss_shadow_alert(
             "alertType": alert_type,
             "alertFingerprint": fingerprint,
             "safeErrorCategory": type(exc).__name__,
+            "attempted": True,
+            "delivered": False,
+            "duplicateSuppressed": False,
         }
     if delivery.get("delivered") is True:
         alert_status = "ALERT_DELIVERED"
@@ -2007,4 +2042,7 @@ def dispatch_toss_shadow_alert(
         "alertFingerprint": fingerprint,
         "safeErrorCategory": delivery.get("safeErrorCategory"),
         "httpStatusCategory": http_status_category,
+        "attempted": delivery.get("attempted") is True,
+        "delivered": delivery.get("delivered") is True,
+        "duplicateSuppressed": False,
     }

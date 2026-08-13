@@ -1076,6 +1076,9 @@ def main() -> int:
         sender=delivered,
     )
     assert alert["status"] == "ALERT_DELIVERED"
+    assert alert["attempted"] is True
+    assert alert["delivered"] is True
+    assert alert["duplicateSuppressed"] is False
     assert len(sent) == 1
     assert "canonical analysis continued=true" in sent[0]
     assert "HTTP: `4xx`" in sent[0]
@@ -1110,7 +1113,34 @@ def main() -> int:
         sender=delivered,
     )
     assert duplicate["status"] == "ALERT_SUPPRESSED_DUPLICATE"
+    assert duplicate["attempted"] is False
+    assert duplicate["delivered"] is False
+    assert duplicate["duplicateSuppressed"] is True
     assert len(sent) == 1
+
+    stage_a_alert = dispatch_toss_shadow_alert(
+        {
+            **blocked,
+            "requestLineage": {
+                "requestSourceArtifact": {"sha256": "a" * 64}
+            },
+        },
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=delivered,
+    )
+    stage_b_alert = dispatch_toss_shadow_alert(
+        {
+            **blocked,
+            "requestLineage": {
+                "requestSourceArtifact": {"sha256": "b" * 64}
+            },
+        },
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=delivered,
+    )
+    assert stage_a_alert["alertFingerprint"] != stage_b_alert["alertFingerprint"]
 
     clock_alert = dispatch_toss_shadow_alert(
         local_clock_behind,
@@ -1144,6 +1174,9 @@ def main() -> int:
         },
     )
     assert config_missing["status"] == "ALERT_CONFIG_MISSING"
+    assert config_missing["attempted"] is False
+    assert config_missing["delivered"] is False
+    assert config_missing["duplicateSuppressed"] is False
 
     delivery_failure = dispatch_toss_shadow_alert(
         blocked,
@@ -1152,6 +1185,9 @@ def main() -> int:
         sender=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("secret detail")),
     )
     assert delivery_failure["status"] == "ALERT_DELIVERY_FAILED"
+    assert delivery_failure["attempted"] is True
+    assert delivery_failure["delivered"] is False
+    assert delivery_failure["duplicateSuppressed"] is False
     assert delivery_failure["safeErrorCategory"] == "RuntimeError"
     assert "secret detail" not in json.dumps(delivery_failure)
 
