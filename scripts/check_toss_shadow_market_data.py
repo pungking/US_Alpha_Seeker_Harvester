@@ -210,8 +210,7 @@ def main() -> int:
     assert "toss_shadow_runtime_decision" in harvester_source
     assert "TOSS_MARKET_DATA_SHADOW.json" in harvester_source
     assert "ensure_toss_shadow_market_data" in harvester_source
-    assert "load_latest_stage3_shadow_symbols" in harvester_source
-    assert "load_latest_stage3_shadow_scope" in harvester_source
+    assert "load_stage3_shadow_handoff_scope" in harvester_source
     assert "request_source_artifact" in harvester_source
     assert "TOSS_SHADOW_PROVIDER_ENABLED: 'false'" in workflow_source
     assert "TOSS_SHADOW_REGISTERED_EGRESS_CONFIRMED: 'false'" in workflow_source
