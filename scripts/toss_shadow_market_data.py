@@ -4,9 +4,11 @@ import datetime
 import email.utils
 import hashlib
 import json
+import os
 import re
 import time
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from zoneinfo import ZoneInfo
 
@@ -172,6 +174,384 @@ def _sanitize_request_source_artifact(value: Any) -> dict[str, Any] | None:
     if generated_at_source is not None:
         safe["generatedAtSource"] = generated_at_source
     return safe
+
+
+def build_stage3_request_scope(
+    *,
+    file_name: str,
+    payload: Any,
+    expected_sha256: str | None = None,
+    drive_created_at: str | None = None,
+) -> dict[str, Any]:
+    base = {
+        "status": "REQUEST_SOURCE_ARTIFACT_INVALID",
+        "symbols": [],
+        "sourceArtifact": None,
+        "normalizationCollisionRows": 0,
+        "invalidSymbolRows": 0,
+    }
+    if (
+        not isinstance(file_name, str)
+        or not re.fullmatch(r"STAGE3_FUNDAMENTAL_FULL_[A-Za-z0-9_.-]{1,220}", file_name)
+        or not isinstance(payload, (dict, list))
+    ):
+        return base
+
+    actual_sha256 = _canonical_sha256(payload)
+    if expected_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256)):
+            return {**base, "status": "REQUEST_SOURCE_HASH_INVALID"}
+        if actual_sha256 != expected_sha256:
+            return {**base, "status": "REQUEST_SOURCE_HASH_MISMATCH"}
+
+    rows = (
+        payload.get("fundamental_universe") or payload.get("stocks") or []
+        if isinstance(payload, dict)
+        else payload
+    )
+    if not isinstance(rows, list) or not rows:
+        return base
+
+    normalized_rows: list[str] = []
+    invalid_symbol_rows = 0
+    for row in rows:
+        symbol = row.get("symbol") if isinstance(row, dict) else None
+        normalized = str(symbol or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9.-]+", normalized):
+            invalid_symbol_rows += 1
+            continue
+        normalized_rows.append(normalized)
+    symbols = sorted(set(normalized_rows))
+    collision_rows = len(normalized_rows) - len(symbols)
+    if invalid_symbol_rows:
+        return {
+            **base,
+            "status": "REQUEST_SOURCE_SYMBOL_INVALID",
+            "invalidSymbolRows": invalid_symbol_rows,
+        }
+    if collision_rows:
+        return {
+            **base,
+            "status": "NORMALIZATION_COLLISION",
+            "normalizationCollisionRows": collision_rows,
+        }
+
+    manifest = payload.get("manifest") if isinstance(payload, dict) else None
+    artifact_timestamp = (
+        payload.get("generated_at") or payload.get("generatedAt")
+        if isinstance(payload, dict)
+        else None
+    )
+    if artifact_timestamp is None and isinstance(manifest, dict):
+        artifact_timestamp = (
+            manifest.get("timestamp")
+            or manifest.get("generated_at")
+            or manifest.get("generatedAt")
+        )
+    if _parse_timestamp(artifact_timestamp) is not None:
+        generated_at = str(artifact_timestamp)
+        generated_at_source = "ARTIFACT_FIELD"
+    elif _parse_timestamp(drive_created_at) is not None:
+        generated_at = str(drive_created_at)
+        generated_at_source = "GOOGLE_DRIVE_CREATED_TIME"
+    else:
+        return {**base, "status": "REQUEST_SOURCE_TIMESTAMP_INVALID"}
+
+    request_scope_sha256 = _symbol_scope_sha256(symbols)
+    source_artifact = {
+        "file": file_name,
+        "sha256": actual_sha256,
+        "hashBasis": "CANONICAL_JSON",
+        "generatedAt": generated_at,
+        "generatedAtSource": generated_at_source,
+        "requestScopeSha256": request_scope_sha256,
+    }
+    return {
+        "status": "VERIFIED_STAGE3_REQUEST_SCOPE",
+        "symbols": symbols,
+        "sourceArtifact": source_artifact,
+        "normalizationCollisionRows": 0,
+        "invalidSymbolRows": 0,
+        "requestScopeSha256": request_scope_sha256,
+    }
+
+
+def same_stage3_idempotency_key(request_source_artifact: Mapping[str, Any]) -> str:
+    source = _sanitize_request_source_artifact(request_source_artifact)
+    if source is None:
+        raise ValueError("invalid_request_source_artifact")
+    return _canonical_sha256(
+        {
+            "schemaVersion": SCHEMA_VERSION,
+            "file": source["file"],
+            "sha256": source["sha256"],
+            "hashBasis": source["hashBasis"],
+            "requestScopeSha256": source["requestScopeSha256"],
+        }
+    )
+
+
+def toss_shadow_matches_stage3(
+    shadow: Any,
+    request_source_artifact: Mapping[str, Any],
+) -> bool:
+    expected = _sanitize_request_source_artifact(request_source_artifact)
+    lineage = shadow.get("requestLineage") if isinstance(shadow, Mapping) else None
+    actual = _sanitize_request_source_artifact(
+        lineage.get("requestSourceArtifact") if isinstance(lineage, Mapping) else None
+    )
+    summary = shadow.get("summary") if isinstance(shadow, Mapping) else None
+    prices = shadow.get("prices") if isinstance(shadow, Mapping) else None
+    request_counts = (
+        shadow.get("requestCounts") if isinstance(shadow, Mapping) else None
+    )
+    response_sha256 = (
+        shadow.get("responseSha256") if isinstance(shadow, Mapping) else None
+    )
+    price_request_count = (
+        request_counts.get("prices") if isinstance(request_counts, Mapping) else None
+    )
+    return bool(
+        expected
+        and actual
+        and shadow.get("schemaVersion") == SCHEMA_VERSION
+        and shadow.get("status") == PASS_STATUS
+        and shadow.get("mode") == "SHADOW_ONLY"
+        and shadow.get("provider") == "TOSS_OPEN_API"
+        and shadow.get("eligible") is True
+        and shadow.get("tossEvidenceExcluded") is False
+        and shadow.get("canonicalSourceChanged") is False
+        and shadow.get("policyImpact") == "NONE_REPORT_ONLY"
+        and shadow.get("accountHeaderUsed") is False
+        and shadow.get("orderEndpointUsed") is False
+        and shadow.get("rateLimitHeadersComplete") is True
+        and isinstance(summary, Mapping)
+        and isinstance(prices, list)
+        and isinstance(summary.get("requestedRows"), int)
+        and summary.get("requestedRows") > 0
+        and summary.get("requestedRows") == summary.get("matchedRows")
+        and summary.get("matchedRows") == len(prices)
+        and summary.get("missingRows") == 0
+        and summary.get("invalidRows") == 0
+        and summary.get("duplicateRows") == 0
+        and isinstance(request_counts, Mapping)
+        and request_counts.get("oauth") == 1
+        and request_counts.get("marketCalendar") == 1
+        and isinstance(price_request_count, int)
+        and 1 <= price_request_count <= MAX_PRICE_REQUESTS_PER_RUN
+        and isinstance(response_sha256, Mapping)
+        and re.fullmatch(r"[0-9a-f]{64}", str(response_sha256.get("oauth") or ""))
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(response_sha256.get("marketCalendar") or "")
+        )
+        and isinstance(response_sha256.get("prices"), list)
+        and len(response_sha256["prices"]) == price_request_count
+        and all(
+            re.fullmatch(r"[0-9a-f]{64}", str(value or ""))
+            for value in response_sha256["prices"]
+        )
+        and isinstance(lineage, Mapping)
+        and lineage.get("status") == "VERIFIED_STAGE3_REQUEST_SCOPE"
+        and lineage.get("requestScopeSha256") == expected["requestScopeSha256"]
+        and all(
+            actual[key] == expected[key]
+            for key in ("file", "sha256", "hashBasis", "requestScopeSha256")
+        )
+    )
+
+
+def same_stage3_scope_matches(
+    scope: Any,
+    request_source_artifact: Mapping[str, Any],
+) -> bool:
+    expected = _sanitize_request_source_artifact(request_source_artifact)
+    actual = _sanitize_request_source_artifact(
+        scope.get("sourceArtifact") if isinstance(scope, Mapping) else None
+    )
+    return bool(
+        expected
+        and actual
+        and scope.get("status") == "VERIFIED_STAGE3_REQUEST_SCOPE"
+        and all(
+            actual[key] == expected[key]
+            for key in ("file", "sha256", "hashBasis", "requestScopeSha256")
+        )
+    )
+
+
+def build_same_stage3_readiness(
+    *,
+    scope: Mapping[str, Any],
+    existing_shadow: Any,
+    collector_enabled: bool,
+) -> dict[str, Any]:
+    source = scope.get("sourceArtifact") if isinstance(scope, Mapping) else None
+    source_valid = (
+        scope.get("status") == "VERIFIED_STAGE3_REQUEST_SCOPE"
+        and _sanitize_request_source_artifact(source) is not None
+    )
+    matched = source_valid and toss_shadow_matches_stage3(existing_shadow, source)
+    symbols = scope.get("symbols") if isinstance(scope.get("symbols"), list) else []
+    existing_lineage = (
+        existing_shadow.get("requestLineage")
+        if isinstance(existing_shadow, Mapping)
+        else None
+    )
+    existing_source = (
+        existing_lineage.get("requestSourceArtifact")
+        if isinstance(existing_lineage, Mapping)
+        else None
+    )
+    idempotency_key = same_stage3_idempotency_key(source) if source_valid else None
+    if matched:
+        status = "EXISTING_MATCHED_SHADOW_REUSABLE"
+        request_budget = {"oauth": 0, "marketCalendar": 0, "pricesMax": 0}
+        next_action = "reuse_existing_matched_shadow"
+    elif source_valid:
+        status = "SAME_STAGE3_HANDOFF_READY_FOR_ACTIVATION"
+        request_budget = {
+            "oauth": 1,
+            "marketCalendar": 1,
+            "pricesMax": min(MAX_PRICE_REQUESTS_PER_RUN, (len(symbols) + 199) // 200),
+        }
+        next_action = "activate_registered_mac_collector"
+    else:
+        status = "STATIC_CONTRACT_DEFECT"
+        request_budget = {"oauth": 0, "marketCalendar": 0, "pricesMax": 0}
+        next_action = "repair_stage3_handoff_evidence"
+    return {
+        "status": status,
+        "detectedStage3File": source.get("file") if isinstance(source, Mapping) else None,
+        "detectedStage3Sha256": source.get("sha256") if isinstance(source, Mapping) else None,
+        "stage3HashVerified": source_valid,
+        "requestScopeSha256": source.get("requestScopeSha256") if isinstance(source, Mapping) else None,
+        "existingShadowSourceFile": existing_source.get("file") if isinstance(existing_source, Mapping) else None,
+        "existingShadowSourceSha256": existing_source.get("sha256") if isinstance(existing_source, Mapping) else None,
+        "sourceArtifactMatches": bool(matched),
+        "idempotencyKey": idempotency_key,
+        "collectorRequired": bool(source_valid and not matched),
+        "collectorEnabled": bool(collector_enabled),
+        "requestBudget": request_budget,
+        "publishReady": source_valid,
+        "canonicalAnalysisCanContinue": True,
+        "primaryHandoffBlocker": None if matched else "MAC_COLLECTOR_CONFIGURATION_REQUIRED" if source_valid else str(scope.get("status") or "STATIC_CONTRACT_DEFECT"),
+        "nextAction": next_action,
+    }
+
+
+def reserve_same_stage3_sentinel(
+    directory: Path,
+    idempotency_key: str,
+    request_source_artifact: Mapping[str, Any],
+    reserved_at: str,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{64}", idempotency_key):
+        raise ValueError("invalid_idempotency_key")
+    source = _sanitize_request_source_artifact(request_source_artifact)
+    if source is None or _parse_timestamp(reserved_at) is None:
+        raise ValueError("invalid_sentinel_contract")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / f"{idempotency_key}.json"
+    payload = {
+        "schemaVersion": "toss-same-stage3-sentinel-v1",
+        "status": "IN_PROGRESS",
+        "idempotencyKey": idempotency_key,
+        "requestSourceArtifact": source,
+        "reservedAt": reserved_at,
+    }
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"status": "SENTINEL_INVALID", "path": str(path)}
+        status = str(existing.get("status") or "SENTINEL_INVALID")
+        return {
+            "status": status if status in {"IN_PROGRESS", "SUCCESS", "FAILED"} else "SENTINEL_INVALID",
+            "path": str(path),
+        }
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
+        handle.write("\n")
+    return {"status": "RESERVED", "path": str(path)}
+
+
+def finish_same_stage3_sentinel(
+    path: Path,
+    *,
+    status: str,
+    completed_at: str,
+    artifact_sha256: str | None = None,
+) -> None:
+    if status not in {"SUCCESS", "FAILED"} or _parse_timestamp(completed_at) is None:
+        raise ValueError("invalid_sentinel_completion")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("status") != "IN_PROGRESS":
+        raise ValueError("sentinel_not_in_progress")
+    if artifact_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256):
+        raise ValueError("invalid_artifact_sha256")
+    payload.update({"status": status, "completedAt": completed_at})
+    if artifact_sha256 is not None:
+        payload["artifactSha256"] = artifact_sha256
+        payload["artifactFile"] = "TOSS_MARKET_DATA_SHADOW.json"
+        payload["artifactHashBasis"] = "CANONICAL_JSON"
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, path)
+
+
+def _shadow_archive_filename(payload: Mapping[str, Any]) -> str:
+    lineage = payload.get("requestLineage")
+    source = (
+        lineage.get("requestSourceArtifact") if isinstance(lineage, Mapping) else None
+    )
+    try:
+        key = same_stage3_idempotency_key(source)
+    except (TypeError, ValueError):
+        key = _canonical_sha256(payload)
+    status = re.sub(r"[^A-Z0-9_]+", "_", str(payload.get("status") or "UNKNOWN").upper())[:48]
+    revision = _canonical_sha256(payload)[:16]
+    return f"TOSS_MARKET_DATA_SHADOW_{key[:16]}_{status}_{revision}.json"
+
+
+def publish_toss_shadow_with_archive(
+    *,
+    previous_shadow: Any,
+    current_shadow: Mapping[str, Any],
+    uploader: Callable[[str, Mapping[str, Any]], None],
+) -> dict[str, Any]:
+    uploaded: list[str] = []
+    try:
+        canonical_sha256 = _canonical_sha256(current_shadow)
+        if isinstance(previous_shadow, Mapping):
+            previous_name = _shadow_archive_filename(previous_shadow)
+            uploader(previous_name, previous_shadow)
+            uploaded.append(previous_name)
+        current_name = _shadow_archive_filename(current_shadow)
+        uploader(current_name, current_shadow)
+        uploaded.append(current_name)
+        uploader("TOSS_MARKET_DATA_SHADOW.json", current_shadow)
+        uploaded.append("TOSS_MARKET_DATA_SHADOW.json")
+    except Exception as exc:
+        return {
+            "status": "ARCHIVE_OR_CANONICAL_FAILED",
+            "safeErrorCategory": type(exc).__name__,
+            "uploadedFiles": uploaded,
+            "canonicalPublished": False,
+            "canonicalArtifactSha256": None,
+        }
+    return {
+        "status": "ARCHIVE_AND_CANONICAL_COMPLETE",
+        "safeErrorCategory": None,
+        "uploadedFiles": uploaded,
+        "canonicalPublished": True,
+        "canonicalArtifactSha256": canonical_sha256,
+    }
 
 
 def _rate_limit_evidence(response: _Response) -> dict[str, Any]:
@@ -1417,6 +1797,12 @@ def dispatch_toss_shadow_alert(
         if isinstance(offset_min, int) and isinstance(offset_max, int)
         else "not_available"
     )
+    request_count_labels = {
+        key: str(counts.get(key))
+        if isinstance(counts.get(key), int) and counts.get(key) >= 0
+        else "unknown"
+        for key in ("oauth", "marketCalendar", "prices")
+    }
     if alert_type == "TOSS_SHADOW_RECOVERED":
         message = (
             "✅ *Toss SHADOW source recovered*\n"
@@ -1441,9 +1827,9 @@ def dispatch_toss_shadow_alert(
             f"AffectedRows: `{affected_rows}`\n"
             f"OffsetMs: `{offset_range}`\n"
             "Requests: "
-            f"oauth={int(counts.get('oauth') or 0)}, "
-            f"calendar={int(counts.get('marketCalendar') or 0)}, "
-            f"prices={int(counts.get('prices') or 0)}\n"
+            f"oauth={request_count_labels['oauth']}, "
+            f"calendar={request_count_labels['marketCalendar']}, "
+            f"prices={request_count_labels['prices']}\n"
             "CircuitBreaker: `OPEN_FOR_RUN`\n"
             "Toss evidence excluded=true\n"
             "canonical analysis continued=true\n"

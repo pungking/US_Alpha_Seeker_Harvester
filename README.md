@@ -268,3 +268,29 @@ clock. A running daemon alone does not prove offset accuracy. If the exact
 network-time state or offset cannot be verified without privileged or external
 checks, report `MAC_CLOCK_SYNC_UNVERIFIED`; do not infer synchronization and do
 not compensate timestamps in code.
+
+### Same-Stage3 Mac handoff
+
+The optional Mac collector consumes the exact Stage3 file/hash/scope published
+in `COLLECTION_PROGRESS.json`; it does not independently choose a newer Stage3
+after locking that handoff. The dispatch path also records the same canonical
+JSON hash and request-scope hash in `LATEST_STAGE4_READY.json`. A missing or
+mismatched exact file is blocked before any Toss request and never falls back to
+another Stage3 artifact.
+
+`python harvester.py --toss-shadow-collector` is the prepared one-shot entrypoint.
+It remains disabled unless both existing Mac-only provider gates are enabled.
+Collection is allowed only while the exact Stage3 progress handshake is still
+`PROCESSING`; a completed Stage4-ready window causes zero Toss requests.
+For each verified Stage3 source it derives one idempotency key, atomically
+reserves a private local sentinel, reuses an already matched successful shadow
+with zero Toss requests, and preserves failed/in-progress sentinels instead of
+automatically retrying. Drive publication archives the previous and current
+shadow before replacing `TOSS_MARKET_DATA_SHADOW.json`; publication failure
+leaves canonical Google Drive/yfinance analysis fail-open and excludes Toss.
+
+No recurring `launchd` job is installed by this repository change. Activation
+requires a separate approval, server-side secret loading, the registered Mac
+egress, and an explicit rollback that unloads the job without deleting sentinel
+or Drive archive evidence. GitHub-hosted runners keep both Toss probes disabled
+and make zero Toss requests.

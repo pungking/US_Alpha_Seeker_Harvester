@@ -13,6 +13,7 @@ import ssl
 import traceback
 import hashlib
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 import yfinance as yf
 from collections import Counter
 from html.parser import HTMLParser
@@ -31,9 +32,17 @@ from scripts.toss_read_only_capability import (
 )
 from scripts.toss_shadow_market_data import (
     SCHEMA_VERSION as TOSS_SHADOW_MARKET_DATA_SCHEMA_VERSION,
+    build_same_stage3_readiness,
+    build_stage3_request_scope,
     build_toss_shadow_blocked_result,
     collect_toss_shadow_market_data,
     dispatch_toss_shadow_alert,
+    finish_same_stage3_sentinel,
+    publish_toss_shadow_with_archive,
+    reserve_same_stage3_sentinel,
+    same_stage3_idempotency_key,
+    same_stage3_scope_matches,
+    toss_shadow_matches_stage3,
     toss_shadow_runtime_decision,
 )
 
@@ -88,6 +97,14 @@ HARVESTER_TOSS_SHADOW_PATH = (
     os.getenv("HARVESTER_TOSS_SHADOW_PATH")
     or "state/toss-market-data-shadow.json"
 ).strip()
+HARVESTER_TOSS_SHADOW_SENTINEL_DIR = Path(
+    os.path.expanduser(
+        (
+            os.getenv("HARVESTER_TOSS_SHADOW_SENTINEL_DIR")
+            or "~/.local/state/us-alpha-seeker-harvester/toss-shadow-sentinels"
+        ).strip()
+    )
+)
 
 # Raw-first policy:
 # 1) Collect source fields directly whenever possible.
@@ -842,70 +859,148 @@ def _toss_shadow_not_run_result(reason: str) -> dict[str, Any]:
     }
 
 
-def load_latest_stage3_shadow_scope(root_id: str) -> dict[str, Any]:
+def load_stage3_shadow_scope(
+    root_id: str,
+    *,
+    expected_file: str,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    if not re.fullmatch(
+        r"STAGE3_FUNDAMENTAL_FULL_[A-Za-z0-9_.-]{1,220}",
+        str(expected_file or ""),
+    ):
+        return {
+            "status": "REQUEST_SOURCE_ARTIFACT_INVALID",
+            "symbols": [],
+            "sourceArtifact": None,
+        }
     stage3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
     if not stage3_folder_id:
-        return {"symbols": [], "sourceArtifact": None}
-    query = (
-        f"'{stage3_folder_id}' in parents and "
-        "name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
-    )
-    files = drive_service.files().list(
-        q=query,
-        fields="files(id, name, createdTime)",
-        orderBy="createdTime desc",
-        pageSize=1,
-    ).execute().get("files", [])
-    if not files:
-        return {"symbols": [], "sourceArtifact": None}
-    payload = download_json(files[0].get("id"))
-    if isinstance(payload, dict):
-        rows = payload.get("fundamental_universe") or payload.get("stocks") or []
-    elif isinstance(payload, list):
-        rows = payload
-    else:
-        rows = []
-    symbols = sorted(
-        {
-            str(row.get("symbol") or "").strip().upper()
-            for row in rows
-            if isinstance(row, dict) and str(row.get("symbol") or "").strip()
+        return {
+            "status": "STAGE3_FOLDER_MISSING",
+            "symbols": [],
+            "sourceArtifact": None,
         }
+    file_id = find_file_id(expected_file, stage3_folder_id)
+    if not file_id:
+        return {
+            "status": "EXACT_STAGE3_FILE_MISSING",
+            "symbols": [],
+            "sourceArtifact": None,
+        }
+    metadata = drive_service.files().get(
+        fileId=file_id,
+        fields="id,name,createdTime",
+    ).execute()
+    payload = download_json(file_id)
+    return build_stage3_request_scope(
+        file_name=str(metadata.get("name") or expected_file),
+        payload=payload,
+        expected_sha256=expected_sha256,
+        drive_created_at=metadata.get("createdTime"),
     )
-    payload_generated_at = (
-        payload.get("generated_at") or payload.get("generatedAt")
-        if isinstance(payload, dict)
-        else None
+
+
+def load_stage3_shadow_handoff_scope(
+    root_id: str,
+    sys_id: str,
+) -> dict[str, Any]:
+    progress_id = find_file_id("COLLECTION_PROGRESS.json", sys_id)
+    progress = download_json(progress_id) if progress_id else None
+    if not isinstance(progress, dict):
+        return {
+            "status": "DRIVE_HANDOFF_CONTRACT_INCOMPLETE",
+            "symbols": [],
+            "sourceArtifact": None,
+        }
+    expected_file = progress.get("trigger_file")
+    expected_sha256 = progress.get("trigger_sha256")
+    expected_scope_sha256 = progress.get("trigger_request_scope_sha256")
+    if progress.get("status") == "COMPLETED":
+        return {
+            "status": "STAGE4_ORDERING_WINDOW_CLOSED",
+            "symbols": [],
+            "sourceArtifact": None,
+        }
+    if (
+        progress.get("status") != "PROCESSING"
+        or progress.get("trigger_hash_basis") != "CANONICAL_JSON"
+        or not isinstance(expected_file, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256 or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(expected_scope_sha256 or ""))
+    ):
+        return {
+            "status": "DRIVE_HANDOFF_CONTRACT_INCOMPLETE",
+            "symbols": [],
+            "sourceArtifact": None,
+        }
+    scope = load_stage3_shadow_scope(
+        root_id,
+        expected_file=expected_file,
+        expected_sha256=expected_sha256,
     )
-    if _parse_iso_datetime(payload_generated_at) is not None:
-        generated_at = str(payload_generated_at)
-        generated_at_source = "ARTIFACT_FIELD"
-    elif _parse_iso_datetime(files[0].get("createdTime")) is not None:
-        generated_at = str(files[0]["createdTime"])
-        generated_at_source = "GOOGLE_DRIVE_CREATED_TIME"
-    else:
-        generated_at = None
-        generated_at_source = None
-    source_artifact = {
-        "file": str(files[0].get("name") or ""),
-        "sha256": _canonical_sha256(payload),
-        "hashBasis": "CANONICAL_JSON",
-        "generatedAt": generated_at,
-        "requestScopeSha256": hashlib.sha256(
-            "\n".join(symbols).encode("utf-8")
-        ).hexdigest(),
+    if (
+        scope.get("status") == "VERIFIED_STAGE3_REQUEST_SCOPE"
+        and scope.get("requestScopeSha256") != expected_scope_sha256
+    ):
+        return {
+            "status": "REQUEST_SCOPE_HASH_MISMATCH",
+            "symbols": [],
+            "sourceArtifact": scope.get("sourceArtifact"),
+        }
+    scope["handoffStatus"] = "VERIFIED_COLLECTION_PROGRESS_HANDOFF"
+    return scope
+
+
+def inspect_same_stage3_handoff_window(
+    root_id: str,
+    sys_id: str,
+    request_source_artifact: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        scope = load_stage3_shadow_handoff_scope(root_id, sys_id)
+    except Exception as exc:
+        return {
+            "status": "HANDOFF_WINDOW_READ_FAILED",
+            "open": False,
+            "sourceArtifactMatches": False,
+            "safeErrorCategory": type(exc).__name__,
+        }
+    matched = same_stage3_scope_matches(scope, request_source_artifact)
+    return {
+        "status": "HANDOFF_WINDOW_OPEN" if matched else str(scope.get("status")),
+        "open": matched,
+        "sourceArtifactMatches": matched,
+        "safeErrorCategory": None,
     }
-    if generated_at_source is not None:
-        source_artifact["generatedAtSource"] = generated_at_source
-    return {"symbols": symbols, "sourceArtifact": source_artifact}
 
 
-def load_latest_stage3_shadow_symbols(root_id: str) -> list[str]:
-    scope = load_latest_stage3_shadow_scope(root_id)
-    return list(scope.get("symbols") or [])
+def complete_same_stage3_sentinel(
+    reservation: Mapping[str, Any],
+    *,
+    status: str,
+    artifact_sha256: str | None = None,
+) -> dict[str, Any]:
+    completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    try:
+        finish_same_stage3_sentinel(
+            Path(str(reservation["path"])),
+            status=status,
+            completed_at=completed_at,
+            artifact_sha256=artifact_sha256,
+        )
+        return {"sentinelStatus": status, "sentinelErrorCategory": None}
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "sentinelStatus": "SENTINEL_COMPLETION_FAILED",
+            "sentinelErrorCategory": type(exc).__name__,
+        }
 
 
 def ensure_toss_shadow_market_data(
+    root_id: str,
     sys_id: str,
     candidate_symbols: Iterable[str],
     session: Any | None = None,
@@ -916,19 +1011,140 @@ def ensure_toss_shadow_market_data(
     if not enabled:
         return _toss_shadow_not_run_result(runtime_reason)
 
+    symbols = list(candidate_symbols)
+    source_artifact = dict(request_source_artifact or {})
+    scope = {
+        "status": "VERIFIED_STAGE3_REQUEST_SCOPE",
+        "symbols": symbols,
+        "sourceArtifact": source_artifact,
+    }
     previous_id = find_file_id(TOSS_MARKET_DATA_SHADOW_FILENAME, sys_id)
     previous = download_json(previous_id) if previous_id else None
     previous_status = (
         str(previous.get("status") or "").strip() if isinstance(previous, dict) else None
     ) or None
+    try:
+        idempotency_key = same_stage3_idempotency_key(source_artifact)
+    except ValueError:
+        result = build_toss_shadow_blocked_result(
+            status="TOSS_SHADOW_SCHEMA_INVALID",
+            safe_error_category="request_source_lineage_invalid",
+            capability_artifact_sha256="0" * 64,
+            retrieved_at=datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+        result["runtimeAction"] = "PRE_NETWORK_HANDOFF_BLOCKED"
+        result["runtimeReason"] = "request_source_lineage_invalid"
+        result["runtimeReadiness"] = build_same_stage3_readiness(
+            scope={**scope, "status": "REQUEST_SOURCE_ARTIFACT_INVALID"},
+            existing_shadow=previous,
+            collector_enabled=enabled,
+        )
+        write_json_report(
+            HARVESTER_TOSS_SHADOW_PATH,
+            result,
+            "Toss same-Stage3 handoff blocked",
+        )
+        return result
+
+    readiness = build_same_stage3_readiness(
+        scope=scope,
+        existing_shadow=previous,
+        collector_enabled=enabled,
+    )
+    if toss_shadow_matches_stage3(previous, source_artifact):
+        reused = dict(previous)
+        reused.update(
+            {
+                "runtimeAction": "EXISTING_MATCHED_SHADOW_REUSED",
+                "runtimeReason": "exact_stage3_file_hash_scope_match",
+                "idempotencyKey": idempotency_key,
+                "thisRunRequestCounts": {
+                    "oauth": 0,
+                    "marketCalendar": 0,
+                    "prices": 0,
+                },
+                "runtimeReadiness": readiness,
+            }
+        )
+        write_json_report(
+            HARVESTER_TOSS_SHADOW_PATH,
+            reused,
+            "Toss same-Stage3 matched shadow reused",
+        )
+        return reused
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    reservation = reserve_same_stage3_sentinel(
+        HARVESTER_TOSS_SHADOW_SENTINEL_DIR,
+        idempotency_key,
+        source_artifact,
+        now_utc,
+    )
+    if reservation.get("status") != "RESERVED":
+        result = _toss_shadow_not_run_result(
+            f"same_stage3_sentinel_{str(reservation.get('status') or 'invalid').lower()}"
+        )
+        result.update(
+            {
+                "runtimeAction": "DUPLICATE_OR_FAILED_SENTINEL_PRESERVED",
+                "idempotencyKey": idempotency_key,
+                "sentinelStatus": reservation.get("status"),
+                "thisRunRequestCounts": {
+                    "oauth": 0,
+                    "marketCalendar": 0,
+                    "prices": 0,
+                },
+                "runtimeReadiness": readiness,
+            }
+        )
+        write_json_report(
+            HARVESTER_TOSS_SHADOW_PATH,
+            result,
+            "Toss same-Stage3 duplicate suppressed",
+        )
+        return result
+
+    pre_network_window = inspect_same_stage3_handoff_window(
+        root_id,
+        sys_id,
+        source_artifact,
+    )
+    if pre_network_window.get("open") is not True:
+        result = _toss_shadow_not_run_result(
+            "same_stage3_handoff_window_closed_before_network"
+        )
+        result.update(
+            {
+                "runtimeAction": "PRE_NETWORK_HANDOFF_BLOCKED",
+                "idempotencyKey": idempotency_key,
+                "handoffWindowBeforeNetwork": pre_network_window,
+                "thisRunRequestCounts": {
+                    "oauth": 0,
+                    "marketCalendar": 0,
+                    "prices": 0,
+                },
+                "runtimeReadiness": readiness,
+            }
+        )
+        result.update(
+            complete_same_stage3_sentinel(reservation, status="FAILED")
+        )
+        write_json_report(
+            HARVESTER_TOSS_SHADOW_PATH,
+            result,
+            "Toss same-Stage3 handoff window closed",
+        )
+        return result
 
     capability_id = find_file_id(TOSS_READ_ONLY_CAPABILITY_FILENAME, sys_id)
     capability = download_json(capability_id) if capability_id else None
     capability_payload = capability if isinstance(capability, dict) else {}
     capability_sha256 = _canonical_sha256(capability_payload)
-    now_utc = datetime.datetime.now(datetime.timezone.utc).replace(
-        microsecond=0
-    ).isoformat().replace("+00:00", "Z")
 
     if capability_payload.get("probeStatus") != "TOSS_READ_ONLY_CAPABILITY_PASS":
         result = build_toss_shadow_blocked_result(
@@ -952,16 +1168,20 @@ def ensure_toss_shadow_market_data(
             session or requests.Session(),
             client_id=TOSS_CLIENT_ID,
             client_secret=TOSS_CLIENT_SECRET,
-            symbols=list(candidate_symbols),
+            symbols=symbols,
             retrieved_at=now_utc,
             calendar_date=calendar_date,
             capability_artifact_sha256=capability_sha256,
-            request_source_artifact=request_source_artifact,
+            request_source_artifact=source_artifact,
             max_price_requests=TOSS_SHADOW_MAX_PRICE_REQUESTS,
         )
         result["runtimeAction"] = "COLLECTED_REGISTERED_MAC_SHADOW"
 
     result["runtimeReason"] = runtime_reason
+    result["idempotencyKey"] = idempotency_key
+    result["thisRunRequestCounts"] = dict(result.get("requestCounts") or {})
+    result["runtimeReadiness"] = readiness
+    result["handoffWindowBeforeNetwork"] = pre_network_window
     result["capabilityArtifact"] = {
         "file": TOSS_READ_ONLY_CAPABILITY_FILENAME,
         "schemaVersion": capability_payload.get("schemaVersion"),
@@ -969,34 +1189,250 @@ def ensure_toss_shadow_market_data(
         "sha256": capability_sha256,
         "hashBasis": "CANONICAL_JSON",
     }
+    result["alertDelivery"] = {
+        "status": "ALERT_PENDING_POST_PUBLISH",
+        "alertType": None,
+        "alertFingerprint": None,
+        "safeErrorCategory": None,
+    }
+    try:
+        write_json_report(
+            HARVESTER_TOSS_SHADOW_PATH,
+            result,
+            "Toss market-data shadow",
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        result["localArtifactWriteStatus"] = "FAILED"
+        result["localArtifactWriteErrorCategory"] = type(exc).__name__
+
+    pre_publish_window = inspect_same_stage3_handoff_window(
+        root_id,
+        sys_id,
+        source_artifact,
+    )
+    result["handoffWindowBeforePublish"] = pre_publish_window
+    if pre_publish_window.get("open") is True:
+        publish_payload = dict(result)
+        persistence = publish_toss_shadow_with_archive(
+            previous_shadow=previous,
+            current_shadow=publish_payload,
+            uploader=lambda name, payload: upload_json(name, payload, sys_id),
+        )
+    else:
+        result.update(
+            {
+                "status": "TOSS_SHADOW_STALE_OR_PARTIAL",
+                "eligible": False,
+                "tossEvidenceExcluded": True,
+                "safeErrorCategory": "stage3_handoff_closed_before_publish",
+                "affectedEndpointGroup": "STAGE3_HANDOFF",
+                "prices": [],
+            }
+        )
+        persistence = {
+            "status": "PUBLISH_SKIPPED_HANDOFF_WINDOW_CLOSED",
+            "safeErrorCategory": None,
+            "canonicalPublished": False,
+            "canonicalArtifactSha256": None,
+        }
+    result["artifactPersistenceStatus"] = persistence.get("status")
+    result["artifactPersistenceErrorCategory"] = persistence.get(
+        "safeErrorCategory"
+    )
+    if (
+        persistence.get("canonicalPublished") is not True
+        and pre_publish_window.get("open") is True
+    ):
+        result.update(
+            {
+                "status": "TOSS_SHADOW_TRANSIENT_FAILURE",
+                "eligible": False,
+                "tossEvidenceExcluded": True,
+                "safeErrorCategory": "drive_shadow_publish_failed",
+                "affectedEndpointGroup": "GOOGLE_DRIVE_HANDOFF",
+                "prices": [],
+            }
+        )
+        print(
+            "⚠️ Toss SHADOW Drive persistence failed; canonical analysis continues "
+            f"(category={persistence.get('safeErrorCategory') or 'unknown'})",
+            flush=True,
+        )
     result["alertDelivery"] = dispatch_toss_shadow_alert(
         result,
         previous_status=previous_status,
         sent_fingerprints=set(),
         sender=alert_sender or send_telegram,
     )
-    result["artifactPersistenceStatus"] = "LOCAL_AND_DRIVE_COMPLETE"
-    write_json_report(
-        HARVESTER_TOSS_SHADOW_PATH,
-        result,
-        "Toss market-data shadow",
+    sentinel_status = (
+        "SUCCESS"
+        if result.get("status") == "TOSS_SHADOW_PASS"
+        and persistence.get("canonicalPublished") is True
+        else "FAILED"
+    )
+    result.update(
+        complete_same_stage3_sentinel(
+            reservation,
+            status=sentinel_status,
+            artifact_sha256=(
+                persistence.get("canonicalArtifactSha256")
+                if sentinel_status == "SUCCESS"
+                else None
+            ),
+        )
     )
     try:
-        upload_json(TOSS_MARKET_DATA_SHADOW_FILENAME, result, sys_id)
-    except Exception as exc:
-        result["artifactPersistenceStatus"] = "LOCAL_ONLY_DRIVE_FAILED"
-        result["artifactPersistenceErrorCategory"] = type(exc).__name__
         write_json_report(
             HARVESTER_TOSS_SHADOW_PATH,
             result,
-            "Toss market-data shadow fail-open",
+            "Toss market-data shadow final",
         )
+    except (OSError, TypeError, ValueError) as exc:
+        result["localArtifactWriteStatus"] = "FAILED"
+        result["localArtifactWriteErrorCategory"] = type(exc).__name__
+    return result
+
+
+def run_toss_same_stage3_collector() -> dict[str, Any]:
+    enabled, runtime_reason = toss_shadow_runtime_decision(os.environ)
+    result: dict[str, Any] | None = None
+    network_collection_entered = False
+    try:
+        root_id = find_file_id("US_Alpha_Seeker")
+        sys_id = find_file_id("System_Identity_Maps", root_id)
+        if not root_id or not sys_id:
+            raise RuntimeError("drive_handoff_folder_missing")
+        scope = load_stage3_shadow_handoff_scope(root_id, sys_id)
+        previous_id = find_file_id(TOSS_MARKET_DATA_SHADOW_FILENAME, sys_id)
+        previous = download_json(previous_id) if previous_id else None
+        readiness = build_same_stage3_readiness(
+            scope=scope,
+            existing_shadow=previous,
+            collector_enabled=enabled,
+        )
+        if readiness.get("status") == "EXISTING_MATCHED_SHADOW_REUSABLE":
+            result = dict(previous)
+            result.update(
+                {
+                    "runtimeAction": "EXISTING_MATCHED_SHADOW_REUSED",
+                    "runtimeReason": "exact_stage3_file_hash_scope_match",
+                    "thisRunRequestCounts": {
+                        "oauth": 0,
+                        "marketCalendar": 0,
+                        "prices": 0,
+                    },
+                    "runtimeReadiness": readiness,
+                }
+            )
+        elif scope.get("status") != "VERIFIED_STAGE3_REQUEST_SCOPE":
+            result = _toss_shadow_not_run_result(
+                str(scope.get("status") or "drive_handoff_contract_incomplete").lower()
+            )
+            result.update(
+                {
+                    "runtimeAction": "PRE_NETWORK_HANDOFF_BLOCKED",
+                    "runtimeReadiness": readiness,
+                }
+            )
+        elif not enabled:
+            result = _toss_shadow_not_run_result(runtime_reason)
+            result.update(
+                {
+                    "runtimeAction": "MAC_COLLECTOR_CONFIGURATION_REQUIRED",
+                    "runtimeReadiness": readiness,
+                }
+            )
+        else:
+            network_collection_entered = True
+            result = ensure_toss_shadow_market_data(
+                root_id,
+                sys_id,
+                scope.get("symbols") or [],
+                request_source_artifact=scope.get("sourceArtifact"),
+            )
+        try:
+            write_json_report(
+                HARVESTER_TOSS_SHADOW_PATH,
+                result,
+                "Toss same-Stage3 collector result",
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            result["localArtifactWriteStatus"] = "FAILED"
+            result["localArtifactWriteErrorCategory"] = type(exc).__name__
         print(
-            "⚠️ Toss SHADOW Drive persistence failed; canonical analysis continues "
-            f"(category={type(exc).__name__})",
+            "[TOSS_SAME_STAGE3] "
+            f"status={result.get('status')} "
+            f"action={result.get('runtimeAction')} "
+            f"requests={result.get('thisRunRequestCounts') or result.get('requestCounts')}",
             flush=True,
         )
-    return result
+        return result
+    except Exception as exc:
+        now_utc = datetime.datetime.now(datetime.timezone.utc).replace(
+            microsecond=0
+        ).isoformat().replace("+00:00", "Z")
+        observed_counts = (
+            dict(
+                result.get("thisRunRequestCounts")
+                or result.get("requestCounts")
+                or {}
+            )
+            if isinstance(result, dict)
+            else {}
+        )
+        if not observed_counts:
+            observed_counts = (
+                {"oauth": None, "marketCalendar": None, "prices": None}
+                if network_collection_entered
+                else {"oauth": 0, "marketCalendar": 0, "prices": 0}
+            )
+        result = build_toss_shadow_blocked_result(
+            status="TOSS_SHADOW_TRANSIENT_FAILURE",
+            safe_error_category=f"collector_{type(exc).__name__}",
+            capability_artifact_sha256="0" * 64,
+            retrieved_at=now_utc,
+        )
+        result.update(
+            {
+                "runtimeAction": "COLLECTOR_EXCEPTION_FAIL_OPEN",
+                "runtimeReason": "canonical_analysis_continues",
+                "requestCounts": observed_counts,
+                "thisRunRequestCounts": observed_counts,
+                "requestAccountingStatus": (
+                    "UNVERIFIED_POST_EXCEPTION"
+                    if network_collection_entered and any(
+                        value is None for value in observed_counts.values()
+                    )
+                    else "VERIFIED"
+                ),
+            }
+        )
+        result["alertDelivery"] = dispatch_toss_shadow_alert(
+            result,
+            previous_status=None,
+            sent_fingerprints=set(),
+            sender=send_telegram,
+        )
+        try:
+            write_json_report(
+                HARVESTER_TOSS_SHADOW_PATH,
+                result,
+                "Toss same-Stage3 collector fail-open",
+            )
+        except (OSError, TypeError, ValueError) as write_exc:
+            result["localArtifactWriteStatus"] = "FAILED"
+            result["localArtifactWriteErrorCategory"] = type(write_exc).__name__
+            print(
+                "[TOSS_SAME_STAGE3] local fail-open report write failed "
+                f"category={type(write_exc).__name__}",
+                flush=True,
+            )
+        print(
+            "[TOSS_SAME_STAGE3] status=TOSS_SHADOW_TRANSIENT_FAILURE "
+            f"category={type(exc).__name__} canonical_continues=true",
+            flush=True,
+        )
+        return result
 
 def summarize_key_coverage(records, keys):
     total = len(records)
@@ -4016,7 +4452,16 @@ def get_dispatch_trigger_file():
         return None
 
 # [추가됨] 실시간 진행 상태 기록 함수
-def update_progress(current, total, ticker, sys_id, status="PROCESSING", trigger_file=None):
+def update_progress(
+    current,
+    total,
+    ticker,
+    sys_id,
+    status="PROCESSING",
+    trigger_file=None,
+    trigger_sha256=None,
+    trigger_request_scope_sha256=None,
+):
     progress_data = {
         "status": status,
         "current": current,
@@ -4027,6 +4472,13 @@ def update_progress(current, total, ticker, sys_id, status="PROCESSING", trigger
     }
     if trigger_file:
         progress_data["trigger_file"] = trigger_file
+    if trigger_sha256:
+        progress_data["trigger_sha256"] = trigger_sha256
+        progress_data["trigger_hash_basis"] = "CANONICAL_JSON"
+    if trigger_request_scope_sha256:
+        progress_data["trigger_request_scope_sha256"] = (
+            trigger_request_scope_sha256
+        )
     upload_json("COLLECTION_PROGRESS.json", progress_data, sys_id)
 
 # --- [OHLCV 누적 수집 로직] ---
@@ -5654,6 +6106,8 @@ def run_harvester():
     is_weekend_update = (now_kst.weekday() in (5, 6))
     run_mode = "dispatch" if GITHUB_EVENT_NAME == 'repository_dispatch' else "daily"
     dispatch_trigger_file = None
+    dispatch_trigger_sha256 = None
+    dispatch_trigger_request_scope_sha256 = None
     dispatch_total_symbols = 0
     dispatch_benchmark_success = 0
     dispatch_benchmark_fail = 0
@@ -5707,23 +6161,36 @@ def run_harvester():
             
             if s3_folder_id:
                 query = f"'{s3_folder_id}' in parents and name contains 'STAGE3_FUNDAMENTAL_FULL_' and trashed = false"
-                s3_files = drive_service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc").execute().get('files', [])
-                
+                s3_files = drive_service.files().list(q=query, fields="files(id, name, createdTime)", orderBy="createdTime desc").execute().get('files', [])
+                if not s3_files:
+                    raise RuntimeError("specified_stage3_trigger_missing")
                 if s3_files:
-                    target_s3 = None
-                    if dispatch_trigger_file:
-                        target_s3 = next((f for f in s3_files if f.get('name') == dispatch_trigger_file), None)
-                        if target_s3:
-                            print(f"🎯 지정된 Stage 3 파일 사용: {dispatch_trigger_file}")
-                        else:
-                            print(f"⚠️ 지정된 trigger_file 미발견: {dispatch_trigger_file} → 최신 파일로 대체")
-                    
+                    if not dispatch_trigger_file:
+                        raise RuntimeError("specified_stage3_trigger_missing")
+                    target_s3 = next(
+                        (
+                            file
+                            for file in s3_files
+                            if file.get("name") == dispatch_trigger_file
+                        ),
+                        None,
+                    )
                     if not target_s3:
-                        target_s3 = s3_files[0]
+                        raise RuntimeError("specified_stage3_trigger_missing")
+                    print(f"🎯 지정된 Stage 3 파일 사용: {dispatch_trigger_file}")
                     
                     s3_data = download_json(target_s3['id'])
                     current_trigger_file = target_s3['name']
                     dispatch_trigger_file = current_trigger_file
+                    toss_stage3_scope = build_stage3_request_scope(
+                        file_name=current_trigger_file,
+                        payload=s3_data,
+                        drive_created_at=target_s3.get("createdTime"),
+                    )
+                    dispatch_trigger_sha256 = _canonical_sha256(s3_data)
+                    dispatch_trigger_request_scope_sha256 = (
+                        toss_stage3_scope.get("requestScopeSha256")
+                    )
                     
                     # 티커 리스트 추출 및 중복 제거 (순서 보존: 재현성 유지)
                     t_list = s3_data.get('fundamental_universe') or s3_data.get('stocks') or (s3_data if isinstance(s3_data, list) else [])
@@ -5754,7 +6221,16 @@ def run_harvester():
                         dispatch_total_symbols = total_count
                         send_telegram(f"🚀 *수집 시작:* `{total_count}`종목 (OHLCV {OHLCV_INITIAL_PERIOD})")
                         
-                        update_progress(0, total_count, "STARTING...", sys_id, "PROCESSING", current_trigger_file)
+                        update_progress(
+                            0,
+                            total_count,
+                            "STARTING...",
+                            sys_id,
+                            "PROCESSING",
+                            current_trigger_file,
+                            dispatch_trigger_sha256,
+                            dispatch_trigger_request_scope_sha256,
+                        )
 
                         ohlcv_skipped = 0
                         for idx, st in enumerate(s3_tickers, 1):
@@ -5793,7 +6269,16 @@ def run_harvester():
 
                             if idx % 10 == 0 or idx == total_count:
                                 print(f"📊 진행 중... {idx}/{total_count} (skip {ohlcv_skipped})")
-                                update_progress(idx, total_count, st, sys_id, "PROCESSING", current_trigger_file)
+                                update_progress(
+                                    idx,
+                                    total_count,
+                                    st,
+                                    sys_id,
+                                    "PROCESSING",
+                                    current_trigger_file,
+                                    dispatch_trigger_sha256,
+                                    dispatch_trigger_request_scope_sha256,
+                                )
 
                         try:
                             corporate_action_audit = build_corporate_action_runtime_audit(
@@ -5898,13 +6383,27 @@ def run_harvester():
                         dispatch_earnings_event_missing = earnings_event_missing
                         dispatch_earnings_event_source = earnings_event_source
 
-                        update_progress(total_count, total_count, "FINISHED", sys_id, "COMPLETED", current_trigger_file)
+                        update_progress(
+                            total_count,
+                            total_count,
+                            "FINISHED",
+                            sys_id,
+                            "COMPLETED",
+                            current_trigger_file,
+                            dispatch_trigger_sha256,
+                            dispatch_trigger_request_scope_sha256,
+                        )
 
                         upload_json(
                             "LATEST_STAGE4_READY.json",
                             {
                                 "status": "COMPLETED",
                                 "trigger_file": current_trigger_file,
+                                "trigger_sha256": dispatch_trigger_sha256,
+                                "trigger_hash_basis": "CANONICAL_JSON",
+                                "trigger_request_scope_sha256": (
+                                    dispatch_trigger_request_scope_sha256
+                                ),
                                 "timestamp": today_str,
                                 "corporateActionLineageStatus": (
                                     (
@@ -5960,6 +6459,11 @@ def run_harvester():
                 "eventName": GITHUB_EVENT_NAME or "unknown",
                 "mode": run_mode,
                 "triggerFile": dispatch_trigger_file,
+                "triggerSha256": dispatch_trigger_sha256,
+                "triggerHashBasis": "CANONICAL_JSON" if dispatch_trigger_sha256 else None,
+                "triggerRequestScopeSha256": (
+                    dispatch_trigger_request_scope_sha256
+                ),
                 "targetSymbols": dispatch_total_symbols,
                 "batchLabel": "dispatch_stage4",
                 "batchMode": "repository_dispatch",
@@ -6078,14 +6582,29 @@ def run_harvester():
             )
         if TOSS_SHADOW_PROVIDER_ENABLED:
             try:
-                toss_shadow_scope = load_latest_stage3_shadow_scope(root_id)
-                toss_market_data_shadow = ensure_toss_shadow_market_data(
+                toss_shadow_scope = load_stage3_shadow_handoff_scope(
+                    root_id,
                     sys_id,
-                    toss_shadow_scope.get("symbols") or [],
-                    request_source_artifact=toss_shadow_scope.get(
-                        "sourceArtifact"
-                    ),
                 )
+                if toss_shadow_scope.get("status") == "VERIFIED_STAGE3_REQUEST_SCOPE":
+                    toss_market_data_shadow = ensure_toss_shadow_market_data(
+                        root_id,
+                        sys_id,
+                        toss_shadow_scope.get("symbols") or [],
+                        request_source_artifact=toss_shadow_scope.get(
+                            "sourceArtifact"
+                        ),
+                    )
+                else:
+                    toss_market_data_shadow = _toss_shadow_not_run_result(
+                        str(
+                            toss_shadow_scope.get("status")
+                            or "drive_handoff_contract_incomplete"
+                        ).lower()
+                    )
+                    toss_market_data_shadow["runtimeAction"] = (
+                        "PRE_NETWORK_HANDOFF_BLOCKED"
+                    )
             except Exception as exc:
                 toss_market_data_shadow = build_toss_shadow_blocked_result(
                     status="TOSS_SHADOW_TRANSIENT_FAILURE",
@@ -6880,4 +7399,7 @@ def run_harvester():
         raise
 
 if __name__ == "__main__":
-    run_harvester()
+    if "--toss-shadow-collector" in sys.argv[1:]:
+        run_toss_same_stage3_collector()
+    else:
+        run_harvester()
