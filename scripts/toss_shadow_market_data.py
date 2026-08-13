@@ -765,6 +765,24 @@ def _base_result(
         },
         "diagnostics": {
             "timestampMissingRows": 0,
+            "timestampFieldPresentRows": 0,
+            "timestampFieldAbsentRows": 0,
+            "timestampNullRows": 0,
+            "timestampBlankRows": 0,
+            "timestampParseableRows": 0,
+            "timestampUnparseableRows": 0,
+            "timestampTypeCounts": {},
+            "responseShapeFingerprintCounts": {},
+            "missingTimestampRowsByBatch": [],
+            "validTimestampRowsByBatch": [],
+            "returnedRowsByBatch": [],
+            "lastPricePresentWithoutTimestampRows": 0,
+            "currencyPresentWithoutTimestampRows": 0,
+            "timestampDiagnosticStatus": "NOT_EVALUATED",
+            "timestampDiagnosticPrimaryCause": None,
+            "timestampDiagnosticRows": 0,
+            "timestampDiagnosticCountMatches": True,
+            "timestampUnknownOrUnclassifiedRows": 0,
             "futureTimestampRows": 0,
             "outOfCalendarDateRows": 0,
             "unreturnedSymbolRows": len(symbols),
@@ -1234,6 +1252,19 @@ def collect_toss_shadow_market_data(
     invalid_rows = 0
     duplicate_rows = 0
     timestamp_missing_rows = 0
+    timestamp_field_present_rows = 0
+    timestamp_field_absent_rows = 0
+    timestamp_null_rows = 0
+    timestamp_blank_rows = 0
+    timestamp_parseable_rows = 0
+    timestamp_unparseable_rows = 0
+    timestamp_type_counts: dict[str, int] = {}
+    response_shape_fingerprint_counts: dict[str, int] = {}
+    missing_timestamp_rows_by_batch: list[int] = []
+    valid_timestamp_rows_by_batch: list[int] = []
+    returned_rows_by_batch: list[int] = []
+    last_price_present_without_timestamp_rows = 0
+    currency_present_without_timestamp_rows = 0
     future_timestamp_rows = 0
     out_of_calendar_date_rows = 0
     future_skew_ms: list[int] = []
@@ -1322,6 +1353,8 @@ def collect_toss_shadow_market_data(
         batch_returned_provider_symbols: set[str] = set()
         batch_payload_to_local_offsets_ms: list[int] = []
         batch_payload_to_http_offsets_ms: list[int] = []
+        batch_missing_timestamp_rows = 0
+        batch_valid_timestamp_rows = 0
         price_status = int(getattr(price_response, "status_code", 0) or 0)
         result["httpStatusCategories"]["prices"].append(
             _status_category(price_status)
@@ -1351,10 +1384,61 @@ def collect_toss_shadow_market_data(
         if not isinstance(rows, list):
             invalid_rows += 1
             continue
+        returned_rows_by_batch.append(len(rows))
         for row in rows:
             if not isinstance(row, dict):
                 invalid_rows += 1
                 continue
+            shape_fingerprint = _canonical_sha256(sorted(str(key) for key in row))
+            response_shape_fingerprint_counts[shape_fingerprint] = (
+                response_shape_fingerprint_counts.get(shape_fingerprint, 0) + 1
+            )
+            if "timestamp" not in row:
+                timestamp_field_absent_rows += 1
+                timestamp_type = "absent"
+                timestamp = None
+            else:
+                timestamp_field_present_rows += 1
+                timestamp_value = row.get("timestamp")
+                if timestamp_value is None:
+                    timestamp_type = "null"
+                    timestamp_null_rows += 1
+                    timestamp = None
+                elif isinstance(timestamp_value, str):
+                    timestamp_type = "string"
+                    if not timestamp_value.strip():
+                        timestamp_blank_rows += 1
+                        timestamp = None
+                    else:
+                        timestamp = _parse_timestamp(timestamp_value)
+                        if timestamp is None:
+                            timestamp_unparseable_rows += 1
+                else:
+                    timestamp_type = (
+                        "boolean"
+                        if isinstance(timestamp_value, bool)
+                        else "number"
+                        if isinstance(timestamp_value, (int, float))
+                        else "array"
+                        if isinstance(timestamp_value, list)
+                        else "object"
+                        if isinstance(timestamp_value, dict)
+                        else "other"
+                    )
+                    timestamp_unparseable_rows += 1
+                    timestamp = None
+            timestamp_type_counts[timestamp_type] = (
+                timestamp_type_counts.get(timestamp_type, 0) + 1
+            )
+            if timestamp is None:
+                batch_missing_timestamp_rows += 1
+                last_price_present_without_timestamp_rows += int(
+                    "lastPrice" in row
+                )
+                currency_present_without_timestamp_rows += int("currency" in row)
+            else:
+                timestamp_parseable_rows += 1
+                batch_valid_timestamp_rows += 1
             provider_symbol = row.get("symbol")
             canonical_symbol = (
                 provider_to_canonical.get(provider_symbol)
@@ -1382,7 +1466,6 @@ def collect_toss_shadow_market_data(
             if currency != "USD":
                 currency_conflicts += 1
                 continue
-            timestamp = _parse_timestamp(row.get("timestamp"))
             if timestamp is None:
                 timestamp_missing_rows += 1
                 root_cause_counts["PAYLOAD_TIMESTAMP_MISSING"] += 1
@@ -1444,6 +1527,9 @@ def collect_toss_shadow_market_data(
             }
             seen[canonical_symbol] = safe_row
             source_timestamps.append((timestamp, row["timestamp"]))
+
+        missing_timestamp_rows_by_batch.append(batch_missing_timestamp_rows)
+        valid_timestamp_rows_by_batch.append(batch_valid_timestamp_rows)
 
         batch_missing_symbols = sorted(
             set(batch).difference(batch_returned_canonical_symbols)
@@ -1512,6 +1598,43 @@ def collect_toss_shadow_market_data(
     missing = requested.difference(seen)
     unreturned_symbols = requested.difference(returned_canonical_symbols)
     root_cause_counts["PARTIAL_SYMBOL_RESPONSE"] += len(unreturned_symbols)
+    timestamp_diagnostic_rows = (
+        timestamp_field_absent_rows
+        + timestamp_null_rows
+        + timestamp_blank_rows
+        + timestamp_parseable_rows
+        + timestamp_unparseable_rows
+    )
+    timestamp_evaluated_rows = sum(timestamp_type_counts.values())
+    timestamp_returned_rows = sum(returned_rows_by_batch)
+    timestamp_diagnostic_count_matches = (
+        timestamp_diagnostic_rows
+        == timestamp_evaluated_rows
+        == timestamp_returned_rows
+    )
+    timestamp_unknown_rows = abs(timestamp_returned_rows - timestamp_evaluated_rows)
+    timestamp_failure_causes = [
+        cause
+        for count, cause in (
+            (timestamp_field_absent_rows, "TIMESTAMP_KEY_ABSENT"),
+            (timestamp_null_rows, "DOCUMENTED_NULLABLE_TIMESTAMP"),
+            (timestamp_blank_rows, "TIMESTAMP_NULL_OR_BLANK"),
+            (timestamp_unparseable_rows, "TIMESTAMP_FORMAT_UNPARSEABLE"),
+        )
+        if count
+    ]
+    if not timestamp_diagnostic_count_matches or not timestamp_evaluated_rows:
+        timestamp_diagnostic_primary_cause = "SAFE_EVIDENCE_INSUFFICIENT"
+        timestamp_diagnostic_status = "EVIDENCE_INSUFFICIENT"
+    elif len(timestamp_failure_causes) > 1:
+        timestamp_diagnostic_primary_cause = "MIXED_RESPONSE_SCHEMA_VARIANT"
+        timestamp_diagnostic_status = "CLASSIFIED"
+    elif timestamp_failure_causes:
+        timestamp_diagnostic_primary_cause = timestamp_failure_causes[0]
+        timestamp_diagnostic_status = "CLASSIFIED"
+    else:
+        timestamp_diagnostic_primary_cause = "TIMESTAMP_PRESENT_VALID"
+        timestamp_diagnostic_status = "COMPLETE"
     result["summary"].update(
         {
             "matchedRows": len(seen),
@@ -1522,6 +1645,30 @@ def collect_toss_shadow_market_data(
     )
     result["diagnostics"] = {
         "timestampMissingRows": timestamp_missing_rows,
+        "timestampFieldPresentRows": timestamp_field_present_rows,
+        "timestampFieldAbsentRows": timestamp_field_absent_rows,
+        "timestampNullRows": timestamp_null_rows,
+        "timestampBlankRows": timestamp_blank_rows,
+        "timestampParseableRows": timestamp_parseable_rows,
+        "timestampUnparseableRows": timestamp_unparseable_rows,
+        "timestampTypeCounts": dict(sorted(timestamp_type_counts.items())),
+        "responseShapeFingerprintCounts": dict(
+            sorted(response_shape_fingerprint_counts.items())
+        ),
+        "missingTimestampRowsByBatch": missing_timestamp_rows_by_batch,
+        "validTimestampRowsByBatch": valid_timestamp_rows_by_batch,
+        "returnedRowsByBatch": returned_rows_by_batch,
+        "lastPricePresentWithoutTimestampRows": (
+            last_price_present_without_timestamp_rows
+        ),
+        "currencyPresentWithoutTimestampRows": (
+            currency_present_without_timestamp_rows
+        ),
+        "timestampDiagnosticStatus": timestamp_diagnostic_status,
+        "timestampDiagnosticPrimaryCause": timestamp_diagnostic_primary_cause,
+        "timestampDiagnosticRows": timestamp_diagnostic_rows,
+        "timestampDiagnosticCountMatches": timestamp_diagnostic_count_matches,
+        "timestampUnknownOrUnclassifiedRows": timestamp_unknown_rows,
         "futureTimestampRows": future_timestamp_rows,
         "outOfCalendarDateRows": out_of_calendar_date_rows,
         "unreturnedSymbolRows": len(unreturned_symbols),
