@@ -5,8 +5,9 @@
 Overall status: `OFFICIAL_SOURCE_CONTRACT_INCOMPLETE`.
 
 The existing `corporate-action-lineage-v1` and SHADOW_ONLY safety invariants are
-sufficient for a static contract. No runtime provider, planner, ledger, or new
-dependency is needed yet.
+sufficient for the static contract. A default-disabled bounded evidence
+producer now implements the approved source subset; no planner, ledger, or new
+dependency is introduced.
 
 The remaining primary blocker is the exchange-listed Reg SHO source matrix.
 The SEC assigns threshold-list dissemination to the security's primary-listing
@@ -114,3 +115,24 @@ The maximum proposed one-shot scope is:
 - No pagination, retry, bulk download, recurring activation, raw response
   storage, canonical-source replacement, Stage6/OOS policy impact, or
   broker/sidecar/state mutation.
+
+## Disabled SHADOW Producer
+
+`scripts/sec_finra_shadow_evidence.py` implements the proven bounded scope as a
+server-side, report-only producer. It publishes only safe hashes, timestamps,
+schema verdicts, and aggregate counts to `state/sec-finra-shadow-evidence.json`
+and `System_Identity_Maps/SEC_FINRA_SHADOW_EVIDENCE.json`.
+
+`SEC_FINRA_SHADOW_PROVIDER_ENABLED=false` remains the workflow default. The
+producer makes no request until recurring activation is approved. When enabled,
+one observation uses at most three SEC discovery requests, three SEC
+Submissions requests, three SEC raw-filing requests, one FINRA OAuth request,
+one FINRA metadata request, and three `limit=1` FINRA data requests, with no
+retry or pagination. This is capability/latest-observation coverage, not full
+Stage3-universe coverage.
+
+An empty Schedule 13D/G current-filings feed is a classified no-current-filing
+observation, not a retry condition. Exchange-listed Reg SHO remains excluded;
+only FINRA's proven OTC `thresholdList` scope is observed. Every emitted row is
+`directSignalEligible=false`, and the artifact remains
+`policyImpact=NONE_REPORT_ONLY` and `canonicalSourceChanged=false`.
