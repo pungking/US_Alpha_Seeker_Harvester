@@ -58,6 +58,8 @@ jobs:
         run: python scripts/check_listing_lifecycle_contract.py
       - name: Corporate-action lineage contract
         run: python scripts/check_corporate_action_lineage_contract.py
+      - name: SEC and FINRA SHADOW_ONLY capability contract
+        run: python scripts/check_sec_finra_shadow_capability.py
       - name: Toss read-only capability contract
         run: python scripts/check_toss_read_only_capability.py
       - name: Toss Phase2a shadow market-data contract
