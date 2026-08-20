@@ -10,7 +10,7 @@ promotion, a timestamp fallback, or a Stage6 policy change.
 The canonical Toss OpenAPI document is:
 
 - <https://openapi.tossinvest.com/openapi-docs/latest/openapi.json>
-- captured SHA-256: `d29f9079a557c0b6affcec330aa131f93b09fd49932354668e3dc4524cd42180`
+- captured SHA-256: `fccf49abd11f37f557bdd349138f4a03c42b829ebd8b5c14ab4907116fb84c7a`
 
 For `PriceResponse`, the required fields are `symbol`, `lastPrice`, and
 `currency`. `timestamp` is an optional `string | null` with `date-time` format.
