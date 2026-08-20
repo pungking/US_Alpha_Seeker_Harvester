@@ -229,6 +229,9 @@ def main() -> int:
     assert "HTTP Date is diagnostic-only" in readme_source
     assert "MAC_CLOCK_SYNC_UNVERIFIED" in readme_source
     assert "No timestamp tolerance is authorized" in readme_source
+    assert "HTTP 2xx timestamp omissions never use auth or egress guidance" in (
+        readme_source
+    )
     assert "DOCUMENTED_NULLABLE_TIMESTAMP_POLICY_REVIEW_REQUIRED" in (
         policy_review_source
     )
@@ -373,6 +376,16 @@ def main() -> int:
     assert success_timestamp_diagnostics["timestampBlankRows"] == 0
     assert success_timestamp_diagnostics["timestampParseableRows"] == 300
     assert success_timestamp_diagnostics["timestampUnparseableRows"] == 0
+    assert success_timestamp_diagnostics["timestampCategoryCounts"] == {
+        "BLANK": 0,
+        "NULL": 0,
+        "OPTIONAL_ABSENT": 0,
+        "PRESENT_VALID": 300,
+        "UNPARSEABLE": 0,
+    }
+    assert sum(
+        success_timestamp_diagnostics["timestampCategoryCounts"].values()
+    ) == sum(success_timestamp_diagnostics["returnedRowsByBatch"])
     assert success_timestamp_diagnostics["timestampTypeCounts"] == {
         "string": 300
     }
@@ -678,6 +691,13 @@ def main() -> int:
     assert missing_timestamp_diagnostics["timestampBlankRows"] == 0
     assert missing_timestamp_diagnostics["timestampParseableRows"] == 0
     assert missing_timestamp_diagnostics["timestampUnparseableRows"] == 0
+    assert missing_timestamp_diagnostics["timestampCategoryCounts"] == {
+        "BLANK": 0,
+        "NULL": 1,
+        "OPTIONAL_ABSENT": 0,
+        "PRESENT_VALID": 0,
+        "UNPARSEABLE": 0,
+    }
     assert missing_timestamp_diagnostics["timestampTypeCounts"] == {"null": 1}
     assert missing_timestamp_diagnostics["returnedRowsByBatch"] == [1]
     assert missing_timestamp_diagnostics["missingTimestampRowsByBatch"] == [1]
@@ -717,6 +737,13 @@ def main() -> int:
     assert absent_diagnostics["timestampFieldPresentRows"] == 0
     assert absent_diagnostics["timestampFieldAbsentRows"] == 1
     assert absent_diagnostics["timestampTypeCounts"] == {"absent": 1}
+    assert absent_diagnostics["timestampCategoryCounts"] == {
+        "BLANK": 0,
+        "NULL": 0,
+        "OPTIONAL_ABSENT": 1,
+        "PRESENT_VALID": 0,
+        "UNPARSEABLE": 0,
+    }
     assert absent_diagnostics["timestampDiagnosticPrimaryCause"] == (
         "TIMESTAMP_KEY_ABSENT"
     )
@@ -737,6 +764,7 @@ def main() -> int:
     blank_diagnostics = timestamp_blank["diagnostics"]
     assert blank_diagnostics["timestampBlankRows"] == 1
     assert blank_diagnostics["timestampUnparseableRows"] == 0
+    assert blank_diagnostics["timestampCategoryCounts"]["BLANK"] == 1
     assert blank_diagnostics["timestampDiagnosticPrimaryCause"] == (
         "TIMESTAMP_NULL_OR_BLANK"
     )
@@ -757,6 +785,7 @@ def main() -> int:
     )
     unparseable_diagnostics = timestamp_unparseable["diagnostics"]
     assert unparseable_diagnostics["timestampUnparseableRows"] == 1
+    assert unparseable_diagnostics["timestampCategoryCounts"]["UNPARSEABLE"] == 1
     assert unparseable_diagnostics["timestampDiagnosticPrimaryCause"] == (
         "TIMESTAMP_FORMAT_UNPARSEABLE"
     )
@@ -785,6 +814,13 @@ def main() -> int:
     assert mixed_timestamp_diagnostics["timestampBlankRows"] == 2
     assert mixed_timestamp_diagnostics["timestampParseableRows"] == 292
     assert mixed_timestamp_diagnostics["timestampUnparseableRows"] == 2
+    assert mixed_timestamp_diagnostics["timestampCategoryCounts"] == {
+        "BLANK": 2,
+        "NULL": 2,
+        "OPTIONAL_ABSENT": 2,
+        "PRESENT_VALID": 292,
+        "UNPARSEABLE": 2,
+    }
     assert mixed_timestamp_diagnostics["timestampTypeCounts"] == {
         "absent": 2,
         "null": 2,
@@ -1104,6 +1140,67 @@ def main() -> int:
     )
     assert "registered egress, credentials, rate limit" not in (
         partial_alert_messages[0]
+    )
+
+    nullable_alert_messages: list[str] = []
+
+    def nullable_delivered(message: str, *, channel: str) -> dict[str, Any]:
+        assert channel == "alert"
+        nullable_alert_messages.append(message)
+        return {"attempted": True, "delivered": True, "safeErrorCategory": None}
+
+    nullable_alert = dispatch_toss_shadow_alert(
+        missing_timestamp,
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=nullable_delivered,
+    )
+    assert nullable_alert["status"] == "ALERT_DELIVERED"
+    assert len(nullable_alert_messages) == 1
+    assert "TimestampCause: `DOCUMENTED_NULLABLE_TIMESTAMP`" in (
+        nullable_alert_messages[0]
+    )
+    assert "review documented optional/nullable timestamp policy" in (
+        nullable_alert_messages[0]
+    )
+    assert "registered egress, credentials, rate limit" not in (
+        nullable_alert_messages[0]
+    )
+
+    absent_alert_messages: list[str] = []
+    dispatch_toss_shadow_alert(
+        timestamp_absent,
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=lambda message, *, channel: (
+            absent_alert_messages.append(message)
+            or {"attempted": True, "delivered": True, "safeErrorCategory": None}
+        ),
+    )
+    assert "TimestampCause: `TIMESTAMP_KEY_ABSENT`" in absent_alert_messages[0]
+    assert "review documented optional/nullable timestamp policy" in (
+        absent_alert_messages[0]
+    )
+    assert "registered egress, credentials, rate limit" not in (
+        absent_alert_messages[0]
+    )
+
+    format_alert_messages: list[str] = []
+    dispatch_toss_shadow_alert(
+        timestamp_unparseable,
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=lambda message, *, channel: (
+            format_alert_messages.append(message)
+            or {"attempted": True, "delivered": True, "safeErrorCategory": None}
+        ),
+    )
+    assert "TimestampCause: `TIMESTAMP_FORMAT_UNPARSEABLE`" in (
+        format_alert_messages[0]
+    )
+    assert "review provider timestamp format contract" in format_alert_messages[0]
+    assert "registered egress, credentials, rate limit" not in (
+        format_alert_messages[0]
     )
 
     duplicate = dispatch_toss_shadow_alert(

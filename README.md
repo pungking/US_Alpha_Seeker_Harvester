@@ -233,6 +233,9 @@ only counts, per-batch reconciliation, safe JSON type counts, and SHA-256 hashes
 of sorted response key sets. They never persist timestamp values, symbols, or
 raw responses. The strict all-row timestamp gate remains unchanged pending the
 report-only policy decision in `TOSS_PRICE_TIMESTAMP_POLICY_REVIEW.md`.
+HTTP 2xx timestamp omissions never use auth or egress guidance in Telegram:
+documented optional/null shapes point to policy review, while blank or
+unparseable values point to the provider timestamp-format contract.
 
 The additive `clockDomainEvidence` envelope records request start, local response
 receipt, parsed HTTP `Date`, request duration, and aggregate payload timestamp

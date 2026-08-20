@@ -771,6 +771,13 @@ def _base_result(
             "timestampBlankRows": 0,
             "timestampParseableRows": 0,
             "timestampUnparseableRows": 0,
+            "timestampCategoryCounts": {
+                "PRESENT_VALID": 0,
+                "OPTIONAL_ABSENT": 0,
+                "NULL": 0,
+                "BLANK": 0,
+                "UNPARSEABLE": 0,
+            },
             "timestampTypeCounts": {},
             "responseShapeFingerprintCounts": {},
             "missingTimestampRowsByBatch": [],
@@ -1598,13 +1605,14 @@ def collect_toss_shadow_market_data(
     missing = requested.difference(seen)
     unreturned_symbols = requested.difference(returned_canonical_symbols)
     root_cause_counts["PARTIAL_SYMBOL_RESPONSE"] += len(unreturned_symbols)
-    timestamp_diagnostic_rows = (
-        timestamp_field_absent_rows
-        + timestamp_null_rows
-        + timestamp_blank_rows
-        + timestamp_parseable_rows
-        + timestamp_unparseable_rows
-    )
+    timestamp_category_counts = {
+        "PRESENT_VALID": timestamp_parseable_rows,
+        "OPTIONAL_ABSENT": timestamp_field_absent_rows,
+        "NULL": timestamp_null_rows,
+        "BLANK": timestamp_blank_rows,
+        "UNPARSEABLE": timestamp_unparseable_rows,
+    }
+    timestamp_diagnostic_rows = sum(timestamp_category_counts.values())
     timestamp_evaluated_rows = sum(timestamp_type_counts.values())
     timestamp_returned_rows = sum(returned_rows_by_batch)
     timestamp_diagnostic_count_matches = (
@@ -1651,6 +1659,7 @@ def collect_toss_shadow_market_data(
         "timestampBlankRows": timestamp_blank_rows,
         "timestampParseableRows": timestamp_parseable_rows,
         "timestampUnparseableRows": timestamp_unparseable_rows,
+        "timestampCategoryCounts": timestamp_category_counts,
         "timestampTypeCounts": dict(sorted(timestamp_type_counts.items())),
         "responseShapeFingerprintCounts": dict(
             sorted(response_shape_fingerprint_counts.items())
@@ -1990,12 +1999,70 @@ def dispatch_toss_shadow_alert(
             "canonical analysis continued=true"
         )
     else:
-        next_action = (
-            "verify hashed missing-symbol lineage and provider symbol mapping; "
-            "do not retry full scope"
-            if result.get("safeErrorCategory") == "partial_symbol_response"
-            else "verify registered egress, credentials, rate limit, and source contract"
-        )
+        error_category = result.get("safeErrorCategory")
+        timestamp_cause_line = ""
+        if error_category == "price_timestamp_missing":
+            diagnostics = result.get("diagnostics")
+            diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
+            category_counts = diagnostics.get("timestampCategoryCounts")
+            category_counts = (
+                category_counts if isinstance(category_counts, Mapping) else {}
+            )
+            blank_or_unparseable = sum(
+                int(category_counts.get(key, 0) or 0)
+                for key in ("BLANK", "UNPARSEABLE")
+            )
+            optional_or_nullable = sum(
+                int(category_counts.get(key, 0) or 0)
+                for key in ("OPTIONAL_ABSENT", "NULL")
+            )
+            timestamp_cause = str(
+                diagnostics.get("timestampDiagnosticPrimaryCause")
+                or "SAFE_EVIDENCE_INSUFFICIENT"
+            )
+            allowed_timestamp_causes = {
+                "TIMESTAMP_PRESENT_VALID",
+                "TIMESTAMP_KEY_ABSENT",
+                "DOCUMENTED_NULLABLE_TIMESTAMP",
+                "TIMESTAMP_NULL_OR_BLANK",
+                "TIMESTAMP_FORMAT_UNPARSEABLE",
+                "MIXED_RESPONSE_SCHEMA_VARIANT",
+                "SAFE_EVIDENCE_INSUFFICIENT",
+            }
+            if timestamp_cause not in allowed_timestamp_causes:
+                timestamp_cause = "SAFE_EVIDENCE_INSUFFICIENT"
+            timestamp_cause_line = f"TimestampCause: `{timestamp_cause}`\n"
+            if blank_or_unparseable > 0:
+                next_action = (
+                    "review provider timestamp format contract; keep Toss evidence "
+                    "excluded"
+                )
+            elif (
+                optional_or_nullable > 0
+                and diagnostics.get("timestampDiagnosticCountMatches") is True
+                and int(
+                    diagnostics.get("timestampUnknownOrUnclassifiedRows", 0) or 0
+                )
+                == 0
+            ):
+                next_action = (
+                    "review documented optional/nullable timestamp policy; keep Toss "
+                    "evidence excluded"
+                )
+            else:
+                next_action = (
+                    "verify aggregate timestamp classification contract; keep Toss "
+                    "evidence excluded"
+                )
+        elif error_category == "partial_symbol_response":
+            next_action = (
+                "verify hashed missing-symbol lineage and provider symbol mapping; "
+                "do not retry full scope"
+            )
+        else:
+            next_action = (
+                "verify registered egress, credentials, rate limit, and source contract"
+            )
         message = (
             "⚠️ *Toss SHADOW source excluded*\n"
             f"Status: `{status}`\n"
@@ -2003,6 +2070,7 @@ def dispatch_toss_shadow_alert(
             f"HTTP: `{http_status_category}`\n"
             f"EndpointGroup: `{result.get('affectedEndpointGroup') or 'unknown'}`\n"
             f"ClockReference: `{clock_summary.get('clockReferenceStatus') or 'not_available'}`\n"
+            f"{timestamp_cause_line}"
             f"AffectedRows: `{affected_rows}`\n"
             f"OffsetMs: `{offset_range}`\n"
             "Requests: "
