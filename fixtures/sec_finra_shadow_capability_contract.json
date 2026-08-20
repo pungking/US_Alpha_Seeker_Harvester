@@ -1,0 +1,324 @@
+{
+  "schemaVersion": "sec-finra-shadow-capability-v1",
+  "reviewedAt": "2026-08-20T00:00:00Z",
+  "mode": "SHADOW_ONLY",
+  "capabilityStatus": "OFFICIAL_SOURCE_CONTRACT_INCOMPLETE",
+  "primaryBlocker": "EXCHANGE_LISTED_REG_SHO_SRO_SOURCE_MATRIX_NOT_SELECTED",
+  "runtimeEnabled": false,
+  "externalRequestCount": 0,
+  "canonicalSourceChanged": false,
+  "policyImpact": "NONE_REPORT_ONLY",
+  "stage4To7Impact": "NONE",
+  "sourceContracts": [
+    {
+      "sourceId": "SEC_SECTION16_FORMS_3_4_5",
+      "status": "SHADOW_CAPABILITY_READY",
+      "evidenceClass": "INSIDER_OWNERSHIP_TRANSACTION",
+      "semanticMeaning": "Section 16 ownership filing disclosed by a reporting owner",
+      "prohibitedInference": "A filing is not a current buy or sell recommendation",
+      "directSignalEligible": false,
+      "historicalEvidenceCurrentSentimentEligible": false,
+      "responseSha256Required": true,
+      "amendmentsModeled": true,
+      "amendmentPolicy": "Preserve accession lineage and apply amendments only after their own publication timestamp",
+      "issuerIdentifierPolicy": "Join issuer CIK and accession lineage before effective-dated symbol aliases",
+      "publication": {
+        "eventClock": "transactionDate or reporting-person effective date",
+        "publicationClock": "SEC acceptedAt",
+        "timezone": "America/New_York",
+        "publicationDelayModeled": true,
+        "delayModel": "Form 3 generally 10 days, Form 4 generally two business days, and Form 5 generally 45 days after fiscal year end",
+        "lookAheadRule": "publishedAt<=decisionAt"
+      },
+      "machineReadableContract": {
+        "format": "SEC ownership XML plus EDGAR submissions metadata",
+        "identifier": "Ownership XML 5.5; accession number; issuer CIK"
+      },
+      "officialDocumentation": [
+        "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        "https://www.sec.gov/submit-filings/technical-specifications",
+        "https://www.sec.gov/files/forms-3-4-5.pdf"
+      ]
+    },
+    {
+      "sourceId": "SEC_SCHEDULES_13D_13G",
+      "status": "SHADOW_CAPABILITY_READY",
+      "evidenceClass": "BENEFICIAL_OWNERSHIP_POSITION_DISCLOSURE",
+      "semanticMeaning": "Published beneficial ownership position or amendment",
+      "prohibitedInference": "A beneficial ownership filing is not a contemporaneous trade or sentiment signal",
+      "directSignalEligible": false,
+      "historicalEvidenceCurrentSentimentEligible": false,
+      "responseSha256Required": true,
+      "amendmentsModeled": true,
+      "amendmentPolicy": "Retain original and amended accession lineage; never backdate amended facts",
+      "issuerIdentifierPolicy": "Use subject issuer CIK, not reporting-person CIK, then effective-dated alias lineage",
+      "publication": {
+        "eventClock": "beneficial ownership trigger date",
+        "publicationClock": "SEC acceptedAt",
+        "timezone": "America/New_York",
+        "publicationDelayModeled": true,
+        "delayModel": "Schedule 13D initial filing is generally five business days and amendments two business days; Schedule 13G timing varies by filer class",
+        "lookAheadRule": "publishedAt<=decisionAt"
+      },
+      "machineReadableContract": {
+        "format": "SEC Schedule 13D/G XML plus EDGAR submissions metadata",
+        "identifier": "Schedule 13D/G XML 2.3; accession number; subject issuer CIK"
+      },
+      "officialDocumentation": [
+        "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        "https://www.sec.gov/submit-filings/technical-specifications",
+        "https://www.sec.gov/newsroom/press-releases/2023-219"
+      ]
+    },
+    {
+      "sourceId": "SEC_FORM_13F",
+      "status": "SHADOW_CAPABILITY_READY",
+      "evidenceClass": "INSTITUTIONAL_HOLDINGS_SNAPSHOT",
+      "semanticMeaning": "Institutional investment manager holdings snapshot as of quarter end",
+      "prohibitedInference": "Form 13F is neither real-time trading nor complete current portfolio evidence",
+      "directSignalEligible": false,
+      "historicalEvidenceCurrentSentimentEligible": false,
+      "isRealtimeTradeEvidence": false,
+      "responseSha256Required": true,
+      "amendmentsModeled": true,
+      "amendmentPolicy": "Preserve 13F-HR and 13F-HR/A accession lineage and expose restatement status",
+      "issuerIdentifierPolicy": "Never treat filing-manager CIK as held-issuer identity; require reported security identifier and effective corporate-action lineage",
+      "publication": {
+        "eventClock": "calendar quarter end",
+        "publicationClock": "SEC acceptedAt",
+        "timezone": "America/New_York",
+        "publicationDelayModeled": true,
+        "delayModel": "Filed within 45 days after quarter end",
+        "lookAheadRule": "publishedAt<=decisionAt"
+      },
+      "machineReadableContract": {
+        "format": "SEC Form 13F XML plus EDGAR submissions metadata",
+        "identifier": "Form 13F XML 1.9; accession number; filing-manager CIK; reported security identifier"
+      },
+      "officialDocumentation": [
+        "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+        "https://www.sec.gov/submit-filings/technical-specifications",
+        "https://www.sec.gov/rules-regulations/staff-guidance/division-investment-management-frequently-asked-questions/frequently-asked-questions-about-form-13f"
+      ]
+    },
+    {
+      "sourceId": "FINRA_CONSOLIDATED_SHORT_INTEREST",
+      "status": "LICENSE_OR_ACCESS_REVIEW_REQUIRED",
+      "evidenceClass": "SHORT_INTEREST_POSITION_SNAPSHOT",
+      "semanticMeaning": "Twice-monthly aggregate short position snapshot based on settlement date",
+      "prohibitedInference": "Short interest is not daily short-sale volume or a direct short signal",
+      "directSignalEligible": false,
+      "historicalEvidenceCurrentSentimentEligible": false,
+      "isShortSaleVolume": false,
+      "responseSha256Required": true,
+      "amendmentsModeled": true,
+      "amendmentPolicy": "Preserve publication date and FINRA revisionFlag; do not overwrite prior snapshots",
+      "issuerIdentifierPolicy": "Map reported security identity through effective-dated corporate-action lineage",
+      "publication": {
+        "eventClock": "settlementDate",
+        "publicationClock": "FINRA publication date and retrieval timestamp",
+        "timezone": "America/New_York",
+        "publicationDelayModeled": true,
+        "delayModel": "Reported twice monthly and published on the seventh business day after the settlement date by 4:40 p.m. ET",
+        "lookAheadRule": "publishedAt<=decisionAt"
+      },
+      "machineReadableContract": {
+        "format": "FINRA API JSON",
+        "identifier": "consolidatedShortInterest dataset; Public credential and terms acceptance required"
+      },
+      "officialDocumentation": [
+        "https://www.finra.org/finra-data/browse-catalog/equity-short-interest",
+        "https://developer.finra.org/docs"
+      ]
+    },
+    {
+      "sourceId": "FINRA_REG_SHO_DAILY_SHORT_VOLUME",
+      "status": "LICENSE_OR_ACCESS_REVIEW_REQUIRED",
+      "evidenceClass": "SHORT_SALE_ACTIVITY_VOLUME",
+      "semanticMeaning": "Daily short-sale volume in FINRA-published off-exchange reporting-facility data",
+      "prohibitedInference": "Daily short-sale volume is not short interest, an end-of-day short position, or consolidated exchange volume",
+      "directSignalEligible": false,
+      "historicalEvidenceCurrentSentimentEligible": false,
+      "isShortInterest": false,
+      "responseSha256Required": true,
+      "amendmentsModeled": true,
+      "amendmentPolicy": "Preserve trade date, publication observation, and any replacement response hash",
+      "issuerIdentifierPolicy": "Map reported security identity through effective-dated corporate-action lineage",
+      "publication": {
+        "eventClock": "tradeDate",
+        "publicationClock": "FINRA dataset publication observation and retrieval timestamp",
+        "timezone": "America/New_York",
+        "publicationDelayModeled": true,
+        "delayModel": "Use only after official daily dataset publication is observed; never backdate availability to trade time",
+        "lookAheadRule": "publishedAt<=decisionAt"
+      },
+      "machineReadableContract": {
+        "format": "FINRA API JSON",
+        "identifier": "regShoDaily dataset; Public credential and terms acceptance required"
+      },
+      "officialDocumentation": [
+        "https://www.finra.org/finra-data/browse-catalog/short-sale-volume",
+        "https://developer.finra.org/docs"
+      ]
+    },
+    {
+      "sourceId": "REG_SHO_THRESHOLD_SECURITIES",
+      "status": "OFFICIAL_SOURCE_CONTRACT_INCOMPLETE",
+      "evidenceClass": "REGULATORY_THRESHOLD_STATUS",
+      "semanticMeaning": "Published threshold-security status associated with persistent aggregate fails-to-deliver criteria",
+      "prohibitedInference": "Threshold-list membership is not issuer misconduct evidence or a direct short signal",
+      "directSignalEligible": false,
+      "historicalEvidenceCurrentSentimentEligible": false,
+      "isShortSignal": false,
+      "responseSha256Required": true,
+      "amendmentsModeled": true,
+      "amendmentPolicy": "Preserve list date, late or amended publication status, primary-listing SRO, and response lineage",
+      "issuerIdentifierPolicy": "Require effective-dated security identity plus primary-listing SRO; do not merge OTC and exchange-listed source scopes",
+      "publication": {
+        "eventClock": "thresholdListDate",
+        "publicationClock": "official SRO list publication timestamp or retrieval timestamp",
+        "timezone": "America/New_York",
+        "publicationDelayModeled": true,
+        "delayModel": "Use only after official list publication; preserve late and amended list evidence",
+        "lookAheadRule": "publishedAt<=decisionAt"
+      },
+      "machineReadableContract": {
+        "format": "FINRA API JSON for OTC scope; exchange-listed primary-SRO contract unresolved",
+        "identifier": "thresholdList dataset for OTC securities; exchange-listed SRO source matrix pending"
+      },
+      "officialDocumentation": [
+        "https://www.sec.gov/investor/pubs/regsho.htm",
+        "https://www.finra.org/finra-data/browse-catalog/otc-threshold",
+        "https://developer.finra.org/docs"
+      ]
+    }
+  ],
+  "semanticGuards": {
+    "form13fIsRealtimeTradeEvidence": false,
+    "historicalFilingIsCurrentSentiment": false,
+    "regShoThresholdIsShortSignal": false,
+    "shortInterestEquivalentToShortSaleVolume": false
+  },
+  "identifierLineage": {
+    "existingContract": "corporate-action-lineage-v1",
+    "symbolOnlyJoinAllowed": false,
+    "tickerRenameRequiresEffectiveDate": true,
+    "mergerOrDelistingRequiresLineage": true,
+    "unknownOrUnclassifiedRows": 0,
+    "specialCases": [
+      "FILING_MANAGER_CIK_IS_NOT_HELD_ISSUER_ID",
+      "REPORTING_OWNER_CIK_IS_NOT_SUBJECT_ISSUER_CIK",
+      "OTC_AND_EXCHANGE_LISTED_THRESHOLD_SCOPES_ARE_DISTINCT"
+    ]
+  },
+  "syntheticCases": [
+    {
+      "caseId": "section16_published_before_decision",
+      "sourceId": "SEC_SECTION16_FORMS_3_4_5",
+      "identifierSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "identifierEvidence": "STABLE_IDENTIFIER_VERIFIED",
+      "publishedAt": "2026-08-10T20:00:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "PUBLICATION_AVAILABLE",
+      "expectedIdentifierStatus": "IDENTIFIER_VERIFIED",
+      "expectedEvidenceClass": "INSIDER_OWNERSHIP_TRANSACTION"
+    },
+    {
+      "caseId": "section16_future_amendment_rejected",
+      "sourceId": "SEC_SECTION16_FORMS_3_4_5",
+      "identifierSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "identifierEvidence": "STABLE_IDENTIFIER_VERIFIED",
+      "publishedAt": "2026-08-11T20:00:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "LOOK_AHEAD_REJECTED",
+      "expectedIdentifierStatus": "IDENTIFIER_VERIFIED",
+      "expectedEvidenceClass": "INSIDER_OWNERSHIP_TRANSACTION"
+    },
+    {
+      "caseId": "beneficial_ownership_effective_alias",
+      "sourceId": "SEC_SCHEDULES_13D_13G",
+      "identifierSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "identifierEvidence": "EFFECTIVE_DATED_ALIAS_VERIFIED",
+      "publishedAt": "2026-08-10T19:00:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "PUBLICATION_AVAILABLE",
+      "expectedIdentifierStatus": "IDENTIFIER_VERIFIED",
+      "expectedEvidenceClass": "BENEFICIAL_OWNERSHIP_POSITION_DISCLOSURE"
+    },
+    {
+      "caseId": "beneficial_ownership_lineage_incomplete",
+      "sourceId": "SEC_SCHEDULES_13D_13G",
+      "identifierSha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "identifierEvidence": "IDENTIFIER_LINEAGE_INCOMPLETE",
+      "publishedAt": "2026-08-10T19:00:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "PUBLICATION_AVAILABLE",
+      "expectedIdentifierStatus": "IDENTIFIER_LINEAGE_INCOMPLETE",
+      "expectedEvidenceClass": "BENEFICIAL_OWNERSHIP_POSITION_DISCLOSURE"
+    },
+    {
+      "caseId": "institutional_holdings_historical_snapshot",
+      "sourceId": "SEC_FORM_13F",
+      "identifierSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "identifierEvidence": "EFFECTIVE_DATED_ALIAS_VERIFIED",
+      "publishedAt": "2026-08-10T18:00:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "PUBLICATION_AVAILABLE",
+      "expectedIdentifierStatus": "IDENTIFIER_VERIFIED",
+      "expectedEvidenceClass": "INSTITUTIONAL_HOLDINGS_SNAPSHOT"
+    },
+    {
+      "caseId": "institutional_holdings_future_filing_rejected",
+      "sourceId": "SEC_FORM_13F",
+      "identifierSha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "identifierEvidence": "STABLE_IDENTIFIER_VERIFIED",
+      "publishedAt": "2026-08-12T18:00:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "LOOK_AHEAD_REJECTED",
+      "expectedIdentifierStatus": "IDENTIFIER_VERIFIED",
+      "expectedEvidenceClass": "INSTITUTIONAL_HOLDINGS_SNAPSHOT"
+    },
+    {
+      "caseId": "short_interest_position_snapshot",
+      "sourceId": "FINRA_CONSOLIDATED_SHORT_INTEREST",
+      "identifierSha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "identifierEvidence": "STABLE_IDENTIFIER_VERIFIED",
+      "publishedAt": "2026-08-10T20:40:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "PUBLICATION_AVAILABLE",
+      "expectedIdentifierStatus": "IDENTIFIER_VERIFIED",
+      "expectedEvidenceClass": "SHORT_INTEREST_POSITION_SNAPSHOT"
+    },
+    {
+      "caseId": "short_sale_activity_volume",
+      "sourceId": "FINRA_REG_SHO_DAILY_SHORT_VOLUME",
+      "identifierSha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "identifierEvidence": "STABLE_IDENTIFIER_VERIFIED",
+      "publishedAt": "2026-08-10T20:30:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "PUBLICATION_AVAILABLE",
+      "expectedIdentifierStatus": "IDENTIFIER_VERIFIED",
+      "expectedEvidenceClass": "SHORT_SALE_ACTIVITY_VOLUME"
+    },
+    {
+      "caseId": "threshold_status_lineage_incomplete",
+      "sourceId": "REG_SHO_THRESHOLD_SECURITIES",
+      "identifierSha256": "9999999999999999999999999999999999999999999999999999999999999999",
+      "identifierEvidence": "IDENTIFIER_LINEAGE_INCOMPLETE",
+      "publishedAt": "2026-08-10T20:30:00Z",
+      "decisionAt": "2026-08-10T21:00:00Z",
+      "expectedLookAheadStatus": "PUBLICATION_AVAILABLE",
+      "expectedIdentifierStatus": "IDENTIFIER_LINEAGE_INCOMPLETE",
+      "expectedEvidenceClass": "REGULATORY_THRESHOLD_STATUS"
+    }
+  ],
+  "auditSummary": {
+    "externalRequestCount": 0,
+    "historicalFilingCurrentSentimentPromotionRows": 0,
+    "identifierUnknownOrUnclassifiedRows": 0,
+    "lookAheadViolationRows": 0,
+    "regShoDirectSignalRows": 0,
+    "shortInterestShortSaleVolumeConfusionRows": 0,
+    "sourceRows": 6
+  }
+}
