@@ -60,6 +60,8 @@ jobs:
         run: python scripts/check_corporate_action_lineage_contract.py
       - name: SEC and FINRA SHADOW_ONLY capability contract
         run: python scripts/check_sec_finra_shadow_capability.py
+      - name: SEC and FINRA SHADOW_ONLY evidence producer
+        run: python scripts/check_sec_finra_shadow_evidence.py
       - name: Toss read-only capability contract
         run: python scripts/check_toss_read_only_capability.py
       - name: Toss Phase2a shadow market-data contract
@@ -78,6 +80,9 @@ jobs:
           FINNHUB_KEY: ${{ secrets.FINNHUB_KEY || secrets.FINNHUB_API_KEY }}
           TOSS_CLIENT_ID: ${{ secrets.TOSS_CLIENT_ID }}
           TOSS_CLIENT_SECRET: ${{ secrets.TOSS_CLIENT_SECRET }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          FINRA_CLIENT_ID: ${{ secrets.FINRA_CLIENT_ID }}
+          FINRA_CLIENT_SECRET: ${{ secrets.FINRA_CLIENT_SECRET }}
           # The current account is free-tier; Premium activation requires a reviewed contract change.
           FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED: 'false'
           FMP_DELISTED_PREMIUM_ENABLED: 'false'
@@ -87,6 +92,8 @@ jobs:
           TOSS_SHADOW_PROVIDER_ENABLED: 'false'
           TOSS_SHADOW_REGISTERED_EGRESS_CONFIRMED: 'false'
           TOSS_SHADOW_MAX_PRICE_REQUESTS: '2'
+          # Static producer is merged separately from recurring source activation.
+          SEC_FINRA_SHADOW_PROVIDER_ENABLED: 'false'
           
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           # Harvester collection notifications must go to simulation/private channel.
@@ -105,6 +112,7 @@ jobs:
           HARVESTER_CORPORATE_ACTION_RUNTIME_AUDIT_PATH: state/corporate-action-lineage-runtime-audit.json
           HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH: state/toss-read-only-capability.json
           HARVESTER_TOSS_SHADOW_PATH: state/toss-market-data-shadow.json
+          HARVESTER_SEC_FINRA_SHADOW_PATH: state/sec-finra-shadow-evidence.json
         run: |
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
@@ -138,6 +146,7 @@ jobs:
             state/corporate-action-lineage-runtime-audit.json
             state/toss-read-only-capability.json
             state/toss-market-data-shadow.json
+            state/sec-finra-shadow-evidence.json
             state/symbol-agnostic-runtime-check.json
             state/symbol-agnostic-runtime-check.md
             state/telegram-routing-policy-audit.*

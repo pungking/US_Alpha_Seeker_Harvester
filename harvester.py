@@ -45,6 +45,11 @@ from scripts.toss_shadow_market_data import (
     toss_shadow_matches_stage3,
     toss_shadow_runtime_decision,
 )
+from scripts.sec_finra_shadow_evidence import (
+    build_sec_finra_shadow_not_run_result,
+    collect_sec_finra_shadow_evidence,
+    sec_finra_shadow_runtime_decision,
+)
 
 # 로그 실시간 출력 설정
 # 항상 line buffering을 켜서 GitHub Actions/터미널에 진행 로그가 즉시 보이게 한다.
@@ -96,6 +101,10 @@ HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH = (
 HARVESTER_TOSS_SHADOW_PATH = (
     os.getenv("HARVESTER_TOSS_SHADOW_PATH")
     or "state/toss-market-data-shadow.json"
+).strip()
+HARVESTER_SEC_FINRA_SHADOW_PATH = (
+    os.getenv("HARVESTER_SEC_FINRA_SHADOW_PATH")
+    or "state/sec-finra-shadow-evidence.json"
 ).strip()
 HARVESTER_TOSS_SHADOW_SENTINEL_DIR = Path(
     os.path.expanduser(
@@ -219,6 +228,9 @@ FMP_API_KEY = os.getenv("FMP_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_KEY") or os.getenv("FINNHUB_API_KEY")
 TOSS_CLIENT_ID = os.getenv("TOSS_CLIENT_ID")
 TOSS_CLIENT_SECRET = os.getenv("TOSS_CLIENT_SECRET")
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT")
+FINRA_CLIENT_ID = os.getenv("FINRA_CLIENT_ID")
+FINRA_CLIENT_SECRET = os.getenv("FINRA_CLIENT_SECRET")
 
 
 def _read_bool_env(name, default=False):
@@ -264,6 +276,9 @@ TOSS_READ_ONLY_CAPABILITY_PROBE_ENABLED = _read_bool_env(
 )
 TOSS_SHADOW_PROVIDER_ENABLED = _read_bool_env(
     "TOSS_SHADOW_PROVIDER_ENABLED", False
+)
+SEC_FINRA_SHADOW_PROVIDER_ENABLED = _read_bool_env(
+    "SEC_FINRA_SHADOW_PROVIDER_ENABLED", False
 )
 TOSS_SHADOW_MAX_PRICE_REQUESTS = _read_positive_int_env(
     "TOSS_SHADOW_MAX_PRICE_REQUESTS", 2
@@ -741,6 +756,78 @@ def upload_json(filename, data, parent_id):
 
 TOSS_READ_ONLY_CAPABILITY_FILENAME = "TOSS_READ_ONLY_CAPABILITY.json"
 TOSS_MARKET_DATA_SHADOW_FILENAME = "TOSS_MARKET_DATA_SHADOW.json"
+SEC_FINRA_SHADOW_EVIDENCE_FILENAME = "SEC_FINRA_SHADOW_EVIDENCE.json"
+
+
+def ensure_sec_finra_shadow_evidence(
+    sys_id: str,
+    session: Any | None = None,
+) -> dict[str, Any]:
+    enabled, runtime_reason = sec_finra_shadow_runtime_decision(os.environ)
+    if not enabled:
+        return build_sec_finra_shadow_not_run_result(runtime_reason)
+
+    retrieved_at = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    source_session = session or requests.Session()
+    owns_session = session is None
+    if owns_session:
+        source_session.trust_env = False
+    try:
+        result = collect_sec_finra_shadow_evidence(
+            session=source_session,
+            sec_user_agent=str(SEC_USER_AGENT or ""),
+            finra_client_id=str(FINRA_CLIENT_ID or ""),
+            finra_client_secret=str(FINRA_CLIENT_SECRET or ""),
+            retrieved_at=retrieved_at,
+        )
+    except Exception as exc:
+        result = build_sec_finra_shadow_not_run_result(
+            "producer_exception_fail_open"
+        )
+        result.update(
+            {
+                "status": "SEC_FINRA_SHADOW_TRANSIENT_FAILURE",
+                "runtimeAction": "PRODUCER_EXCEPTION_FAIL_OPEN",
+                "safeErrorCategory": type(exc).__name__,
+                "requestCounts": {
+                    key: None for key in result["requestCounts"]
+                },
+                "externalRequestCount": None,
+                "requestCountEvidenceStatus": "UNAVAILABLE_AFTER_EXCEPTION",
+            }
+        )
+    finally:
+        if owns_session:
+            source_session.close()
+
+    write_json_report(
+        HARVESTER_SEC_FINRA_SHADOW_PATH,
+        result,
+        "SEC/FINRA shadow evidence",
+    )
+    artifact_hash = str(result.get("evidenceSha256") or _canonical_sha256(result))
+    safe_status = re.sub(
+        r"[^A-Z0-9_]+",
+        "_",
+        str(result.get("status") or "UNKNOWN").upper(),
+    )[:48]
+    archive_name = (
+        f"SEC_FINRA_SHADOW_EVIDENCE_{safe_status}_{artifact_hash[:16]}.json"
+    )
+    try:
+        upload_json(archive_name, result, sys_id)
+        upload_json(SEC_FINRA_SHADOW_EVIDENCE_FILENAME, result, sys_id)
+    except Exception as exc:
+        result["artifactPersistenceStatus"] = "DRIVE_PUBLISH_FAILED"
+        result["artifactPersistenceErrorCategory"] = type(exc).__name__
+        write_json_report(
+            HARVESTER_SEC_FINRA_SHADOW_PATH,
+            result,
+            "SEC/FINRA shadow Drive publish failure",
+        )
+    return result
 
 
 def ensure_toss_read_only_capability_once(sys_id, candidate_symbols, session=None):
@@ -6278,6 +6365,9 @@ def run_harvester():
     toss_market_data_shadow = _toss_shadow_not_run_result(
         "shadow_provider_not_evaluated"
     )
+    sec_finra_shadow = build_sec_finra_shadow_not_run_result(
+        "shadow_provider_not_evaluated"
+    )
     corporate_action_runtime_audit_written = False
     mapping_refresh_audit = {"status": "not_run"}
 
@@ -6644,6 +6734,7 @@ def run_harvester():
                 "errorCount": total_error,
                 "durationMinutes": round(duration, 2),
                 "tossMarketDataShadow": toss_market_data_shadow,
+                "secFinraShadow": sec_finra_shadow,
             }
             failure_report = build_harvester_failure_report(summary_payload)
             write_harvester_failure_report(failure_report)
@@ -6793,6 +6884,25 @@ def run_harvester():
                 print(
                     "⚠️ Toss SHADOW producer failed; canonical analysis continues "
                     f"(category={type(exc).__name__})",
+                    flush=True,
+                )
+        if SEC_FINRA_SHADOW_PROVIDER_ENABLED:
+            try:
+                sec_finra_shadow = ensure_sec_finra_shadow_evidence(sys_id)
+            except Exception as exc:
+                sec_finra_shadow = build_sec_finra_shadow_not_run_result(
+                    "producer_exception_fail_open"
+                )
+                sec_finra_shadow.update(
+                    {
+                        "status": "SEC_FINRA_SHADOW_TRANSIENT_FAILURE",
+                        "runtimeAction": "PRODUCER_EXCEPTION_FAIL_OPEN",
+                        "safeErrorCategory": type(exc).__name__,
+                    }
+                )
+                print(
+                    "⚠️ SEC/FINRA SHADOW producer failed; canonical analysis "
+                    f"continues (category={type(exc).__name__})",
                     flush=True,
                 )
         daily_corporate_action_audit = build_mapping_corporate_action_runtime_audit(
@@ -7486,6 +7596,7 @@ def run_harvester():
         summary_payload["targetLineageRuntime"] = target_lineage_runtime
         summary_payload["tossReadOnlyCapability"] = toss_read_only_capability
         summary_payload["tossMarketDataShadow"] = toss_market_data_shadow
+        summary_payload["secFinraShadow"] = sec_finra_shadow
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
         write_harvester_run_summary(summary_payload)
 
@@ -7532,6 +7643,7 @@ def run_harvester():
             "errorType": type(e).__name__,
             "errorMessage": str(e),
             "tossMarketDataShadow": toss_market_data_shadow,
+            "secFinraShadow": sec_finra_shadow,
         }
         failure_report = build_harvester_failure_report(summary_payload)
         write_harvester_failure_report(failure_report)
