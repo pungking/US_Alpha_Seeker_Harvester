@@ -17,9 +17,6 @@ jobs:
     timeout-minutes: 10
     env:
       SEC_FINRA_SHADOW_PROVIDER_ENABLED: 'false'
-      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
-      FINRA_CLIENT_ID: ${{ secrets.FINRA_CLIENT_ID }}
-      FINRA_CLIENT_SECRET: ${{ secrets.FINRA_CLIENT_SECRET }}
     steps:
       - name: Verify explicit bounded approval
         env:
@@ -44,6 +41,10 @@ jobs:
           python scripts/check_sec_finra_shadow_evidence.py
 
       - name: Run bounded read-only reproof
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          FINRA_CLIENT_ID: ${{ secrets.FINRA_CLIENT_ID }}
+          FINRA_CLIENT_SECRET: ${{ secrets.FINRA_CLIENT_SECRET }}
         run: |
           python scripts/run_sec_finra_shadow_reproof.py \
             --output "$RUNNER_TEMP/sec-finra-shadow-reproof.json" \
