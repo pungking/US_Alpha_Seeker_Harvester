@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -10,6 +11,7 @@ from sec_finra_shadow_evidence import (
     collect_sec_finra_shadow_evidence,
     sec_finra_shadow_runtime_decision,
 )
+from run_sec_finra_shadow_reproof import run_sec_finra_shadow_reproof
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -236,10 +238,72 @@ def main() -> int:
     assert blocked["analysisContinued"] is True
     assert blocked["unknownOrUnclassifiedRows"] == 0
 
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        reproof_session = FakeSession()
+        reproof = run_sec_finra_shadow_reproof(
+            session=reproof_session,
+            environment={
+                "SEC_USER_AGENT": "US Alpha Seeker contact@invalid.test",
+                "FINRA_CLIENT_ID": "client-id",
+                "FINRA_CLIENT_SECRET": "client-secret",
+            },
+            output_path=root / "result.json",
+            sentinel_path=root / "sentinel.json",
+            retrieved_at="2026-08-21T12:00:00Z",
+        )
+        assert reproof["status"] == "SEC_FINRA_SHADOW_PASS_APPROVED_SCOPE"
+        assert reproof["externalRequestCount"] == 12
+        assert reproof["reproofMode"] == "BOUNDED_MANUAL_READ_ONLY"
+        assert reproof["canonicalSourceChanged"] is False
+        assert reproof["policyImpact"] == "NONE_REPORT_ONLY"
+        assert reproof["rawResponseStored"] is False
+        assert (root / "result.json").exists()
+        sentinel = json.loads((root / "sentinel.json").read_text(encoding="utf-8"))
+        assert sentinel["status"] == "COMPLETE"
+        assert sentinel["requestCounts"] == reproof["requestCounts"]
+        assert len(sentinel["resultSha256"]) == 64
+
+        request_count = len(reproof_session.requests)
+        try:
+            run_sec_finra_shadow_reproof(
+                session=reproof_session,
+                environment={
+                    "SEC_USER_AGENT": "US Alpha Seeker contact@invalid.test",
+                    "FINRA_CLIENT_ID": "client-id",
+                    "FINRA_CLIENT_SECRET": "client-secret",
+                },
+                output_path=root / "result.json",
+                sentinel_path=root / "sentinel.json",
+                retrieved_at="2026-08-21T12:01:00Z",
+            )
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("duplicate reproof must fail before network")
+        assert len(reproof_session.requests) == request_count
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        blocked_session = FakeSession()
+        blocked_reproof = run_sec_finra_shadow_reproof(
+            session=blocked_session,
+            environment={},
+            output_path=root / "result.json",
+            sentinel_path=root / "sentinel.json",
+            retrieved_at="2026-08-21T12:02:00Z",
+        )
+        assert blocked_reproof["status"] == "SEC_FINRA_SHADOW_REPROOF_CONFIG_BLOCKED"
+        assert blocked_reproof["externalRequestCount"] == 0
+        assert blocked_session.requests == []
+
     harvester_source = (ROOT / "harvester.py").read_text(encoding="utf-8")
     workflow_source = (ROOT / ".github/workflows/main.yml").read_text(
         encoding="utf-8"
     )
+    reproof_workflow = (
+        ROOT / ".github/workflows/sec-finra-shadow-reproof.yml"
+    ).read_text(encoding="utf-8")
     for required in (
         "SEC_FINRA_SHADOW_EVIDENCE_FILENAME",
         "ensure_sec_finra_shadow_evidence",
@@ -255,6 +319,15 @@ def main() -> int:
         "state/sec-finra-shadow-evidence.json",
     ):
         assert required in workflow_source
+    for required in (
+        "workflow_dispatch:",
+        "SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}",
+        "FINRA_CLIENT_ID: ${{ secrets.FINRA_CLIENT_ID }}",
+        "FINRA_CLIENT_SECRET: ${{ secrets.FINRA_CLIENT_SECRET }}",
+        "python scripts/run_sec_finra_shadow_reproof.py",
+        "SEC_FINRA_SHADOW_PROVIDER_ENABLED: 'false'",
+    ):
+        assert required in reproof_workflow
 
     print(
         "[SEC_FINRA_SHADOW_EVIDENCE] PASS "
