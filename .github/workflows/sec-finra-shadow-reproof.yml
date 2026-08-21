@@ -1,0 +1,60 @@
+name: SEC FINRA SHADOW Read-only Reproof
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: "Exact bounded reproof approval phrase"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  reproof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SEC_FINRA_SHADOW_PROVIDER_ENABLED: 'false'
+      SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+      FINRA_CLIENT_ID: ${{ secrets.FINRA_CLIENT_ID }}
+      FINRA_CLIENT_SECRET: ${{ secrets.FINRA_CLIENT_SECRET }}
+    steps:
+      - name: Verify explicit bounded approval
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          test "$APPROVAL" = "AUTHORIZE SEC FINRA SHADOW READ-ONLY REPROOF"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install bounded client dependency
+        run: python -m pip install requests
+
+      - name: Verify static SEC/FINRA contracts
+        run: |
+          python scripts/check_sec_finra_shadow_capability.py
+          python scripts/check_sec_finra_shadow_evidence.py
+
+      - name: Run bounded read-only reproof
+        run: |
+          python scripts/run_sec_finra_shadow_reproof.py \
+            --output "$RUNNER_TEMP/sec-finra-shadow-reproof.json" \
+            --sentinel "$RUNNER_TEMP/sec-finra-shadow-reproof-sentinel.json"
+
+      - name: Upload safe aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: sec-finra-shadow-reproof-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/sec-finra-shadow-reproof.json
+            ${{ runner.temp }}/sec-finra-shadow-reproof-sentinel.json
+          if-no-files-found: warn
