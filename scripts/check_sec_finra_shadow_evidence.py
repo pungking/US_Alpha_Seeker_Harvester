@@ -328,6 +328,13 @@ def main() -> int:
         "SEC_FINRA_SHADOW_PROVIDER_ENABLED: 'false'",
     ):
         assert required in reproof_workflow
+    job_prelude, steps = reproof_workflow.split("    steps:", 1)
+    probe_step = steps.split(
+        "      - name: Run bounded read-only reproof", 1
+    )[1].split("      - name:", 1)[0]
+    for secret in ("SEC_USER_AGENT", "FINRA_CLIENT_ID", "FINRA_CLIENT_SECRET"):
+        assert f"secrets.{secret}" not in job_prelude
+        assert f"secrets.{secret}" in probe_step
 
     print(
         "[SEC_FINRA_SHADOW_EVIDENCE] PASS "
