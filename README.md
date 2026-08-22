@@ -304,3 +304,41 @@ requires a separate approval, server-side secret loading, the registered Mac
 egress, and an explicit rollback that unloads the job without deleting sentinel
 or Drive archive evidence. GitHub-hosted runners keep both Toss probes disabled
 and make zero Toss requests.
+
+### BLS calendar Mac one-shot topology
+
+The selected topology is `BLS_CALENDAR_MAC_TOPOLOGY_READY`: run the existing
+bounded calendar parser as an operator-approved Mac-side one-shot. The
+GitHub-hosted runner remains unsuitable because the official calendar source is
+access-blocked there. A static-egress self-hosted runner adds cost and attack
+surface without improving the current contract; reconsider it only if the Mac
+cannot reach the official source. Deferring integration remains the safe
+fallback, but provides no publication clock.
+
+The Mac command first requests the official iCal source once. It requests the
+official monthly HTML schedule once only after an iCal 401/403. A 429, timeout,
+5xx, redirect, or invalid contract does not trigger fallback or retry. The
+dynamic HTML route uses the retrieval month in `America/New_York`. The command
+does not read or send `BLS_API_KEY`; every non-calendar provider budget is zero.
+
+After the exact approval phrase `AUTHORIZE BLS CALENDAR MAC SHADOW ONE-SHOT`, run
+the command once from the server-side Harvester checkout:
+
+```bash
+python scripts/run_macro_event_clock_capability_probe.py \
+  --bls-calendar-mac-only \
+  --approval "AUTHORIZE BLS CALENDAR MAC SHADOW ONE-SHOT" \
+  --output /private/tmp/bls-calendar-mac-capability.json \
+  --sentinel /private/tmp/bls-calendar-mac-capability-sentinel.json
+```
+
+Both paths must be absent before activation. The sentinel is reserved before
+network access, so preserving either file blocks a duplicate request. The safe
+result contains only aggregate event/time counts, response and shape hashes,
+and publication/effective-time separation; it stores no raw ICS/HTML, title,
+release value, credential, or symbol. This command neither publishes a
+canonical source nor changes Stage6/OOS policy or broker/sidecar state.
+
+No recurring `launchd` job or self-hosted runner is installed. Rollback is to
+stop after the one-shot and preserve the result and sentinel; recurring
+activation requires a separate goal and approval.

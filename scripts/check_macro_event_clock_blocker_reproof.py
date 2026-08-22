@@ -8,11 +8,16 @@ from typing import Any
 import requests
 
 from run_macro_event_clock_capability_probe import (
+    BLS_CALENDAR_MAC_APPROVAL,
+    BLS_CALENDAR_MAC_REQUEST_BUDGETS,
+    BLS_CALENDAR_MAC_SCHEMA_VERSION,
     BLOCKER_ONLY_APPROVAL,
     BLOCKER_ONLY_PASS_STATUS,
     BLOCKER_ONLY_REQUEST_BUDGETS,
     BLOCKER_ONLY_SCHEMA_VERSION,
+    collect_bls_calendar_mac_capability,
     collect_macro_event_clock_blocker_reproof,
+    run_bls_calendar_mac_capability_probe,
     run_macro_event_clock_blocker_reproof,
 )
 
@@ -177,6 +182,55 @@ def main() -> int:
     fallback_urls = [url for _, url, _ in fallback_session.requests]
     assert fallback_urls[1].endswith("/schedule/2026/08_sched_list.htm")
 
+    mac_session = FakeSession()
+    mac = collect_bls_calendar_mac_capability(
+        session=mac_session,
+        retrieved_at="2026-08-21T12:00:00Z",
+    )
+    mac_counts = {key: 0 for key in BLS_CALENDAR_MAC_REQUEST_BUDGETS}
+    mac_counts["blsIcal"] = 1
+    assert mac["schemaVersion"] == BLS_CALENDAR_MAC_SCHEMA_VERSION
+    assert mac["status"] == "BLS_CALENDAR_ICAL_PASS"
+    assert mac["mode"] == "SHADOW_ONLY_MAC_CALENDAR_ONE_SHOT"
+    assert mac["executionTopology"] == "MAC_SIDE_BOUNDED_ONE_SHOT"
+    assert mac["topologyVerdict"] == "BLS_CALENDAR_MAC_TOPOLOGY_READY"
+    assert mac["requestCounts"] == mac_counts
+    assert mac["externalRequestCount"] == 1
+    assert mac["requestBudgetCompliant"] is True
+    assert mac["marketTimezone"] == "America/New_York"
+    assert mac["registrationKeyUsed"] is False
+    assert mac["rawResponseStored"] is False
+    assert mac["canonicalSourceChanged"] is False
+    assert mac["policyImpact"] == "NONE_REPORT_ONLY"
+    assert mac["unknownOrUnclassifiedRows"] == 0
+    assert len(mac["source"]["responseSha256"]) == 64
+    assert len(mac["source"]["shapeKeySetSha256"]) == 64
+    assert len(mac_session.requests) == 1
+    assert mac_session.requests[0][1].endswith("bls.ics")
+    assert "private release" not in json.dumps(mac, sort_keys=True)
+
+    mac_fallback_session = FakeSession(ical_status=403)
+    mac_fallback = collect_bls_calendar_mac_capability(
+        session=mac_fallback_session,
+        retrieved_at="2026-08-21T12:00:00Z",
+    )
+    assert mac_fallback["status"] == "BLS_CALENDAR_HTML_FALLBACK_PASS"
+    assert mac_fallback["requestCounts"]["blsIcal"] == 1
+    assert mac_fallback["requestCounts"]["blsHtmlFallback"] == 1
+    assert len(mac_fallback_session.requests) == 2
+
+    for blocked_session in (
+        FakeSession(ical_status=429),
+        FakeSession(ical_status=500),
+        FakeSession(ical_exception=requests.Timeout("private")),
+    ):
+        blocked_mac = collect_bls_calendar_mac_capability(
+            session=blocked_session,
+            retrieved_at="2026-08-21T12:00:00Z",
+        )
+        assert blocked_mac["requestCounts"]["blsHtmlFallback"] == 0
+        assert len(blocked_session.requests) == 1
+
     rendered = json.dumps(fallback, sort_keys=True)
     for forbidden in (
         "private-bea-key",
@@ -239,6 +293,51 @@ def main() -> int:
             raise AssertionError("duplicate blocker reproof must fail before network")
         assert len(session.requests) == initial_request_count
 
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        session = FakeSession(ical_status=403)
+        result = run_bls_calendar_mac_capability_probe(
+            session=session,
+            output_path=root / "result.json",
+            sentinel_path=root / "sentinel.json",
+            retrieved_at="2026-08-21T12:00:00Z",
+            approval=BLS_CALENDAR_MAC_APPROVAL,
+        )
+        assert result["status"] == "BLS_CALENDAR_HTML_FALLBACK_PASS"
+        initial_request_count = len(session.requests)
+        try:
+            run_bls_calendar_mac_capability_probe(
+                session=session,
+                output_path=root / "result.json",
+                sentinel_path=root / "sentinel.json",
+                retrieved_at="2026-08-21T12:01:00Z",
+                approval=BLS_CALENDAR_MAC_APPROVAL,
+            )
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("duplicate Mac probe must fail before network")
+        assert len(session.requests) == initial_request_count
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        sentinel = root / "sentinel.json"
+        sentinel.write_text("{}\n", encoding="utf-8")
+        session = FakeSession()
+        try:
+            run_bls_calendar_mac_capability_probe(
+                session=session,
+                output_path=root / "result.json",
+                sentinel_path=sentinel,
+                retrieved_at="2026-08-21T12:00:00Z",
+                approval=BLS_CALENDAR_MAC_APPROVAL,
+            )
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("existing Mac sentinel must block before network")
+        assert session.requests == []
+
     workflow = (
         ROOT / ".github/workflows/macro-event-clock-blocker-reproof.yml"
     ).read_text(encoding="utf-8")
@@ -250,6 +349,12 @@ def main() -> int:
     assert "secrets.FRED_API_KEY" not in workflow
     assert "schedule:" not in workflow
     assert "pull_request:" not in workflow
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "BLS_CALENDAR_MAC_TOPOLOGY_READY" in readme
+    assert "--bls-calendar-mac-only" in readme
+    assert BLS_CALENDAR_MAC_APPROVAL in readme
+    assert "No recurring `launchd` job" in readme
 
     print(
         "[MACRO_BLOCKER_REPROOF] PASS "
