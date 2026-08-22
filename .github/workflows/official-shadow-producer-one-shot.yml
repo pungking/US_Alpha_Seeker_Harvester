@@ -1,0 +1,79 @@
+name: Official SHADOW Producer Bounded One-Shot
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Exact bounded one-shot approval phrase
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: official-shadow-producer-one-shot
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate approval and ref
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$APPROVAL" = "AUTHORIZE OFFICIAL SHADOW PRODUCER BOUNDED ONE-SHOT"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install --upgrade google-api-python-client google-auth requests yfinance pandas
+
+      - name: Verify static producer contract
+        run: python scripts/check_official_shadow_producer_readiness.py
+
+      - name: Run bounded official SHADOW producers
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          FINRA_CLIENT_ID: ${{ secrets.FINRA_CLIENT_ID }}
+          FINRA_CLIENT_SECRET: ${{ secrets.FINRA_CLIENT_SECRET }}
+          BEA_API_KEY: ${{ secrets.BEA_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_ALERT_CHAT_ID || vars.TELEGRAM_ALERT_CHAT_ID }}
+          GITHUB_EVENT_NAME: workflow_dispatch
+          OFFICIAL_SHADOW_ONE_SHOT_APPROVAL: ${{ inputs.approval }}
+          SEC_FINRA_SHADOW_PROVIDER_ENABLED: 'true'
+          MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED: 'true'
+          HARVESTER_SEC_FINRA_SHADOW_PATH: state/sec-finra-shadow-evidence.json
+          HARVESTER_MACRO_EVENT_CLOCK_SHADOW_PATH: state/macro-event-clock-shadow.json
+          HARVESTER_OFFICIAL_SHADOW_SENTINEL_DIR: state/official-shadow-sentinels
+          HARVESTER_OFFICIAL_SHADOW_ONE_SHOT_RESULT_PATH: state/official-shadow-producer-one-shot.json
+        run: |
+          mkdir -p state
+          python harvester.py --official-shadow-producer-one-shot
+
+      - name: Upload safe one-shot evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: official-shadow-producer-one-shot-${{ github.run_id }}
+          path: |
+            state/official-shadow-producer-one-shot.json
+            state/sec-finra-shadow-evidence.json
+            state/macro-event-clock-shadow.json
+            state/official-shadow-sentinels/*.json
+          if-no-files-found: warn

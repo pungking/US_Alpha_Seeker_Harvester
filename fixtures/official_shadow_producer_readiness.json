@@ -1,0 +1,92 @@
+{
+  "schemaVersion": "official-shadow-producer-readiness-v1",
+  "status": "OFFICIAL_SHADOW_PRODUCER_READY_WITH_BLS_CALENDAR_EXCLUDED",
+  "credentialCapabilityStatus": "PASS_ALL_CREDENTIAL_CAPABILITIES",
+  "enabledByDefault": false,
+  "recurringActivationAuthorized": false,
+  "secFinraProducerStatus": "EXISTING_RUNTIME_PRODUCER_READY",
+  "macroProducerStatus": "EXISTING_RUNTIME_PRODUCER_READY",
+  "blsCalendarStatus": "BLS_CALENDAR_STATIC_EGRESS_REQUIRED",
+  "collectionWindowContractStatus": "VERIFIED_SOURCE_PUBLICATION_OBSERVATION_WINDOWS",
+  "idempotencyStatus": "LOCAL_AND_DRIVE_SENTINEL_CONTRACT_READY",
+  "existingArtifactReuseStatus": "MATCHED_WINDOW_REUSE_ZERO_REQUESTS",
+  "requestBudget": {
+    "secFinra": {
+      "secDiscovery": 3,
+      "secSubmissions": 3,
+      "secRawFiling": 3,
+      "finraOauth": 1,
+      "finraMetadata": 1,
+      "finraData": 3
+    },
+    "macro": {
+      "federalReserveCalendar": 1,
+      "fredMetadata": 1,
+      "fredData": 1,
+      "beaMetadata": 1,
+      "beaData": 1,
+      "blsRegisteredData": 1,
+      "blsIcal": 0,
+      "blsHtmlFallback": 0,
+      "sec": 0,
+      "finra": 0,
+      "toss": 0
+    }
+  },
+  "sourceClassifications": [
+    {
+      "sourceId": "SEC_SECTION16_FORMS_3_4_5",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "SEC_SCHEDULES_13D_13G",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "SEC_FORM_13F",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "FINRA_CONSOLIDATED_SHORT_INTEREST",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "FINRA_REG_SHO_DAILY_SHORT_VOLUME",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "FINRA_OTC_THRESHOLD_LIST",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "FEDERAL_RESERVE_FOMC_CALENDAR",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "FRED_RELEASE_METADATA_AND_SOURCE_DATES",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "BEA_RELEASE_SCHEDULE_AND_DATASET_METADATA",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "BLS_REGISTERED_DATA_OBSERVATION_CATALOG",
+      "status": "EXISTING_RUNTIME_PRODUCER_READY"
+    },
+    {
+      "sourceId": "BLS_OFFICIAL_RELEASE_CALENDAR",
+      "status": "SOURCE_EXCLUDED_STATIC_EGRESS_REQUIRED"
+    }
+  ],
+  "failOpenStatus": "CANONICAL_ANALYSIS_CONTINUES",
+  "drivePublishStatus": "ATOMIC_LOCAL_THEN_ARCHIVE_AND_CURRENT_POINTER",
+  "telegramAggregateAlertStatus": "AT_MOST_ONCE_PER_SOURCE_WINDOW",
+  "canonicalSourceChanged": false,
+  "policyImpact": "NONE_REPORT_ONLY",
+  "brokerOrSidecarStateMutation": false,
+  "externalRequestCount": 0,
+  "unknownOrUnclassifiedRows": 0,
+  "primaryActivationBlocker": "BOUNDED_ONE_SHOT_NOT_YET_AUTHORIZED",
+  "nextAction": "RUN_APPROVED_BOUNDED_ONE_SHOT_BEFORE_RECURRING_ACTIVATION"
+}

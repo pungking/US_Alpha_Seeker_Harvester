@@ -77,6 +77,45 @@ BLS_CALENDAR_MAC_REQUEST_BUDGETS = {
     "finra": 0,
     "toss": 0,
 }
+MACRO_SHADOW_SCHEMA_VERSION = "macro-event-clock-shadow-v1"
+MACRO_SHADOW_PASS_STATUS = (
+    "MACRO_EVENT_CLOCK_SHADOW_PASS_WITH_BLS_CALENDAR_EXCLUDED"
+)
+MACRO_SHADOW_REQUEST_BUDGETS = {
+    "federalReserveCalendar": 1,
+    "beaMetadata": 1,
+    "beaData": 1,
+    "fredMetadata": 1,
+    "fredData": 1,
+    "blsRegisteredData": 1,
+    "blsIcal": 0,
+    "blsHtmlFallback": 0,
+    "sec": 0,
+    "finra": 0,
+    "toss": 0,
+}
+MACRO_SHADOW_SOURCE_IDS = (
+    "FEDERAL_RESERVE_FOMC_CALENDAR",
+    "FRED_RELEASE_METADATA_AND_SOURCE_DATES",
+    "BEA_RELEASE_SCHEDULE_AND_DATASET_METADATA",
+    "BLS_REGISTERED_DATA_OBSERVATION_CATALOG",
+    "BLS_OFFICIAL_RELEASE_CALENDAR",
+)
+MACRO_SHADOW_SOURCE_WINDOW_BASES = {
+    "FEDERAL_RESERVE_FOMC_CALENDAR": (
+        "FED_OFFICIAL_CALENDAR_PUBLICATION_OBSERVATION_DATE_ET"
+    ),
+    "FRED_RELEASE_METADATA_AND_SOURCE_DATES": (
+        "FRED_RELEASE_METADATA_PUBLICATION_OBSERVATION_DATE_ET"
+    ),
+    "BEA_RELEASE_SCHEDULE_AND_DATASET_METADATA": (
+        "BEA_RELEASE_METADATA_PUBLICATION_OBSERVATION_DATE_ET"
+    ),
+    "BLS_REGISTERED_DATA_OBSERVATION_CATALOG": (
+        "BLS_OBSERVATION_EFFECTIVE_PERIOD_OBSERVATION_DATE_ET"
+    ),
+    "BLS_OFFICIAL_RELEASE_CALENDAR": "EXCLUDED_STATIC_EGRESS_NO_REQUEST",
+}
 
 
 def _utc_now() -> str:
@@ -99,6 +138,24 @@ def macro_event_clock_runtime_decision(
     if not _configured(environment.get("FRED_API_KEY")):
         return False, "fred_api_key_missing"
     return True, "bounded_shadow_probe_enabled"
+
+
+def macro_event_clock_shadow_runtime_decision(
+    environment: Mapping[str, Any],
+) -> tuple[bool, str]:
+    enabled = str(
+        environment.get("MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED") or ""
+    ).lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False, "shadow_provider_disabled"
+    for key, reason in (
+        ("BEA_API_KEY", "bea_api_key_missing"),
+        ("FRED_API_KEY", "fred_api_key_missing"),
+        ("BLS_API_KEY", "bls_api_key_missing"),
+    ):
+        if not _configured(environment.get(key)):
+            return False, reason
+    return True, "server_side_shadow_enabled"
 
 
 def _sha256(value: bytes | str) -> str:
@@ -1165,6 +1222,237 @@ def collect_bls_registered_data_capability(
         effective_period_rows=effective_period_rows,
         registration_key_used=True,
     )
+
+
+def build_macro_event_clock_shadow_not_run_result(reason: str) -> dict[str, Any]:
+    result = {
+        "schemaVersion": MACRO_SHADOW_SCHEMA_VERSION,
+        "status": "MACRO_EVENT_CLOCK_SHADOW_NOT_RUN",
+        "primaryBlocker": reason,
+        "mode": "SHADOW_ONLY",
+        "runtimeAction": "NOT_RUN",
+        "runtimeReason": reason,
+        "requestBudgets": MACRO_SHADOW_REQUEST_BUDGETS,
+        "requestCounts": {key: 0 for key in MACRO_SHADOW_REQUEST_BUDGETS},
+        "externalRequestCount": 0,
+        "requestBudgetCompliant": True,
+        "blsCalendarStatus": "BLS_CALENDAR_STATIC_EGRESS_REQUIRED",
+        "blsCalendarPublicationClockEligible": False,
+        "publicationEffectiveTimestampSeparated": True,
+        "unknownOrUnclassifiedRows": 0,
+        "analysisEligible": False,
+        "analysisContinued": True,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "stage4To7Impact": "NONE",
+        "rawResponseStored": False,
+        "secretValuesStoredOrPrinted": False,
+        "paginationUsed": False,
+        "retryCount": 0,
+        "enabledByDefault": False,
+        "recurringActivationAuthorized": False,
+        "accountHeaderUsed": False,
+        "accountEndpointUsed": False,
+        "orderEndpointUsed": False,
+        "brokerOrSidecarStateMutation": False,
+    }
+    result["evidenceHashBasis"] = "CANONICAL_JSON_WITHOUT_EVIDENCE_HASH"
+    result["evidenceSha256"] = _canonical_sha256(result)
+    return result
+
+
+def _bls_registered_shadow_source(result: Mapping[str, Any]) -> dict[str, Any]:
+    status = str(result.get("status") or "BLS_REGISTERED_API_SCHEMA_INVALID")
+    mapped_status = {
+        BLS_REGISTERED_PASS_STATUS: "SOURCE_CAPABILITY_PASS",
+        "BLS_AUTH_OR_REGISTRATION_BLOCKED": "AUTH_OR_ENTITLEMENT_BLOCKED",
+        "BLS_REGISTERED_API_RATE_LIMITED": "RATE_LIMITED",
+        "BLS_REGISTERED_API_TRANSIENT_FAILURE": "SOURCE_HTTP_FAILURE",
+    }.get(status, "SOURCE_CONTRACT_INVALID")
+    return {
+        "sourceId": "BLS_REGISTERED_DATA_OBSERVATION_CATALOG",
+        "status": mapped_status,
+        "primaryBlocker": None if mapped_status == "SOURCE_CAPABILITY_PASS" else status,
+        "responseSha256": result.get("responseSha256"),
+        "httpStatusCategory": result.get("httpStatusCategory"),
+        "seriesRows": int(result.get("seriesRows", 0) or 0),
+        "observationRows": int(result.get("observationRows", 0) or 0),
+        "catalogPresentRows": int(result.get("catalogPresentRows", 0) or 0),
+        "effectivePeriodRows": int(result.get("effectivePeriodRows", 0) or 0),
+        "publicationTimestampAvailable": False,
+        "publicationClockStatus": "UNAVAILABLE_DATA_API_IS_NOT_RELEASE_CALENDAR",
+        "effectiveClockStatus": "OBSERVATION_PERIOD_AVAILABLE_SEPARATELY",
+        "timezoneStatus": "OBSERVATION_PERIOD_ONLY",
+        "revisionPolicy": "OBSERVATION_REVISION_VALUES_NOT_STORED",
+        "publicationEffectiveSeparated": True,
+    }
+
+
+def _macro_shadow_source_contract(
+    source: Mapping[str, Any],
+    *,
+    retrieved_at: str,
+    request_counts: Mapping[str, int],
+) -> dict[str, Any]:
+    response_hashes = []
+    for field in ("response", "metadataResponse", "dataResponse"):
+        envelope = source.get(field)
+        if isinstance(envelope, Mapping) and re.fullmatch(
+            r"[0-9a-f]{64}", str(envelope.get("responseSha256") or "")
+        ):
+            response_hashes.append(str(envelope["responseSha256"]))
+    direct_hash = str(source.get("responseSha256") or "")
+    if re.fullmatch(r"[0-9a-f]{64}", direct_hash):
+        response_hashes.append(direct_hash)
+    response_hashes = sorted(set(response_hashes))
+    result = dict(source)
+    result.update(
+        {
+            "sourceStatus": source.get("status"),
+            "sourceAsOf": None,
+            "sourceAsOfStatus": "NOT_EXPOSED_BY_BOUNDED_SOURCE_CONTRACT",
+            "retrievedAt": retrieved_at,
+            "publicationTimestampBasis": source.get("publicationClockStatus"),
+            "effectivePeriodBasis": source.get("effectiveClockStatus"),
+            "revisionOrAmendmentStatus": source.get("revisionPolicy"),
+            "responseSha256": (
+                response_hashes[0]
+                if len(response_hashes) == 1
+                else _canonical_sha256(response_hashes)
+                if response_hashes
+                else None
+            ),
+            "requestCounts": dict(sorted(request_counts.items())),
+            "publicationDelayStatus": (
+                "STATIC_EGRESS_REQUIRED"
+                if source.get("sourceId") == "BLS_OFFICIAL_RELEASE_CALENDAR"
+                else "SOURCE_SPECIFIC_REPORT_ONLY"
+            ),
+        }
+    )
+    return result
+
+
+def collect_macro_event_clock_shadow(
+    *,
+    session: Any,
+    environment: Mapping[str, Any],
+    retrieved_at: str,
+) -> dict[str, Any]:
+    if _parse_timestamp(retrieved_at) is None:
+        raise ValueError("invalid_retrieved_at")
+    enabled, reason = macro_event_clock_shadow_runtime_decision(environment)
+    if not enabled:
+        raise ValueError(reason)
+    client = _BoundedClient(session, MACRO_SHADOW_REQUEST_BUDGETS)
+    bls_result = collect_bls_registered_data_capability(
+        session=session,
+        environment=environment,
+        retrieved_at=retrieved_at,
+    )
+    client.counts["blsRegisteredData"] = int(
+        (bls_result.get("requestCounts") or {}).get("blsRegisteredData", 0) or 0
+    )
+    sources = [
+        _fed_calendar(client),
+        _bea(client, str(environment["BEA_API_KEY"])),
+        _fred(client, str(environment["FRED_API_KEY"])),
+        _bls_registered_shadow_source(bls_result),
+        {
+            "sourceId": "BLS_OFFICIAL_RELEASE_CALENDAR",
+            "status": "BLS_CALENDAR_STATIC_EGRESS_REQUIRED",
+            "primaryBlocker": "BLS_CALENDAR_STATIC_EGRESS_REQUIRED",
+            "requestCounts": {"blsIcal": 0, "blsHtmlFallback": 0},
+            "publicationClockEligible": False,
+            "publicationClockStatus": "STATIC_EGRESS_REQUIRED",
+            "effectiveClockStatus": "NOT_APPLICABLE",
+            "timezoneStatus": "AMERICA_NEW_YORK_CONTRACT_PRESERVED",
+            "revisionPolicy": "NOT_COLLECTED_IN_THIS_PRODUCER",
+            "publicationEffectiveSeparated": True,
+        },
+    ]
+    counters_by_source = {
+        "FEDERAL_RESERVE_FOMC_CALENDAR": ("federalReserveCalendar",),
+        "BEA_RELEASE_SCHEDULE_AND_DATASET_METADATA": (
+            "beaMetadata",
+            "beaData",
+        ),
+        "FRED_RELEASE_METADATA_AND_SOURCE_DATES": ("fredMetadata", "fredData"),
+        "BLS_REGISTERED_DATA_OBSERVATION_CATALOG": ("blsRegisteredData",),
+        "BLS_OFFICIAL_RELEASE_CALENDAR": ("blsIcal", "blsHtmlFallback"),
+    }
+    sources = [
+        _macro_shadow_source_contract(
+            source,
+            retrieved_at=retrieved_at,
+            request_counts={
+                counter: client.counts[counter]
+                for counter in counters_by_source[str(source["sourceId"])]
+            },
+        )
+        for source in sources
+    ]
+    passing = all(
+        source.get("status") == "SOURCE_CAPABILITY_PASS"
+        for source in sources
+        if source.get("sourceId") != "BLS_OFFICIAL_RELEASE_CALENDAR"
+    )
+    primary_blocker = next(
+        (
+            str(source.get("primaryBlocker") or source.get("status"))
+            for source in sources
+            if source.get("sourceId") != "BLS_OFFICIAL_RELEASE_CALENDAR"
+            and source.get("status") != "SOURCE_CAPABILITY_PASS"
+        ),
+        None,
+    )
+    result = {
+        "schemaVersion": MACRO_SHADOW_SCHEMA_VERSION,
+        "status": (
+            MACRO_SHADOW_PASS_STATUS
+            if passing
+            else "MACRO_EVENT_CLOCK_SHADOW_PARTIAL"
+        ),
+        "primaryBlocker": primary_blocker,
+        "mode": "SHADOW_ONLY",
+        "runtimeAction": "BOUNDED_OFFICIAL_SOURCE_OBSERVATION",
+        "retrievedAt": retrieved_at,
+        "requestBudgets": MACRO_SHADOW_REQUEST_BUDGETS,
+        "requestCounts": dict(client.counts),
+        "externalRequestCount": sum(client.counts.values()),
+        "requestBudgetCompliant": all(
+            client.counts[key] <= MACRO_SHADOW_REQUEST_BUDGETS[key]
+            for key in MACRO_SHADOW_REQUEST_BUDGETS
+        ),
+        "sources": sources,
+        "blsCalendarStatus": "BLS_CALENDAR_STATIC_EGRESS_REQUIRED",
+        "blsCalendarPublicationClockEligible": False,
+        "publicationEffectiveTimestampSeparated": all(
+            source.get("publicationEffectiveSeparated") is True
+            for source in sources
+        ),
+        "publicationDelayStatus": "SOURCE_SPECIFIC_REPORT_ONLY",
+        "lookAheadViolationRows": 0,
+        "unknownOrUnclassifiedRows": 0,
+        "analysisEligible": False,
+        "analysisContinued": True,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "stage4To7Impact": "NONE",
+        "rawResponseStored": False,
+        "secretValuesStoredOrPrinted": False,
+        "paginationUsed": False,
+        "retryCount": 0,
+        "enabledByDefault": False,
+        "recurringActivationAuthorized": False,
+        "accountHeaderUsed": False,
+        "accountEndpointUsed": False,
+        "orderEndpointUsed": False,
+        "brokerOrSidecarStateMutation": False,
+    }
+    result["evidenceHashBasis"] = "CANONICAL_JSON_WITHOUT_EVIDENCE_HASH"
+    result["evidenceSha256"] = _canonical_sha256(result)
+    return result
 
 
 def collect_macro_event_clock_capability(

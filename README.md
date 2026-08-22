@@ -342,3 +342,44 @@ canonical source nor changes Stage6/OOS policy or broker/sidecar state.
 No recurring `launchd` job or self-hosted runner is installed. Rollback is to
 stop after the one-shot and preserve the result and sentinel; recurring
 activation requires a separate goal and approval.
+
+### Official SHADOW producer readiness
+
+The SEC/FINRA and macro capability probes remain historical capability
+evidence; normal runtime output is collected separately. Both runtime flags
+default to false:
+
+- `SEC_FINRA_SHADOW_PROVIDER_ENABLED=false`
+- `MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED=false`
+
+When separately activated, scheduled runs derive deterministic per-source
+America/New_York publication-observation windows and a request-scope hash. A matching
+successful or failed current artifact, or an existing local/Drive sentinel,
+causes zero provider requests. A new window reserves local and Drive sentinels
+before network access, preserves failed evidence without automatic retry, and
+publishes a versioned archive before the current Drive pointer. Provider,
+Telegram, or Drive failure excludes only that SHADOW slice; canonical
+Google Drive/yfinance collection continues.
+
+The macro artifact is `macro-event-clock-shadow-v1`. Federal Reserve, FRED,
+BEA, and the registered BLS Data API remain report-only. BLS Data contributes
+observation/catalog effective-period evidence only; it has no publication
+timestamp. The BLS iCal and HTML calendar request counts remain zero and its
+status stays `BLS_CALENDAR_STATIC_EGRESS_REQUIRED`. No BLS API key is sent to a
+calendar endpoint.
+
+The first bounded server-side proof requires the exact approval phrase
+`AUTHORIZE OFFICIAL SHADOW PRODUCER BOUNDED ONE-SHOT`. It preserves completed
+capability evidence and allows only the documented SEC/FINRA, Federal Reserve,
+FRED, BEA, and registered BLS Data budgets. It does not authorize retry,
+pagination, recurring activation, canonical-source replacement, Stage6/OOS
+policy changes, or broker/sidecar/state mutation.
+
+The manual `official-shadow-producer-one-shot.yml` workflow is the only
+activation path prepared here. It accepts that phrase on `main`, enables both
+providers for one process, and runs
+`python harvester.py --official-shadow-producer-one-shot`; it has no push,
+pull-request, or schedule trigger.
+
+Static source classifications and request budgets are pinned in
+`fixtures/official_shadow_producer_readiness.json` and validated in CI.
