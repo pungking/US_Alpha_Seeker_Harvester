@@ -61,6 +61,22 @@ BLS_REGISTERED_REQUEST_BUDGETS = {
     "finra": 0,
     "toss": 0,
 }
+BLS_CALENDAR_MAC_SCHEMA_VERSION = "bls-calendar-mac-capability-v1"
+BLS_CALENDAR_MAC_APPROVAL = "AUTHORIZE BLS CALENDAR MAC SHADOW ONE-SHOT"
+BLS_CALENDAR_MAC_REQUEST_BUDGETS = {
+    "blsIcal": 1,
+    "blsHtmlFallback": 1,
+    "blsRegisteredData": 0,
+    "blsData": 0,
+    "federalReserveCalendar": 0,
+    "beaMetadata": 0,
+    "beaData": 0,
+    "fredMetadata": 0,
+    "fredData": 0,
+    "sec": 0,
+    "finra": 0,
+    "toss": 0,
+}
 
 
 def _utc_now() -> str:
@@ -230,6 +246,13 @@ def _http_failure(
 def _parse_bls_ical(body: bytes) -> dict[str, Any]:
     text = body.decode("utf-8", errors="replace")
     event_rows = text.count("BEGIN:VEVENT")
+    shape_keys = sorted(
+        {
+            line.split(":", 1)[0].split(";", 1)[0].upper()
+            for line in text.splitlines()
+            if ":" in line
+        }
+    )
     dtstart_lines = re.findall(
         r"^DTSTART(?:;[^:]*)?:(\S+)\s*$",
         text,
@@ -249,6 +272,7 @@ def _parse_bls_ical(body: bytes) -> dict[str, Any]:
         "eventRows": event_rows,
         "parseablePublicationRows": len(dtstart_lines),
         "explicitEasternTimeRows": explicit_timezone_rows,
+        "shapeKeySetSha256": _sha256("\n".join(shape_keys)) if shape_keys else None,
     }
 
 
@@ -773,6 +797,7 @@ def _bls_calendar_blocker(
             "parseablePublicationRows": contract["parseablePublicationRows"],
             "explicitEasternTimeRows": contract["explicitEasternTimeRows"],
             "responseSha256": evidence["responseSha256"],
+            "shapeKeySetSha256": contract["shapeKeySetSha256"],
             "publicationClockStatus": "SCHEDULED_PUBLICATION_TIMESTAMP_AVAILABLE",
             "effectiveClockStatus": "OBSERVATION_PERIOD_NOT_PRESENT_IN_CALENDAR",
             "timezoneStatus": "EXPLICIT_ICS_TIMEZONE",
@@ -831,6 +856,57 @@ def _bls_calendar_blocker(
         "publicationEffectiveSeparated": True,
         "response": fallback_evidence,
     }
+
+
+def collect_bls_calendar_mac_capability(
+    *,
+    session: Any,
+    retrieved_at: str,
+) -> dict[str, Any]:
+    if _parse_timestamp(retrieved_at) is None:
+        raise ValueError("invalid_retrieved_at")
+    client = _BoundedClient(session, BLS_CALENDAR_MAC_REQUEST_BUDGETS)
+    source = _bls_calendar_blocker(client, retrieved_at)
+    result = {
+        "schemaVersion": BLS_CALENDAR_MAC_SCHEMA_VERSION,
+        "status": source["status"],
+        "primaryBlocker": source.get("primaryBlocker"),
+        "mode": "SHADOW_ONLY_MAC_CALENDAR_ONE_SHOT",
+        "executionTopology": "MAC_SIDE_BOUNDED_ONE_SHOT",
+        "topologyVerdict": "BLS_CALENDAR_MAC_TOPOLOGY_READY",
+        "retrievedAt": retrieved_at,
+        "requestBudgets": BLS_CALENDAR_MAC_REQUEST_BUDGETS,
+        "requestCounts": dict(client.counts),
+        "externalRequestCount": sum(client.counts.values()),
+        "requestBudgetCompliant": all(
+            client.counts[key] <= BLS_CALENDAR_MAC_REQUEST_BUDGETS[key]
+            for key in BLS_CALENDAR_MAC_REQUEST_BUDGETS
+        ),
+        "source": source,
+        "publicationEffectiveTimestampSeparated": (
+            source.get("publicationEffectiveSeparated") is True
+        ),
+        "marketTimezone": "America/New_York",
+        "registrationKeyUsed": False,
+        "unknownOrUnclassifiedRows": 0,
+        "analysisEligible": False,
+        "analysisContinued": True,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "stage4To7Impact": "NONE",
+        "rawResponseStored": False,
+        "secretValuesStoredOrPrinted": False,
+        "paginationUsed": False,
+        "retryCount": 0,
+        "recurringProviderEnabled": False,
+        "accountHeaderUsed": False,
+        "accountEndpointUsed": False,
+        "orderEndpointUsed": False,
+        "brokerOrSidecarStateMutation": False,
+    }
+    result["evidenceSha256"] = _canonical_sha256(result)
+    result["evidenceHashBasis"] = "CANONICAL_JSON_WITHOUT_EVIDENCE_HASH"
+    return result
 
 
 def _blocker_reproof_result(
@@ -1301,17 +1377,88 @@ def run_bls_registered_data_capability_probe(
     return result
 
 
+def run_bls_calendar_mac_capability_probe(
+    *,
+    session: Any,
+    output_path: Path,
+    sentinel_path: Path,
+    retrieved_at: str,
+    approval: str,
+) -> dict[str, Any]:
+    if approval != BLS_CALENDAR_MAC_APPROVAL:
+        raise ValueError("bls_calendar_mac_approval_required")
+    if output_path.exists():
+        raise FileExistsError(output_path)
+    sentinel_schema = "bls-calendar-mac-capability-sentinel-v1"
+    _reserve_sentinel(
+        sentinel_path,
+        retrieved_at,
+        request_budgets=BLS_CALENDAR_MAC_REQUEST_BUDGETS,
+        schema_version=sentinel_schema,
+    )
+    try:
+        result = collect_bls_calendar_mac_capability(
+            session=session,
+            retrieved_at=retrieved_at,
+        )
+    except Exception as exc:
+        _atomic_write_json(
+            sentinel_path,
+            {
+                "schemaVersion": sentinel_schema,
+                "status": "FAILED",
+                "reservedAt": retrieved_at,
+                "completedAt": _utc_now(),
+                "safeErrorCategory": type(exc).__name__,
+            },
+        )
+        raise
+    _atomic_write_json(output_path, result)
+    _atomic_write_json(
+        sentinel_path,
+        {
+            "schemaVersion": sentinel_schema,
+            "status": "COMPLETE",
+            "reservedAt": retrieved_at,
+            "completedAt": _utc_now(),
+            "requestCounts": result["requestCounts"],
+            "resultSha256": _sha256(output_path.read_bytes()),
+        },
+    )
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sentinel", type=Path, required=True)
     parser.add_argument("--blocker-only", action="store_true")
     parser.add_argument("--bls-registered-only", action="store_true")
+    parser.add_argument("--bls-calendar-mac-only", action="store_true")
     parser.add_argument("--approval", default="")
     parser.add_argument("--bea-activation-confirmed", action="store_true")
     args = parser.parse_args()
-    if args.blocker_only and args.bls_registered_only:
+    if sum(
+        (args.blocker_only, args.bls_registered_only, args.bls_calendar_mac_only)
+    ) > 1:
         parser.error("probe modes are mutually exclusive")
+    if args.bls_calendar_mac_only:
+        result = run_bls_calendar_mac_capability_probe(
+            session=requests.Session(),
+            output_path=args.output,
+            sentinel_path=args.sentinel,
+            retrieved_at=_utc_now(),
+            approval=args.approval,
+        )
+        print(
+            "[BLS_CALENDAR_MAC_CAPABILITY] "
+            f"status={result['status']} requests={result['externalRequestCount']} "
+            f"unknown={result['unknownOrUnclassifiedRows']} rawStored=false"
+        )
+        return 0 if result["status"] in {
+            "BLS_CALENDAR_ICAL_PASS",
+            "BLS_CALENDAR_HTML_FALLBACK_PASS",
+        } else 2
     if args.bls_registered_only:
         result = run_bls_registered_data_capability_probe(
             session=requests.Session(),
