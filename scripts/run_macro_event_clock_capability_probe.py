@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -25,6 +27,23 @@ REQUEST_BUDGETS = {
 }
 USER_AGENT = "US Alpha Seeker macro-event-clock capability/1.0"
 BLS_CAPABILITY_SERIES_ID = "CUUR0000SA0"
+BLOCKER_ONLY_SCHEMA_VERSION = "macro-event-clock-blocker-reproof-v1"
+BLOCKER_ONLY_PASS_STATUS = "MACRO_BLOCKER_ONLY_REPROOF_PASS"
+BLOCKER_ONLY_APPROVAL = "AUTHORIZE MACRO EVENT CLOCK BLOCKER-ONLY REPROOF"
+BLOCKER_ONLY_REQUEST_BUDGETS = {
+    "federalReserveCalendar": 0,
+    "fredMetadata": 0,
+    "fredData": 0,
+    "sec": 0,
+    "finra": 0,
+    "toss": 0,
+    "blsData": 0,
+    "blsIcal": 1,
+    "blsHtmlFallback": 1,
+    "beaMetadata": 1,
+    "beaData": 1,
+}
+BLOCKER_ONLY_BASELINE_RUN_ID = "32541234706"
 
 
 def _utc_now() -> str:
@@ -78,16 +97,22 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def _reserve_sentinel(path: Path, reserved_at: str) -> None:
+def _reserve_sentinel(
+    path: Path,
+    reserved_at: str,
+    *,
+    request_budgets: Mapping[str, int] = REQUEST_BUDGETS,
+    schema_version: str = "macro-event-clock-probe-sentinel-v1",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump(
             {
-                "schemaVersion": "macro-event-clock-probe-sentinel-v1",
+                "schemaVersion": schema_version,
                 "status": "IN_PROGRESS",
                 "reservedAt": reserved_at,
-                "requestBudgets": REQUEST_BUDGETS,
+                "requestBudgets": dict(request_budgets),
             },
             handle,
             ensure_ascii=True,
@@ -98,9 +123,14 @@ def _reserve_sentinel(path: Path, reserved_at: str) -> None:
 
 
 class _BoundedClient:
-    def __init__(self, session: Any) -> None:
+    def __init__(
+        self,
+        session: Any,
+        budgets: Mapping[str, int] = REQUEST_BUDGETS,
+    ) -> None:
         self.session = session
-        self.counts = {key: 0 for key in REQUEST_BUDGETS}
+        self.budgets = dict(budgets)
+        self.counts = {key: 0 for key in self.budgets}
 
     def request(
         self,
@@ -109,7 +139,7 @@ class _BoundedClient:
         url: str,
         **kwargs: Any,
     ) -> tuple[Any | None, bytes, dict[str, Any]]:
-        if self.counts[counter] >= REQUEST_BUDGETS[counter]:
+        if self.counts[counter] >= self.budgets[counter]:
             raise ValueError(f"request_budget_exceeded_{counter}")
         self.counts[counter] += 1
         try:
@@ -180,6 +210,128 @@ def _http_failure(
     }
 
 
+def _parse_bls_ical(body: bytes) -> dict[str, Any]:
+    text = body.decode("utf-8", errors="replace")
+    event_rows = text.count("BEGIN:VEVENT")
+    dtstart_lines = re.findall(
+        r"^DTSTART(?:;[^:]*)?:(\S+)\s*$",
+        text,
+        flags=re.MULTILINE,
+    )
+    explicit_timezone_rows = sum(line.endswith("Z") for line in dtstart_lines)
+    explicit_timezone_rows += len(
+        re.findall(r"^DTSTART;TZID=", text, flags=re.MULTILINE)
+    )
+    return {
+        "valid": (
+            text.startswith("BEGIN:VCALENDAR")
+            and event_rows > 0
+            and len(dtstart_lines) == event_rows
+            and explicit_timezone_rows >= event_rows
+        ),
+        "eventRows": event_rows,
+        "parseablePublicationRows": len(dtstart_lines),
+        "explicitEasternTimeRows": explicit_timezone_rows,
+    }
+
+
+class _BlsScheduleHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self.tags: set[str] = set()
+        self.text: list[str] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del attrs
+        self.tags.add(tag)
+        if tag == "tr":
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+
+    def handle_data(self, data: str) -> None:
+        cleaned = " ".join(data.split())
+        if cleaned:
+            self.text.append(cleaned)
+            if self._cell is not None:
+                self._cell.append(cleaned)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._cell is not None:
+            if self._row is not None:
+                self._row.append(" ".join(self._cell))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
+
+
+def _parse_bls_schedule_html(body: bytes) -> dict[str, Any]:
+    parser = _BlsScheduleHtmlParser()
+    parser.feed(body.decode("utf-8", errors="replace"))
+    parser.close()
+    eastern_notice = "eastern time" in " ".join(parser.text).lower()
+    time_pattern = re.compile(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", re.IGNORECASE)
+    date_pattern = re.compile(
+        r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+"
+        r"[A-Za-z]+\s+\d{1,2},\s+\d{4}\b|"
+        r"\b[A-Za-z]+\s+\d{1,2},\s+\d{4}\b",
+        re.IGNORECASE,
+    )
+    event_rows = 0
+    publication_times: list[dt.datetime] = []
+    for cells in parser.rows:
+        row_text = " ".join(cells)
+        time_match = time_pattern.search(row_text)
+        if time_match is None:
+            continue
+        event_rows += 1
+        date_match = date_pattern.search(row_text)
+        if date_match is None:
+            continue
+        date_text = date_match.group(0)
+        value = f"{date_text} {time_match.group(0).upper()}"
+        for date_format in ("%A, %B %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+            try:
+                parsed = dt.datetime.strptime(value, date_format)
+            except ValueError:
+                continue
+            publication_times.append(
+                parsed.replace(tzinfo=ZoneInfo("America/New_York"))
+            )
+            break
+    shape_keys = sorted(
+        {f"tag:{tag}" for tag in parser.tags}
+        | {f"rowCells:{len(row)}" for row in parser.rows}
+    )
+    explicit_eastern_rows = len(publication_times) if eastern_notice else 0
+    valid = (
+        event_rows > 0
+        and len(publication_times) == event_rows
+        and explicit_eastern_rows == event_rows
+    )
+    return {
+        "valid": valid,
+        "eventRows": event_rows,
+        "parseablePublicationRows": len(publication_times),
+        "explicitEasternTimeRows": explicit_eastern_rows,
+        "publicationDateMin": (
+            min(publication_times).isoformat() if publication_times else None
+        ),
+        "publicationDateMax": (
+            max(publication_times).isoformat() if publication_times else None
+        ),
+        "shapeKeySetSha256": _sha256("\n".join(shape_keys)) if shape_keys else None,
+    }
+
+
 def _fed_calendar(client: _BoundedClient) -> dict[str, Any]:
     source_id = "FEDERAL_RESERVE_FOMC_CALENDAR"
     response, body, evidence = client.request(
@@ -244,22 +396,10 @@ def _bls(client: _BoundedClient) -> dict[str, Any]:
             calendar_response.status_code if calendar_response is not None else None,
         )
     else:
-        calendar_text = calendar_body.decode("utf-8", errors="replace")
-        event_rows = calendar_text.count("BEGIN:VEVENT")
-        dtstart_lines = re.findall(
-            r"^DTSTART(?:;[^:]*)?:(\S+)\s*$",
-            calendar_text,
-            flags=re.MULTILINE,
-        )
-        explicit_timezone_rows = sum(
-            line.endswith("Z") for line in dtstart_lines
-        ) + len(re.findall(r"^DTSTART;TZID=", calendar_text, flags=re.MULTILINE))
-        calendar_valid = (
-            calendar_text.startswith("BEGIN:VCALENDAR")
-            and event_rows > 0
-            and len(dtstart_lines) == event_rows
-            and explicit_timezone_rows >= event_rows
-        )
+        calendar_contract = _parse_bls_ical(calendar_body)
+        event_rows = calendar_contract["eventRows"]
+        explicit_timezone_rows = calendar_contract["explicitEasternTimeRows"]
+        calendar_valid = calendar_contract["valid"]
 
     data_response, _, data_evidence = client.request(
         "blsData",
@@ -564,6 +704,214 @@ def _overall_status(sources: list[Mapping[str, Any]]) -> tuple[str, str | None]:
     return PASS_STATUS, None
 
 
+def _bls_blocker_status(
+    status_code: int | None,
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    if status_code in {401, 403}:
+        status = "BLS_CALENDAR_SOURCE_ACCESS_BLOCKED"
+    elif status_code == 429:
+        status = "BLS_CALENDAR_RATE_LIMITED"
+    elif status_code is None or status_code >= 500:
+        status = "BLS_CALENDAR_TRANSIENT_FAILURE"
+    else:
+        status = "BLS_CALENDAR_CONTRACT_INVALID"
+    return {
+        "sourceId": "BLS_RELEASE_CALENDAR",
+        "status": status,
+        "primaryBlocker": status,
+        "publicationEffectiveSeparated": True,
+        "response": dict(evidence),
+    }
+
+
+def _bls_calendar_blocker(
+    client: _BoundedClient,
+    retrieved_at: str,
+) -> dict[str, Any]:
+    response, body, evidence = client.request(
+        "blsIcal",
+        "GET",
+        "https://www.bls.gov/schedule/news_release/bls.ics",
+        headers={"User-Agent": USER_AGENT, "Accept": "text/calendar"},
+    )
+    status_code = response.status_code if response is not None else None
+    if (
+        response is not None
+        and status_code == 200
+        and not evidence["redirected"]
+    ):
+        contract = _parse_bls_ical(body)
+        return {
+            "sourceId": "BLS_RELEASE_CALENDAR",
+            "status": (
+                "BLS_CALENDAR_ICAL_PASS"
+                if contract["valid"]
+                else "BLS_CALENDAR_CONTRACT_INVALID"
+            ),
+            "primaryBlocker": (
+                None if contract["valid"] else "BLS_CALENDAR_ICAL_CONTRACT_INVALID"
+            ),
+            "eventRows": contract["eventRows"],
+            "parseablePublicationRows": contract["parseablePublicationRows"],
+            "explicitEasternTimeRows": contract["explicitEasternTimeRows"],
+            "responseSha256": evidence["responseSha256"],
+            "publicationClockStatus": "SCHEDULED_PUBLICATION_TIMESTAMP_AVAILABLE",
+            "effectiveClockStatus": "OBSERVATION_PERIOD_NOT_PRESENT_IN_CALENDAR",
+            "timezoneStatus": "EXPLICIT_ICS_TIMEZONE",
+            "publicationEffectiveSeparated": True,
+            "response": evidence,
+        }
+    if status_code not in {401, 403} or evidence["redirected"]:
+        return _bls_blocker_status(status_code, evidence)
+
+    parsed_retrieved_at = _parse_timestamp(retrieved_at)
+    if parsed_retrieved_at is None:
+        raise ValueError("invalid_retrieved_at")
+    eastern = parsed_retrieved_at.astimezone(ZoneInfo("America/New_York"))
+    fallback_url = (
+        f"https://www.bls.gov/schedule/{eastern.year}/"
+        f"{eastern.month:02d}_sched_list.htm"
+    )
+    fallback_response, fallback_body, fallback_evidence = client.request(
+        "blsHtmlFallback",
+        "GET",
+        fallback_url,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
+    )
+    fallback_status = (
+        fallback_response.status_code if fallback_response is not None else None
+    )
+    if (
+        fallback_response is None
+        or fallback_status != 200
+        or fallback_evidence["redirected"]
+    ):
+        return _bls_blocker_status(fallback_status, fallback_evidence)
+    contract = _parse_bls_schedule_html(fallback_body)
+    return {
+        "sourceId": "BLS_RELEASE_CALENDAR",
+        "status": (
+            "BLS_CALENDAR_HTML_FALLBACK_PASS"
+            if contract["valid"]
+            else "BLS_CALENDAR_CONTRACT_INVALID"
+        ),
+        "primaryBlocker": (
+            None
+            if contract["valid"]
+            else "BLS_CALENDAR_HTML_CONTRACT_INVALID"
+        ),
+        "eventRows": contract["eventRows"],
+        "parseablePublicationRows": contract["parseablePublicationRows"],
+        "explicitEasternTimeRows": contract["explicitEasternTimeRows"],
+        "publicationDateMin": contract["publicationDateMin"],
+        "publicationDateMax": contract["publicationDateMax"],
+        "responseSha256": fallback_evidence["responseSha256"],
+        "shapeKeySetSha256": contract["shapeKeySetSha256"],
+        "publicationClockStatus": "SCHEDULED_PUBLICATION_TIMESTAMP_AVAILABLE",
+        "effectiveClockStatus": "OBSERVATION_PERIOD_NOT_PRESENT_IN_CALENDAR",
+        "timezoneStatus": "AMERICA_NEW_YORK_FROM_OFFICIAL_EASTERN_TIME_NOTICE",
+        "publicationEffectiveSeparated": True,
+        "response": fallback_evidence,
+    }
+
+
+def _blocker_reproof_result(
+    *,
+    retrieved_at: str,
+    client: _BoundedClient,
+    status: str,
+    primary_blocker: str | None,
+    sources: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    result = {
+        "schemaVersion": BLOCKER_ONLY_SCHEMA_VERSION,
+        "status": status,
+        "primaryBlocker": primary_blocker,
+        "mode": "SHADOW_ONLY_BLOCKER_REPROOF",
+        "preservedBaselineRunId": BLOCKER_ONLY_BASELINE_RUN_ID,
+        "retrievedAt": retrieved_at,
+        "requestBudgets": BLOCKER_ONLY_REQUEST_BUDGETS,
+        "requestCounts": dict(client.counts),
+        "externalRequestCount": sum(client.counts.values()),
+        "requestBudgetCompliant": all(
+            client.counts[key] <= BLOCKER_ONLY_REQUEST_BUDGETS[key]
+            for key in BLOCKER_ONLY_REQUEST_BUDGETS
+        ),
+        "sources": [dict(source) for source in sources],
+        "publicationEffectiveTimestampSeparated": all(
+            source.get("publicationEffectiveSeparated") is True for source in sources
+        ),
+        "lookAheadViolationRows": 0,
+        "unknownOrUnclassifiedRows": 0,
+        "analysisEligible": False,
+        "analysisContinued": True,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "stage4To7Impact": "NONE",
+        "rawResponseStored": False,
+        "secretValuesStoredOrPrinted": False,
+        "paginationUsed": False,
+        "retryCount": 0,
+        "recurringProviderEnabled": False,
+        "accountHeaderUsed": False,
+        "accountEndpointUsed": False,
+        "orderEndpointUsed": False,
+        "brokerOrSidecarStateMutation": False,
+    }
+    result["evidenceSha256"] = _canonical_sha256(result)
+    result["evidenceHashBasis"] = "CANONICAL_JSON_WITHOUT_EVIDENCE_HASH"
+    return result
+
+
+def collect_macro_event_clock_blocker_reproof(
+    *,
+    session: Any,
+    environment: Mapping[str, Any],
+    retrieved_at: str,
+    bea_activation_confirmed: bool,
+) -> dict[str, Any]:
+    if _parse_timestamp(retrieved_at) is None:
+        raise ValueError("invalid_retrieved_at")
+    client = _BoundedClient(session, BLOCKER_ONLY_REQUEST_BUDGETS)
+    if not bea_activation_confirmed or not _configured(environment.get("BEA_API_KEY")):
+        return _blocker_reproof_result(
+            retrieved_at=retrieved_at,
+            client=client,
+            status="BEA_KEY_ACTIVATION_REQUIRED",
+            primary_blocker="BEA_KEY_ACTIVATION_REQUIRED",
+            sources=[],
+        )
+    sources = [
+        _bls_calendar_blocker(client, retrieved_at),
+        _bea(client, str(environment["BEA_API_KEY"])),
+    ]
+    passing_bls = sources[0]["status"] in {
+        "BLS_CALENDAR_ICAL_PASS",
+        "BLS_CALENDAR_HTML_FALLBACK_PASS",
+    }
+    passing_bea = sources[1]["status"] == "SOURCE_CAPABILITY_PASS"
+    primary_blocker = next(
+        (
+            str(source.get("primaryBlocker"))
+            for source in sources
+            if source.get("primaryBlocker")
+        ),
+        None,
+    )
+    return _blocker_reproof_result(
+        retrieved_at=retrieved_at,
+        client=client,
+        status=(
+            BLOCKER_ONLY_PASS_STATUS
+            if passing_bls and passing_bea
+            else "MACRO_BLOCKER_ONLY_REPROOF_SOURCE_BLOCKED"
+        ),
+        primary_blocker=primary_blocker,
+        sources=sources,
+    )
+
+
 def collect_macro_event_clock_capability(
     *,
     session: Any,
@@ -666,11 +1014,85 @@ def run_macro_event_clock_capability_probe(
     return result
 
 
+def run_macro_event_clock_blocker_reproof(
+    *,
+    session: Any,
+    environment: Mapping[str, Any],
+    output_path: Path,
+    sentinel_path: Path,
+    retrieved_at: str,
+    approval: str,
+    bea_activation_confirmed: bool,
+) -> dict[str, Any]:
+    if approval != BLOCKER_ONLY_APPROVAL:
+        raise ValueError("blocker_only_approval_required")
+    if output_path.exists():
+        raise FileExistsError(output_path)
+    sentinel_schema = "macro-event-clock-blocker-reproof-sentinel-v1"
+    _reserve_sentinel(
+        sentinel_path,
+        retrieved_at,
+        request_budgets=BLOCKER_ONLY_REQUEST_BUDGETS,
+        schema_version=sentinel_schema,
+    )
+    try:
+        result = collect_macro_event_clock_blocker_reproof(
+            session=session,
+            environment=environment,
+            retrieved_at=retrieved_at,
+            bea_activation_confirmed=bea_activation_confirmed,
+        )
+    except Exception as exc:
+        _atomic_write_json(
+            sentinel_path,
+            {
+                "schemaVersion": sentinel_schema,
+                "status": "FAILED",
+                "reservedAt": retrieved_at,
+                "completedAt": _utc_now(),
+                "safeErrorCategory": type(exc).__name__,
+            },
+        )
+        raise
+    _atomic_write_json(output_path, result)
+    _atomic_write_json(
+        sentinel_path,
+        {
+            "schemaVersion": sentinel_schema,
+            "status": "COMPLETE",
+            "reservedAt": retrieved_at,
+            "completedAt": _utc_now(),
+            "requestCounts": result["requestCounts"],
+            "resultSha256": _sha256(output_path.read_bytes()),
+        },
+    )
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sentinel", type=Path, required=True)
+    parser.add_argument("--blocker-only", action="store_true")
+    parser.add_argument("--approval", default="")
+    parser.add_argument("--bea-activation-confirmed", action="store_true")
     args = parser.parse_args()
+    if args.blocker_only:
+        result = run_macro_event_clock_blocker_reproof(
+            session=requests.Session(),
+            environment=os.environ,
+            output_path=args.output,
+            sentinel_path=args.sentinel,
+            retrieved_at=_utc_now(),
+            approval=args.approval,
+            bea_activation_confirmed=args.bea_activation_confirmed,
+        )
+        print(
+            "[MACRO_BLOCKER_REPROOF] "
+            f"status={result['status']} requests={result['externalRequestCount']} "
+            f"unknown={result['unknownOrUnclassifiedRows']} rawStored=false"
+        )
+        return 0 if result["status"] == BLOCKER_ONLY_PASS_STATUS else 2
     result = run_macro_event_clock_capability_probe(
         session=requests.Session(),
         environment=os.environ,

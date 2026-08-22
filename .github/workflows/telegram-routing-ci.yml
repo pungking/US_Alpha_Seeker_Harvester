@@ -36,6 +36,8 @@ jobs:
         run: python scripts/check_sec_finra_shadow_capability.py
       - name: Macro event clock SHADOW_ONLY capability contract
         run: python scripts/check_macro_event_clock_capability.py
+      - name: Macro event clock blocker-only reproof contract
+        run: python scripts/check_macro_event_clock_blocker_reproof.py
       - name: Toss read-only capability contract
         run: python scripts/check_toss_read_only_capability.py
       - name: Toss Phase2a shadow market-data contract
