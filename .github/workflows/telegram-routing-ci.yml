@@ -36,6 +36,8 @@ jobs:
         run: python scripts/check_sec_finra_shadow_capability.py
       - name: SEC and FINRA SHADOW_ONLY evidence producer
         run: python scripts/check_sec_finra_shadow_evidence.py
+      - name: SEC Schedule 13 exact-family contract
+        run: python scripts/check_sec_schedule13_exact_family.py
       - name: Macro event clock SHADOW_ONLY capability contract
         run: python scripts/check_macro_event_clock_capability.py
       - name: Macro event clock blocker-only reproof contract

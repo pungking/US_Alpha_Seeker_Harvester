@@ -383,3 +383,25 @@ pull-request, or schedule trigger.
 
 Static source classifications and request budgets are pinned in
 `fixtures/official_shadow_producer_readiness.json` and validated in CI.
+
+### SEC Schedule 13 exact-family discovery
+
+The SEC current-filings `SC 13` filter is a broad family query. Its bounded
+response is therefore filtered by the Atom entry's machine-readable form
+metadata before any Submissions or raw-filing request. Only `SC 13D`,
+`SC 13D/A`, `SC 13G`, and `SC 13G/A` are accepted. Other SC 13 forms, missing
+form metadata, titles, and summaries are never used to infer family membership.
+An empty feed and a feed with no exact allowed form are separate safe
+observations; neither triggers downstream SEC requests or a failure alert.
+
+The manual `sec-schedule13-exact-family-reproof.yml` workflow is the only
+targeted post-fix probe. It requires the exact phrase
+`AUTHORIZE SEC SCHEDULE 13 EXACT-FAMILY POST-FIX REPROOF`, uses one bounded
+discovery response and at most one Submissions and one raw-filing request, and
+has no push, pull-request, or schedule trigger. It receives only
+`SEC_USER_AGENT`, writes safe aggregate GitHub artifacts, does not publish a
+Google Drive current pointer, and leaves recurring producers disabled.
+
+New terminal collection sentinels label `artifactSha256` with
+`artifactHashBasis=PRE_PERSISTENCE_COLLECTION_EVIDENCE`; historical sentinels
+remain valid and are not rewritten.
