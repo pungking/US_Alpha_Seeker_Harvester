@@ -80,7 +80,7 @@ class FakeSession:
             {
                 "status": self.response_status,
                 "message": ["private-message"] if self.response_status != "REQUEST_SUCCEEDED" else [],
-                "Results": {"series": rows},
+                "Results": [{"series": rows}],
             },
         )
 

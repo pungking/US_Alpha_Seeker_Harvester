@@ -1038,8 +1038,13 @@ def collect_bls_registered_data_capability(
     except ValueError:
         payload = None
     results = payload.get("Results") if isinstance(payload, dict) else None
-    series = results.get("series") if isinstance(results, dict) else None
-    rows = series if isinstance(series, list) else []
+    result_groups = results if isinstance(results, list) else [results]
+    rows = [
+        row
+        for group in result_groups
+        if isinstance(group, dict)
+        for row in (group.get("series") if isinstance(group.get("series"), list) else [])
+    ]
     matching_rows = [
         row
         for row in rows
