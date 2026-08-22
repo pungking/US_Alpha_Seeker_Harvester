@@ -66,6 +66,8 @@ jobs:
         run: python scripts/check_macro_event_clock_capability.py
       - name: Macro event clock blocker-only reproof contract
         run: python scripts/check_macro_event_clock_blocker_reproof.py
+      - name: BLS registered data API capability contract
+        run: python scripts/check_bls_registered_data_capability.py
       - name: Toss read-only capability contract
         run: python scripts/check_toss_read_only_capability.py
       - name: Toss Phase2a shadow market-data contract

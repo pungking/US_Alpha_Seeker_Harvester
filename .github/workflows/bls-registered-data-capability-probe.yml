@@ -1,0 +1,62 @@
+name: BLS Registered Data API SHADOW Capability Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: "Exact BLS registered data capability approval phrase"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  approval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify explicit bounded approval
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          test "$APPROVAL" = "AUTHORIZE BLS REGISTERED DATA API ONE-SHOT"
+
+  probe:
+    needs: approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install bounded client dependency
+        run: python -m pip install requests
+
+      - name: Verify static registered data contract
+        run: python scripts/check_bls_registered_data_capability.py
+
+      - name: Run bounded registered data probe
+        env:
+          APPROVAL: ${{ inputs.approval }}
+          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
+        run: |
+          python scripts/run_macro_event_clock_capability_probe.py \
+            --bls-registered-only \
+            --approval "$APPROVAL" \
+            --output "$RUNNER_TEMP/bls-registered-data-capability.json" \
+            --sentinel "$RUNNER_TEMP/bls-registered-data-capability-sentinel.json"
+
+      - name: Upload safe aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: bls-registered-data-capability-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bls-registered-data-capability.json
+            ${{ runner.temp }}/bls-registered-data-capability-sentinel.json
+          if-no-files-found: warn
