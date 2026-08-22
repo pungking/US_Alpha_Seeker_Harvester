@@ -68,6 +68,8 @@ jobs:
         run: python scripts/check_macro_event_clock_blocker_reproof.py
       - name: BLS registered data API capability contract
         run: python scripts/check_bls_registered_data_capability.py
+      - name: Official SHADOW producer readiness contract
+        run: python scripts/check_official_shadow_producer_readiness.py
       - name: Toss read-only capability contract
         run: python scripts/check_toss_read_only_capability.py
       - name: Toss Phase2a shadow market-data contract
@@ -89,6 +91,9 @@ jobs:
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           FINRA_CLIENT_ID: ${{ secrets.FINRA_CLIENT_ID }}
           FINRA_CLIENT_SECRET: ${{ secrets.FINRA_CLIENT_SECRET }}
+          BEA_API_KEY: ${{ secrets.BEA_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY: ${{ secrets.BLS_API_KEY }}
           # The current account is free-tier; Premium activation requires a reviewed contract change.
           FINNHUB_SYMBOL_CHANGE_PREMIUM_ENABLED: 'false'
           FMP_DELISTED_PREMIUM_ENABLED: 'false'
@@ -100,6 +105,7 @@ jobs:
           TOSS_SHADOW_MAX_PRICE_REQUESTS: '2'
           # Static producer is merged separately from recurring source activation.
           SEC_FINRA_SHADOW_PROVIDER_ENABLED: 'false'
+          MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED: 'false'
           
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           # Harvester collection notifications must go to simulation/private channel.
@@ -119,6 +125,8 @@ jobs:
           HARVESTER_TOSS_READ_ONLY_CAPABILITY_PATH: state/toss-read-only-capability.json
           HARVESTER_TOSS_SHADOW_PATH: state/toss-market-data-shadow.json
           HARVESTER_SEC_FINRA_SHADOW_PATH: state/sec-finra-shadow-evidence.json
+          HARVESTER_MACRO_EVENT_CLOCK_SHADOW_PATH: state/macro-event-clock-shadow.json
+          HARVESTER_OFFICIAL_SHADOW_SENTINEL_DIR: ${{ runner.temp }}/official-shadow-sentinels
         run: |
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
@@ -153,6 +161,7 @@ jobs:
             state/toss-read-only-capability.json
             state/toss-market-data-shadow.json
             state/sec-finra-shadow-evidence.json
+            state/macro-event-clock-shadow.json
             state/symbol-agnostic-runtime-check.json
             state/symbol-agnostic-runtime-check.md
             state/telegram-routing-policy-audit.*

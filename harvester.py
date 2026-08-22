@@ -46,9 +46,37 @@ from scripts.toss_shadow_market_data import (
     toss_shadow_runtime_decision,
 )
 from scripts.sec_finra_shadow_evidence import (
+    PASS_STATUS as SEC_FINRA_SHADOW_PASS_STATUS,
+    REQUEST_BUDGETS as SEC_FINRA_SHADOW_REQUEST_BUDGETS,
+    SCHEMA_VERSION as SEC_FINRA_SHADOW_SCHEMA_VERSION,
+    SOURCE_IDS as SEC_FINRA_SHADOW_SOURCE_IDS,
+    SOURCE_WINDOW_BASES as SEC_FINRA_SHADOW_SOURCE_WINDOW_BASES,
     build_sec_finra_shadow_not_run_result,
     collect_sec_finra_shadow_evidence,
     sec_finra_shadow_runtime_decision,
+)
+from scripts.run_macro_event_clock_capability_probe import (
+    MACRO_SHADOW_PASS_STATUS,
+    MACRO_SHADOW_REQUEST_BUDGETS,
+    MACRO_SHADOW_SCHEMA_VERSION,
+    MACRO_SHADOW_SOURCE_IDS,
+    MACRO_SHADOW_SOURCE_WINDOW_BASES,
+    build_macro_event_clock_shadow_not_run_result,
+    collect_macro_event_clock_shadow,
+    macro_event_clock_shadow_runtime_decision,
+)
+from scripts.official_shadow_runtime import (
+    build_collection_contract,
+    build_durable_collection_sentinel,
+    canonical_sha256 as official_shadow_sha256,
+    classify_durable_collection_sentinel,
+    classify_existing_artifact,
+    dispatch_official_shadow_alert,
+    durable_collection_sentinel_filename,
+    finish_collection_sentinel,
+    persist_shadow_artifact,
+    reserve_collection_sentinel,
+    reuse_existing_artifact,
 )
 
 # 로그 실시간 출력 설정
@@ -106,6 +134,18 @@ HARVESTER_SEC_FINRA_SHADOW_PATH = (
     os.getenv("HARVESTER_SEC_FINRA_SHADOW_PATH")
     or "state/sec-finra-shadow-evidence.json"
 ).strip()
+HARVESTER_MACRO_EVENT_CLOCK_SHADOW_PATH = (
+    os.getenv("HARVESTER_MACRO_EVENT_CLOCK_SHADOW_PATH")
+    or "state/macro-event-clock-shadow.json"
+).strip()
+HARVESTER_OFFICIAL_SHADOW_SENTINEL_DIR = Path(
+    os.path.expanduser(
+        (
+            os.getenv("HARVESTER_OFFICIAL_SHADOW_SENTINEL_DIR")
+            or "~/.local/state/us-alpha-seeker-harvester/official-shadow-sentinels"
+        ).strip()
+    )
+)
 HARVESTER_TOSS_SHADOW_SENTINEL_DIR = Path(
     os.path.expanduser(
         (
@@ -231,6 +271,9 @@ TOSS_CLIENT_SECRET = os.getenv("TOSS_CLIENT_SECRET")
 SEC_USER_AGENT = os.getenv("SEC_USER_AGENT")
 FINRA_CLIENT_ID = os.getenv("FINRA_CLIENT_ID")
 FINRA_CLIENT_SECRET = os.getenv("FINRA_CLIENT_SECRET")
+BEA_API_KEY = os.getenv("BEA_API_KEY")
+FRED_API_KEY = os.getenv("FRED_API_KEY")
+BLS_API_KEY = os.getenv("BLS_API_KEY")
 
 
 def _read_bool_env(name, default=False):
@@ -279,6 +322,9 @@ TOSS_SHADOW_PROVIDER_ENABLED = _read_bool_env(
 )
 SEC_FINRA_SHADOW_PROVIDER_ENABLED = _read_bool_env(
     "SEC_FINRA_SHADOW_PROVIDER_ENABLED", False
+)
+MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED = _read_bool_env(
+    "MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED", False
 )
 TOSS_SHADOW_MAX_PRICE_REQUESTS = _read_positive_int_env(
     "TOSS_SHADOW_MAX_PRICE_REQUESTS", 2
@@ -757,6 +803,279 @@ def upload_json(filename, data, parent_id):
 TOSS_READ_ONLY_CAPABILITY_FILENAME = "TOSS_READ_ONLY_CAPABILITY.json"
 TOSS_MARKET_DATA_SHADOW_FILENAME = "TOSS_MARKET_DATA_SHADOW.json"
 SEC_FINRA_SHADOW_EVIDENCE_FILENAME = "SEC_FINRA_SHADOW_EVIDENCE.json"
+MACRO_EVENT_CLOCK_SHADOW_FILENAME = "MACRO_EVENT_CLOCK_SHADOW.json"
+OFFICIAL_SHADOW_ONE_SHOT_APPROVAL = (
+    "AUTHORIZE OFFICIAL SHADOW PRODUCER BOUNDED ONE-SHOT"
+)
+HARVESTER_OFFICIAL_SHADOW_ONE_SHOT_RESULT_PATH = (
+    os.getenv("HARVESTER_OFFICIAL_SHADOW_ONE_SHOT_RESULT_PATH")
+    or "state/official-shadow-producer-one-shot.json"
+).strip()
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+
+
+def _rehash_official_shadow(payload: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    result.pop("evidenceSha256", None)
+    result["evidenceHashBasis"] = "CANONICAL_JSON_WITHOUT_EVIDENCE_HASH"
+    result["evidenceSha256"] = official_shadow_sha256(result)
+    return result
+
+
+def _existing_official_shadow(
+    sys_id: str,
+    current_filename: str,
+    contract: Mapping[str, Any],
+    *,
+    success_statuses: set[str],
+    request_counter_names: Iterable[str],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    current_id = find_file_id(current_filename, sys_id)
+    existing = download_json(current_id) if current_id else None
+    matched_status = classify_existing_artifact(
+        existing,
+        contract,
+        success_statuses=success_statuses,
+    )
+    if matched_status not in {
+        "EXISTING_MATCHED_SUCCESS",
+        "EXISTING_MATCHED_FAILURE",
+    }:
+        return None, existing if isinstance(existing, dict) else None
+    reused = reuse_existing_artifact(
+        existing,
+        request_counter_names=request_counter_names,
+        matched_status=matched_status,
+    )
+    reused.update(
+        {
+            "idempotencyStatus": matched_status,
+            "artifactPersistenceStatus": "EXISTING_DRIVE_ARTIFACT_REUSED",
+            "drivePublishStatus": "EXISTING_MATCHED_ARTIFACT_REUSED",
+            "telegramAggregateAlertStatus": "ALERT_NOT_REPEATED_EXISTING_WINDOW",
+        }
+    )
+    return _rehash_official_shadow(reused), existing
+
+
+def _blocked_official_shadow_result(
+    builder: Callable[[str], dict[str, Any]],
+    contract: Mapping[str, Any],
+    *,
+    blocker: str,
+    runtime_action: str,
+) -> dict[str, Any]:
+    result = builder(blocker)
+    result.update(
+        {
+            **dict(contract),
+            "primaryBlocker": blocker,
+            "runtimeAction": runtime_action,
+            "idempotencyStatus": blocker,
+            "existingArtifactReuseStatus": "NO_MATCHED_ARTIFACT",
+            "failOpenStatus": "CANONICAL_ANALYSIS_CONTINUES",
+            "telegramAggregateAlertStatus": "ALERT_NOT_REQUIRED_PRE_NETWORK",
+        }
+    )
+    return _rehash_official_shadow(result)
+
+
+def _ensure_official_shadow_provider(
+    *,
+    sys_id: str,
+    source_family: str,
+    schema_version: str,
+    source_ids: Iterable[str],
+    source_window_bases: Mapping[str, str],
+    request_budgets: Mapping[str, int],
+    success_statuses: set[str],
+    current_filename: str,
+    archive_prefix: str,
+    local_path: str,
+    failure_status: str,
+    not_run_builder: Callable[[str], dict[str, Any]],
+    collector: Callable[[Any, str], dict[str, Any]],
+    session: Any | None = None,
+    retrieved_at: str | None = None,
+) -> dict[str, Any]:
+    observed_at = retrieved_at or _utc_now_iso()
+    contract = build_collection_contract(
+        source_family=source_family,
+        schema_version=schema_version,
+        source_ids=source_ids,
+        source_window_bases=source_window_bases,
+        retrieved_at=observed_at,
+    )
+    reused, previous = _existing_official_shadow(
+        sys_id,
+        current_filename,
+        contract,
+        success_statuses=success_statuses,
+        request_counter_names=request_budgets,
+    )
+    if reused is not None:
+        write_json_report(local_path, reused, f"{archive_prefix} reused")
+        return reused
+
+    durable_filename = durable_collection_sentinel_filename(contract)
+    durable_id = find_file_id(durable_filename, sys_id)
+    durable = download_json(durable_id) if durable_id else None
+    durable_status = classify_durable_collection_sentinel(durable, contract)
+    if durable_status != "DURABLE_SENTINEL_MISSING":
+        result = _blocked_official_shadow_result(
+            not_run_builder,
+            contract,
+            blocker=durable_status,
+            runtime_action="DURABLE_COLLECTION_SENTINEL_BLOCKED",
+        )
+        write_json_report(local_path, result, f"{archive_prefix} duplicate blocked")
+        return result
+
+    reservation = reserve_collection_sentinel(
+        HARVESTER_OFFICIAL_SHADOW_SENTINEL_DIR,
+        source_family=source_family,
+        collection_key=contract["collectionKey"],
+        reserved_at=observed_at,
+    )
+    if reservation.get("status") != "RESERVED":
+        result = _blocked_official_shadow_result(
+            not_run_builder,
+            contract,
+            blocker=str(reservation.get("status") or "LOCAL_SENTINEL_INVALID"),
+            runtime_action="LOCAL_COLLECTION_SENTINEL_BLOCKED",
+        )
+        write_json_report(local_path, result, f"{archive_prefix} local duplicate blocked")
+        return result
+
+    durable_in_progress = build_durable_collection_sentinel(
+        contract,
+        status="IN_PROGRESS",
+        reserved_at=observed_at,
+    )
+    try:
+        upload_json(durable_filename, durable_in_progress, sys_id)
+    except Exception as exc:
+        finish_collection_sentinel(
+            Path(str(reservation["path"])),
+            status="FAILED",
+            completed_at=_utc_now_iso(),
+            artifact_sha256=None,
+            request_counts={},
+        )
+        result = _blocked_official_shadow_result(
+            not_run_builder,
+            contract,
+            blocker=type(exc).__name__,
+            runtime_action="DURABLE_SENTINEL_RESERVATION_FAILED",
+        )
+        result["artifactPersistenceStatus"] = "DURABLE_SENTINEL_PUBLISH_FAILED"
+        write_json_report(local_path, result, f"{archive_prefix} reservation failed")
+        return result
+
+    source_session = session or requests.Session()
+    owns_session = session is None
+    if owns_session:
+        source_session.trust_env = False
+    try:
+        result = collector(source_session, observed_at)
+    except Exception as exc:
+        result = not_run_builder("producer_exception_fail_open")
+        result.update(
+            {
+                "status": failure_status,
+                "runtimeAction": "PRODUCER_EXCEPTION_FAIL_OPEN",
+                "primaryBlocker": type(exc).__name__,
+                "safeErrorCategory": type(exc).__name__,
+                "requestCounts": {key: None for key in request_budgets},
+                "externalRequestCount": None,
+                "requestBudgetCompliant": False,
+                "requestCountEvidenceStatus": "UNAVAILABLE_AFTER_EXCEPTION",
+            }
+        )
+    finally:
+        if owns_session:
+            source_session.close()
+
+    source_hash = str(result.get("evidenceSha256") or "")
+    result.update(
+        {
+            **dict(contract),
+            "sourceEvidenceSha256": (
+                source_hash
+                if re.fullmatch(r"[0-9a-f]{64}", source_hash)
+                else None
+            ),
+            "existingArtifactReuseStatus": "NO_MATCHED_ARTIFACT",
+            "idempotencyStatus": "DURABLE_AND_LOCAL_SENTINEL_RESERVED",
+            "failOpenStatus": "CANONICAL_ANALYSIS_CONTINUES",
+            "enabledByDefault": False,
+            "recurringActivationAuthorized": False,
+        }
+    )
+    result = _rehash_official_shadow(result)
+    terminal_status = (
+        "COMPLETE" if result.get("status") in success_statuses else "FAILED"
+    )
+    integer_counts = {
+        key: value
+        for key, value in (result.get("requestCounts") or {}).items()
+        if isinstance(value, int) and value >= 0
+    }
+    completed_at = _utc_now_iso()
+    try:
+        finish_collection_sentinel(
+            Path(str(reservation["path"])),
+            status=terminal_status,
+            completed_at=completed_at,
+            artifact_sha256=result.get("evidenceSha256"),
+            request_counts=integer_counts,
+        )
+        durable_terminal = build_durable_collection_sentinel(
+            contract,
+            status=terminal_status,
+            reserved_at=observed_at,
+            completed_at=completed_at,
+            artifact_sha256=result.get("evidenceSha256"),
+            request_counts=integer_counts,
+        )
+        upload_json(durable_filename, durable_terminal, sys_id)
+        result["idempotencyStatus"] = f"SENTINEL_{terminal_status}"
+    except Exception as exc:
+        result["idempotencyStatus"] = "SENTINEL_COMPLETION_FAILED"
+        result["sentinelErrorCategory"] = type(exc).__name__
+
+    previous_fingerprint = (
+        ((previous or {}).get("alertDelivery") or {}).get("alertFingerprint")
+        if isinstance(previous, Mapping)
+        else None
+    )
+    sent_fingerprints = (
+        {previous_fingerprint}
+        if isinstance(previous_fingerprint, str)
+        and re.fullmatch(r"[0-9a-f]{64}", previous_fingerprint)
+        else set()
+    )
+    result["alertDelivery"] = dispatch_official_shadow_alert(
+        result,
+        success_statuses=success_statuses,
+        sent_fingerprints=sent_fingerprints,
+        sender=send_telegram,
+    )
+    result["telegramAggregateAlertStatus"] = result["alertDelivery"]["status"]
+    return persist_shadow_artifact(
+        result,
+        local_path=local_path,
+        current_filename=current_filename,
+        archive_prefix=archive_prefix,
+        parent_id=sys_id,
+        writer=write_json_report,
+        uploader=upload_json,
+    )
 
 
 def ensure_sec_finra_shadow_evidence(
@@ -766,67 +1085,138 @@ def ensure_sec_finra_shadow_evidence(
     enabled, runtime_reason = sec_finra_shadow_runtime_decision(os.environ)
     if not enabled:
         return build_sec_finra_shadow_not_run_result(runtime_reason)
-
-    retrieved_at = datetime.datetime.now(datetime.timezone.utc).replace(
-        microsecond=0
-    ).isoformat().replace("+00:00", "Z")
-    source_session = session or requests.Session()
-    owns_session = session is None
-    if owns_session:
-        source_session.trust_env = False
-    try:
-        result = collect_sec_finra_shadow_evidence(
+    return _ensure_official_shadow_provider(
+        sys_id=sys_id,
+        source_family="SEC_FINRA_OFFICIAL_EVIDENCE",
+        schema_version=SEC_FINRA_SHADOW_SCHEMA_VERSION,
+        source_ids=SEC_FINRA_SHADOW_SOURCE_IDS,
+        source_window_bases=SEC_FINRA_SHADOW_SOURCE_WINDOW_BASES,
+        request_budgets=SEC_FINRA_SHADOW_REQUEST_BUDGETS,
+        success_statuses={SEC_FINRA_SHADOW_PASS_STATUS},
+        current_filename=SEC_FINRA_SHADOW_EVIDENCE_FILENAME,
+        archive_prefix="SEC_FINRA_SHADOW_EVIDENCE",
+        local_path=HARVESTER_SEC_FINRA_SHADOW_PATH,
+        failure_status="SEC_FINRA_SHADOW_TRANSIENT_FAILURE",
+        not_run_builder=build_sec_finra_shadow_not_run_result,
+        collector=lambda source_session, observed_at: collect_sec_finra_shadow_evidence(
             session=source_session,
             sec_user_agent=str(SEC_USER_AGENT or ""),
             finra_client_id=str(FINRA_CLIENT_ID or ""),
             finra_client_secret=str(FINRA_CLIENT_SECRET or ""),
-            retrieved_at=retrieved_at,
-        )
-    except Exception as exc:
-        result = build_sec_finra_shadow_not_run_result(
-            "producer_exception_fail_open"
-        )
-        result.update(
-            {
-                "status": "SEC_FINRA_SHADOW_TRANSIENT_FAILURE",
-                "runtimeAction": "PRODUCER_EXCEPTION_FAIL_OPEN",
-                "safeErrorCategory": type(exc).__name__,
-                "requestCounts": {
-                    key: None for key in result["requestCounts"]
-                },
-                "externalRequestCount": None,
-                "requestCountEvidenceStatus": "UNAVAILABLE_AFTER_EXCEPTION",
-            }
-        )
-    finally:
-        if owns_session:
-            source_session.close()
+            retrieved_at=observed_at,
+        ),
+        session=session,
+    )
 
-    write_json_report(
-        HARVESTER_SEC_FINRA_SHADOW_PATH,
-        result,
-        "SEC/FINRA shadow evidence",
+
+def ensure_macro_event_clock_shadow(
+    sys_id: str,
+    session: Any | None = None,
+) -> dict[str, Any]:
+    enabled, runtime_reason = macro_event_clock_shadow_runtime_decision(os.environ)
+    if not enabled:
+        return build_macro_event_clock_shadow_not_run_result(runtime_reason)
+    environment = {
+        "MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED": "true",
+        "BEA_API_KEY": BEA_API_KEY,
+        "FRED_API_KEY": FRED_API_KEY,
+        "BLS_API_KEY": BLS_API_KEY,
+    }
+    return _ensure_official_shadow_provider(
+        sys_id=sys_id,
+        source_family="MACRO_EVENT_CLOCK_OFFICIAL_EVIDENCE",
+        schema_version=MACRO_SHADOW_SCHEMA_VERSION,
+        source_ids=MACRO_SHADOW_SOURCE_IDS,
+        source_window_bases=MACRO_SHADOW_SOURCE_WINDOW_BASES,
+        request_budgets=MACRO_SHADOW_REQUEST_BUDGETS,
+        success_statuses={MACRO_SHADOW_PASS_STATUS},
+        current_filename=MACRO_EVENT_CLOCK_SHADOW_FILENAME,
+        archive_prefix="MACRO_EVENT_CLOCK_SHADOW",
+        local_path=HARVESTER_MACRO_EVENT_CLOCK_SHADOW_PATH,
+        failure_status="MACRO_EVENT_CLOCK_SHADOW_TRANSIENT_FAILURE",
+        not_run_builder=build_macro_event_clock_shadow_not_run_result,
+        collector=lambda source_session, observed_at: collect_macro_event_clock_shadow(
+            session=source_session,
+            environment=environment,
+            retrieved_at=observed_at,
+        ),
+        session=session,
     )
-    artifact_hash = str(result.get("evidenceSha256") or _canonical_sha256(result))
-    safe_status = re.sub(
-        r"[^A-Z0-9_]+",
-        "_",
-        str(result.get("status") or "UNKNOWN").upper(),
-    )[:48]
-    archive_name = (
-        f"SEC_FINRA_SHADOW_EVIDENCE_{safe_status}_{artifact_hash[:16]}.json"
+
+
+def run_official_shadow_producer_one_shot() -> dict[str, Any]:
+    if (
+        os.getenv("OFFICIAL_SHADOW_ONE_SHOT_APPROVAL")
+        != OFFICIAL_SHADOW_ONE_SHOT_APPROVAL
+    ):
+        raise RuntimeError("official_shadow_one_shot_approval_required")
+    if GITHUB_EVENT_NAME != "workflow_dispatch":
+        raise RuntimeError("official_shadow_one_shot_manual_dispatch_required")
+    if not (
+        SEC_FINRA_SHADOW_PROVIDER_ENABLED
+        and MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED
+    ):
+        raise RuntimeError("official_shadow_one_shot_provider_flags_required")
+
+    root_id = find_file_id("US_Alpha_Seeker")
+    sys_id = find_file_id("System_Identity_Maps", root_id)
+    if not root_id or not sys_id:
+        raise RuntimeError("official_shadow_drive_folder_missing")
+    sec_finra = ensure_sec_finra_shadow_evidence(sys_id)
+    macro = ensure_macro_event_clock_shadow(sys_id)
+    request_counts = {
+        "secFinra": sec_finra.get("requestCounts") or {},
+        "macro": macro.get("requestCounts") or {},
+    }
+    external_counts = (
+        sec_finra.get("externalRequestCount"),
+        macro.get("externalRequestCount"),
     )
-    try:
-        upload_json(archive_name, result, sys_id)
-        upload_json(SEC_FINRA_SHADOW_EVIDENCE_FILENAME, result, sys_id)
-    except Exception as exc:
-        result["artifactPersistenceStatus"] = "DRIVE_PUBLISH_FAILED"
-        result["artifactPersistenceErrorCategory"] = type(exc).__name__
-        write_json_report(
-            HARVESTER_SEC_FINRA_SHADOW_PATH,
-            result,
-            "SEC/FINRA shadow Drive publish failure",
+    result = {
+        "schemaVersion": "official-shadow-producer-one-shot-v1",
+        "status": (
+            "OFFICIAL_SHADOW_PRODUCER_ONE_SHOT_PASS"
+            if sec_finra.get("status") == SEC_FINRA_SHADOW_PASS_STATUS
+            and macro.get("status") == MACRO_SHADOW_PASS_STATUS
+            else "OFFICIAL_SHADOW_PRODUCER_ONE_SHOT_PARTIAL"
+        ),
+        "mode": "SHADOW_ONLY_BOUNDED_ONE_SHOT",
+        "secFinraStatus": sec_finra.get("status"),
+        "macroStatus": macro.get("status"),
+        "blsCalendarStatus": "BLS_CALENDAR_STATIC_EGRESS_REQUIRED",
+        "requestCounts": request_counts,
+        "externalRequestCount": (
+            sum(external_counts)
+            if all(isinstance(value, int) for value in external_counts)
+            else None
+        ),
+        "requestBudgetCompliant": (
+            sec_finra.get("requestBudgetCompliant") is True
+            and macro.get("requestBudgetCompliant") is True
+        ),
+        "unknownOrUnclassifiedRows": int(
+            sec_finra.get("unknownOrUnclassifiedRows", 0) or 0
         )
+        + int(macro.get("unknownOrUnclassifiedRows", 0) or 0),
+        "recurringActivationAuthorized": False,
+        "rawResponseStored": False,
+        "secretValuesStoredOrPrinted": False,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "brokerOrSidecarStateMutation": False,
+    }
+    result = _rehash_official_shadow(result)
+    write_json_report(
+        HARVESTER_OFFICIAL_SHADOW_ONE_SHOT_RESULT_PATH,
+        result,
+        "Official SHADOW producer bounded one-shot",
+    )
+    print(
+        "[OFFICIAL_SHADOW_ONE_SHOT] "
+        f"status={result['status']} requests={result['externalRequestCount']} "
+        "blsCalendar=BLS_CALENDAR_STATIC_EGRESS_REQUIRED",
+        flush=True,
+    )
     return result
 
 
@@ -6368,6 +6758,9 @@ def run_harvester():
     sec_finra_shadow = build_sec_finra_shadow_not_run_result(
         "shadow_provider_not_evaluated"
     )
+    macro_event_clock_shadow = build_macro_event_clock_shadow_not_run_result(
+        "shadow_provider_not_evaluated"
+    )
     corporate_action_runtime_audit_written = False
     mapping_refresh_audit = {"status": "not_run"}
 
@@ -6735,6 +7128,7 @@ def run_harvester():
                 "durationMinutes": round(duration, 2),
                 "tossMarketDataShadow": toss_market_data_shadow,
                 "secFinraShadow": sec_finra_shadow,
+                "macroEventClockShadow": macro_event_clock_shadow,
             }
             failure_report = build_harvester_failure_report(summary_payload)
             write_harvester_failure_report(failure_report)
@@ -6886,7 +7280,7 @@ def run_harvester():
                     f"(category={type(exc).__name__})",
                     flush=True,
                 )
-        if SEC_FINRA_SHADOW_PROVIDER_ENABLED:
+        if SEC_FINRA_SHADOW_PROVIDER_ENABLED and GITHUB_EVENT_NAME == "schedule":
             try:
                 sec_finra_shadow = ensure_sec_finra_shadow_evidence(sys_id)
             except Exception as exc:
@@ -6905,6 +7299,41 @@ def run_harvester():
                     f"continues (category={type(exc).__name__})",
                     flush=True,
                 )
+        elif SEC_FINRA_SHADOW_PROVIDER_ENABLED:
+            sec_finra_shadow = build_sec_finra_shadow_not_run_result(
+                "runtime_event_not_schedule"
+            )
+        if (
+            MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED
+            and GITHUB_EVENT_NAME == "schedule"
+        ):
+            try:
+                macro_event_clock_shadow = ensure_macro_event_clock_shadow(sys_id)
+            except Exception as exc:
+                macro_event_clock_shadow = (
+                    build_macro_event_clock_shadow_not_run_result(
+                        "producer_exception_fail_open"
+                    )
+                )
+                macro_event_clock_shadow.update(
+                    {
+                        "status": "MACRO_EVENT_CLOCK_SHADOW_TRANSIENT_FAILURE",
+                        "runtimeAction": "PRODUCER_EXCEPTION_FAIL_OPEN",
+                        "safeErrorCategory": type(exc).__name__,
+                    }
+                )
+                print(
+                    "Warning: macro event-clock SHADOW producer failed; "
+                    "canonical analysis continues "
+                    f"(category={type(exc).__name__})",
+                    flush=True,
+                )
+        elif MACRO_EVENT_CLOCK_SHADOW_PROVIDER_ENABLED:
+            macro_event_clock_shadow = (
+                build_macro_event_clock_shadow_not_run_result(
+                    "runtime_event_not_schedule"
+                )
+            )
         daily_corporate_action_audit = build_mapping_corporate_action_runtime_audit(
             full_map,
             expected_symbols=list(filtered_tickers),
@@ -7597,6 +8026,7 @@ def run_harvester():
         summary_payload["tossReadOnlyCapability"] = toss_read_only_capability
         summary_payload["tossMarketDataShadow"] = toss_market_data_shadow
         summary_payload["secFinraShadow"] = sec_finra_shadow
+        summary_payload["macroEventClockShadow"] = macro_event_clock_shadow
         summary_payload["failureSamples"] = failure_report.get("failures", [])[:HARVESTER_FAILURE_SAMPLE_LIMIT]
         write_harvester_run_summary(summary_payload)
 
@@ -7644,6 +8074,7 @@ def run_harvester():
             "errorMessage": str(e),
             "tossMarketDataShadow": toss_market_data_shadow,
             "secFinraShadow": sec_finra_shadow,
+            "macroEventClockShadow": macro_event_clock_shadow,
         }
         failure_report = build_harvester_failure_report(summary_payload)
         write_harvester_failure_report(failure_report)
@@ -7661,5 +8092,7 @@ def run_harvester():
 if __name__ == "__main__":
     if "--toss-shadow-collector" in sys.argv[1:]:
         run_toss_same_stage3_collector()
+    elif "--official-shadow-producer-one-shot" in sys.argv[1:]:
+        run_official_shadow_producer_one_shot()
     else:
         run_harvester()
