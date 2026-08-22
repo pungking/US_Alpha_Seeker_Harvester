@@ -16,6 +16,14 @@ import requests
 SCHEMA_VERSION = "sec-finra-shadow-evidence-v1"
 PASS_STATUS = "SEC_FINRA_SHADOW_PASS_APPROVED_SCOPE"
 PARTIAL_STATUS = "SEC_FINRA_SHADOW_PARTIAL"
+SCHEDULE13_TARGETED_SCHEMA_VERSION = "sec-schedule13-exact-family-reproof-v1"
+SCHEDULE13_SOURCE_ID = "SEC_SCHEDULES_13D_13G"
+SCHEDULE13_ALLOWED_FORMS = {"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"}
+SCHEDULE13_DISCOVERY_COUNT = 40
+SCHEDULE13_PASS_STATUSES = {
+    "SEC_SCHEDULE13_EXACT_FAMILY_PASS",
+    "SEC_SCHEDULE13_NO_CURRENT_ALLOWED_FORM_PASS",
+}
 REQUEST_BUDGETS = {
     "secDiscovery": 3,
     "secSubmissions": 3,
@@ -31,13 +39,15 @@ SEC_FAMILIES = (
         "4",
         "only",
         {"3", "3/A", "4", "4/A", "5", "5/A"},
+        1,
     ),
     (
         "SEC_SCHEDULES_13D_13G",
         "BENEFICIAL_OWNERSHIP_POSITION_DISCLOSURE",
         "SC 13",
         "include",
-        {"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"},
+        SCHEDULE13_ALLOWED_FORMS,
+        SCHEDULE13_DISCOVERY_COUNT,
     ),
     (
         "SEC_FORM_13F",
@@ -45,6 +55,7 @@ SEC_FAMILIES = (
         "13F-HR",
         "include",
         {"13F-HR", "13F-HR/A"},
+        1,
     ),
 )
 FINRA_DATASETS = (
@@ -215,26 +226,83 @@ class _BoundedClient:
         }
 
 
-def _atom_reference(body: bytes) -> tuple[dict[str, str] | None, str]:
+def _atom_reference(
+    body: bytes,
+    allowed_forms: set[str],
+) -> tuple[dict[str, str] | None, str, dict[str, Any]]:
+    shape = {
+        "discoveryEntryRows": 0,
+        "machineReadableFormRows": 0,
+        "allowedFormRows": 0,
+        "rejectedSiblingFormRows": 0,
+        "invalidReferenceRows": 0,
+        "selectedAllowedFormStatus": "NO_FORM_SELECTED",
+        "selectedFormFamily": None,
+        "paginationUsed": False,
+    }
     try:
         root = ElementTree.fromstring(body)
     except ElementTree.ParseError:
-        return None, "DISCOVERY_XML_INVALID"
-    entry = root.find("{http://www.w3.org/2005/Atom}entry")
-    if entry is None:
-        return None, "NO_CURRENT_FILING_DISCOVERED"
-    link = entry.find("{http://www.w3.org/2005/Atom}link")
-    match = re.search(
-        r"/Archives/edgar/data/(\d+)/(\d{18})(?:/|[-_])",
-        urlparse(str(link.attrib.get("href") if link is not None else "")).path,
-    )
-    if match is None:
-        return None, "DISCOVERY_REFERENCE_INVALID"
-    digits = match.group(2)
-    return {
-        "cik": match.group(1),
-        "accession": f"{digits[:10]}-{digits[10:12]}-{digits[12:]}",
-    }, "DISCOVERY_REFERENCE_VALID"
+        return None, "DISCOVERY_XML_INVALID", shape
+    namespace = "{http://www.w3.org/2005/Atom}"
+    entries = root.findall(f"{namespace}entry")
+    shape["discoveryEntryRows"] = len(entries)
+    if not entries:
+        return None, "NO_CURRENT_FILING_DISCOVERED", shape
+
+    missing_form_metadata = 0
+    selected_reference: dict[str, str] | None = None
+    selected_form: str | None = None
+    selected_reference_invalid = False
+    for entry in entries:
+        terms = [
+            str(category.attrib.get("term") or "").strip()
+            for category in entry.findall(f"{namespace}category")
+            if str(category.attrib.get("term") or "").strip()
+        ]
+        if not terms:
+            missing_form_metadata += 1
+            continue
+        shape["machineReadableFormRows"] += 1
+        form = next((term for term in terms if term in allowed_forms), None)
+        if form is None:
+            shape["rejectedSiblingFormRows"] += 1
+            continue
+        shape["allowedFormRows"] += 1
+        link = entry.find(f"{namespace}link")
+        match = re.search(
+            r"/Archives/edgar/data/(\d+)/(\d{18})(?:/|[-_])",
+            urlparse(
+                str(link.attrib.get("href") if link is not None else "")
+            ).path,
+        )
+        if match is None:
+            shape["invalidReferenceRows"] += 1
+            if selected_form is None:
+                selected_form = form
+                selected_reference_invalid = True
+            continue
+        digits = match.group(2)
+        if selected_form is None:
+            selected_form = form
+            selected_reference = {
+                "cik": match.group(1),
+                "accession": f"{digits[:10]}-{digits[10:12]}-{digits[12:]}",
+                "form": form,
+            }
+
+    if selected_form is not None:
+        shape["selectedFormFamily"] = selected_form
+        if selected_reference_invalid:
+            shape["selectedAllowedFormStatus"] = "ALLOWED_FORM_REFERENCE_INVALID"
+            return None, "DISCOVERY_ALLOWED_FORM_REFERENCE_INVALID", shape
+        shape["selectedAllowedFormStatus"] = "EXACT_ALLOWED_FORM_SELECTED"
+        return selected_reference, "DISCOVERY_REFERENCE_VALID", shape
+
+    if missing_form_metadata:
+        shape["selectedAllowedFormStatus"] = "FORM_METADATA_INCOMPLETE"
+        return None, "DISCOVERY_FORM_METADATA_MISSING_OR_INVALID", shape
+    return None, "NO_CURRENT_ALLOWED_FORM_DISCOVERED", shape
 
 
 def _submission_lineage(payload: Any, accession: str) -> dict[str, Any]:
@@ -324,6 +392,9 @@ def _raw_filing_shape(
     return {
         "status": "RAW_FILING_SHAPE_VALID" if valid else "RAW_FILING_SHAPE_INVALID",
         "observedForm": observed_form or None,
+        "accessionMatched": observed_accession == accession,
+        "formFamilyMatched": observed_form in allowed_forms,
+        "xmlShapeValid": parseable > 0,
         "matchingXmlDocumentCount": matching,
         "parseableMatchingXmlDocumentCount": parseable,
         "xmlWrapperDocumentCount": wrappers,
@@ -333,14 +404,35 @@ def _raw_filing_shape(
     }
 
 
+def _http_failure_class(response: Any | None) -> str:
+    if response is None:
+        return "TRANSIENT_FAILURE"
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code in {401, 403}:
+        return "AUTH_OR_NETWORK_BLOCKED"
+    if status_code == 429:
+        return "RATE_LIMITED"
+    if status_code >= 500:
+        return "TRANSIENT_FAILURE"
+    return "SOURCE_CONTRACT_INVALID"
+
+
 def _sec_family(client: _BoundedClient, user_agent: str, contract: tuple[Any, ...]) -> dict[str, Any]:
-    source_id, evidence_class, form_filter, owner_mode, allowed_forms = contract
+    (
+        source_id,
+        evidence_class,
+        form_filter,
+        owner_mode,
+        allowed_forms,
+        discovery_count,
+    ) = contract
     result = {
         "sourceId": source_id,
         "evidenceClass": evidence_class,
         "directSignalEligible": False,
         "historicalEvidenceCurrentSentimentEligible": False,
         "discoveryFormFilter": form_filter,
+        "discoveryCountLimit": discovery_count,
     }
     url = "https://www.sec.gov/cgi-bin/browse-edgar?" + urlencode(
         {
@@ -350,7 +442,7 @@ def _sec_family(client: _BoundedClient, user_agent: str, contract: tuple[Any, ..
             "dateb": "",
             "owner": owner_mode,
             "start": "0",
-            "count": "1",
+            "count": str(discovery_count),
             "output": "atom",
         }
     )
@@ -362,14 +454,32 @@ def _sec_family(client: _BoundedClient, user_agent: str, contract: tuple[Any, ..
     )
     result["discovery"] = evidence
     if response is None or response.status_code != 200 or evidence["redirected"]:
-        return {**result, "status": "SOURCE_HTTP_FAILURE", "safeErrorCategory": "sec_discovery_failure"}
-    reference, status = _atom_reference(body)
-    result["discovery"]["status"] = status
+        result["discovery"]["status"] = "SEC_DISCOVERY_HTTP_FAILURE"
+        return {
+            **result,
+            "status": "SOURCE_HTTP_FAILURE",
+            "safeErrorCategory": "sec_discovery_failure",
+            "httpFailureClass": _http_failure_class(response),
+        }
+    reference, status, discovery_shape = _atom_reference(body, allowed_forms)
+    result["discovery"].update(
+        discovery_shape,
+        status=status,
+        discoveryCountLimit=discovery_count,
+    )
     if reference is None:
         return {
             **result,
             "status": status,
-            "safeErrorCategory": None if status == "NO_CURRENT_FILING_DISCOVERED" else "sec_discovery_contract_invalid",
+            "safeErrorCategory": (
+                None
+                if status
+                in {
+                    "NO_CURRENT_FILING_DISCOVERED",
+                    "NO_CURRENT_ALLOWED_FORM_DISCOVERED",
+                }
+                else "sec_discovery_contract_invalid"
+            ),
         }
 
     result["accessionSha256"] = _sha256(reference["accession"])
@@ -382,12 +492,29 @@ def _sec_family(client: _BoundedClient, user_agent: str, contract: tuple[Any, ..
     )
     result["submissions"] = evidence
     if response is None or response.status_code != 200 or evidence["redirected"]:
-        return {**result, "status": "SOURCE_HTTP_FAILURE", "safeErrorCategory": "sec_submissions_failure"}
+        return {
+            **result,
+            "status": "SOURCE_HTTP_FAILURE",
+            "safeErrorCategory": "sec_submissions_failure",
+            "httpFailureClass": _http_failure_class(response),
+        }
     try:
         lineage = _submission_lineage(response.json(), reference["accession"])
     except ValueError:
         lineage = {"status": "SUBMISSIONS_JSON_INVALID"}
     result["submissionsLineage"] = lineage
+    if lineage["status"] != "ACCESSION_MATCHED":
+        return {
+            **result,
+            "status": "SOURCE_CONTRACT_INVALID",
+            "safeErrorCategory": "sec_submissions_accession_lineage_invalid",
+        }
+    if lineage["observedForm"] not in allowed_forms:
+        return {
+            **result,
+            "status": "SOURCE_CONTRACT_INVALID",
+            "safeErrorCategory": "sec_submissions_form_family_mismatch",
+        }
 
     response, body, evidence = client.request(
         "secRawFiling",
@@ -400,11 +527,32 @@ def _sec_family(client: _BoundedClient, user_agent: str, contract: tuple[Any, ..
     )
     result["rawFiling"] = evidence
     if response is None or response.status_code != 200 or evidence["redirected"]:
-        return {**result, "status": "SOURCE_HTTP_FAILURE", "safeErrorCategory": "sec_raw_filing_failure"}
+        return {
+            **result,
+            "status": "SOURCE_HTTP_FAILURE",
+            "safeErrorCategory": "sec_raw_filing_failure",
+            "httpFailureClass": _http_failure_class(response),
+        }
     shape = _raw_filing_shape(body, reference["accession"], allowed_forms)
     result["rawFiling"].update(shape)
-    if lineage["status"] != "ACCESSION_MATCHED" or shape["status"] != "RAW_FILING_SHAPE_VALID":
-        return {**result, "status": "SOURCE_CONTRACT_INVALID", "safeErrorCategory": "sec_lineage_or_xml_invalid"}
+    if not shape["accessionMatched"]:
+        return {
+            **result,
+            "status": "SOURCE_CONTRACT_INVALID",
+            "safeErrorCategory": "sec_raw_filing_accession_lineage_invalid",
+        }
+    if not shape["formFamilyMatched"]:
+        return {
+            **result,
+            "status": "SOURCE_CONTRACT_INVALID",
+            "safeErrorCategory": "sec_raw_filing_form_family_mismatch",
+        }
+    if not shape["xmlShapeValid"]:
+        return {
+            **result,
+            "status": "SOURCE_CONTRACT_INVALID",
+            "safeErrorCategory": "sec_raw_filing_xml_shape_invalid",
+        }
     return {
         **result,
         "status": "SOURCE_OBSERVATION_PASS",
@@ -413,6 +561,93 @@ def _sec_family(client: _BoundedClient, user_agent: str, contract: tuple[Any, ..
         "filingDate": lineage["filingDate"],
         "publishedAt": lineage["publishedAt"],
     }
+
+
+def collect_sec_schedule13_exact_family_evidence(
+    *,
+    session: Any,
+    sec_user_agent: str,
+    retrieved_at: str,
+) -> dict[str, Any]:
+    if (
+        "@" not in sec_user_agent
+        or not _configured(sec_user_agent)
+        or _parse_timestamp(retrieved_at) is None
+    ):
+        raise ValueError("invalid_sec_contact_or_retrieval_timestamp")
+    client = _BoundedClient(session)
+    contract = next(row for row in SEC_FAMILIES if row[0] == SCHEDULE13_SOURCE_ID)
+    schedule13 = _sec_family(client, sec_user_agent, contract)
+    source_status = str(schedule13.get("status") or "")
+    error_category = str(schedule13.get("safeErrorCategory") or "")
+    http_failure = str(schedule13.get("httpFailureClass") or "")
+    if source_status == "SOURCE_OBSERVATION_PASS":
+        status = "SEC_SCHEDULE13_EXACT_FAMILY_PASS"
+    elif source_status in {
+        "NO_CURRENT_FILING_DISCOVERED",
+        "NO_CURRENT_ALLOWED_FORM_DISCOVERED",
+    }:
+        status = "SEC_SCHEDULE13_NO_CURRENT_ALLOWED_FORM_PASS"
+    elif source_status == "SOURCE_HTTP_FAILURE":
+        status = {
+            "AUTH_OR_NETWORK_BLOCKED": "SEC_SCHEDULE13_AUTH_OR_NETWORK_BLOCKED",
+            "RATE_LIMITED": "SEC_SCHEDULE13_RATE_LIMITED",
+            "SOURCE_CONTRACT_INVALID": "SEC_SCHEDULE13_DISCOVERY_METADATA_INVALID",
+        }.get(http_failure, "SEC_SCHEDULE13_TRANSIENT_FAILURE")
+    elif error_category.startswith("sec_submissions_"):
+        status = "SEC_SCHEDULE13_SUBMISSIONS_LINEAGE_INVALID"
+    elif error_category.startswith("sec_raw_filing_"):
+        status = "SEC_SCHEDULE13_RAW_FILING_CONTRACT_INVALID"
+    else:
+        status = "SEC_SCHEDULE13_DISCOVERY_METADATA_INVALID"
+
+    request_counts = {
+        "secSchedule13Discovery": client.counts["secDiscovery"],
+        "secSchedule13Submissions": client.counts["secSubmissions"],
+        "secSchedule13RawFiling": client.counts["secRawFiling"],
+        "section16": 0,
+        "form13F": 0,
+        "finraOauth": 0,
+        "finraMetadata": 0,
+        "finraData": 0,
+        "federalReserve": 0,
+        "fred": 0,
+        "bea": 0,
+        "bls": 0,
+        "blsCalendar": 0,
+        "toss": 0,
+    }
+    result = {
+        "schemaVersion": SCHEDULE13_TARGETED_SCHEMA_VERSION,
+        "mode": "SHADOW_ONLY_TARGETED_REPROOF",
+        "status": status,
+        "retrievedAt": retrieved_at,
+        "schedule13": schedule13,
+        "requestCounts": request_counts,
+        "externalRequestCount": sum(request_counts.values()),
+        "requestBudgetCompliant": (
+            client.counts["secDiscovery"] <= 1
+            and client.counts["secSubmissions"] <= 1
+            and client.counts["secRawFiling"] <= 1
+        ),
+        "exactFamilyFilterApplied": True,
+        "titleOrSummaryHeuristicUsed": False,
+        "paginationUsed": False,
+        "retryCount": 0,
+        "rawResponseStored": False,
+        "actualIdentifiersStoredOrPrinted": False,
+        "secretValuesStoredOrPrinted": False,
+        "googleDrivePublished": False,
+        "recurringActivationAuthorized": False,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "stage4To7Impact": "NONE",
+        "brokerOrSidecarStateMutation": False,
+        "unknownOrUnclassifiedRows": 0,
+    }
+    result["evidenceHashBasis"] = "CANONICAL_JSON_WITHOUT_EVIDENCE_HASH"
+    result["evidenceSha256"] = _canonical_sha256(result)
+    return result
 
 
 def _finra(client: _BoundedClient, client_id: str, client_secret: str) -> dict[str, Any]:
@@ -553,7 +788,12 @@ def collect_sec_finra_shadow_evidence(
     sec_rows = [_sec_family(client, sec_user_agent, contract) for contract in SEC_FAMILIES]
     finra = _finra(client, finra_client_id, finra_client_secret)
     complete = all(
-        row["status"] in {"SOURCE_OBSERVATION_PASS", "NO_CURRENT_FILING_DISCOVERED"}
+        row["status"]
+        in {
+            "SOURCE_OBSERVATION_PASS",
+            "NO_CURRENT_FILING_DISCOVERED",
+            "NO_CURRENT_ALLOWED_FORM_DISCOVERED",
+        }
         for row in sec_rows
     ) and finra["status"] == "SOURCE_OBSERVATION_PASS"
     result = {

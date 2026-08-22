@@ -12,6 +12,9 @@ from zoneinfo import ZoneInfo
 
 COLLECTION_WINDOW_BASIS = "AMERICA_NEW_YORK_PUBLICATION_DATE"
 COLLECTION_WINDOW_TIMEZONE = ZoneInfo("America/New_York")
+PRE_PERSISTENCE_ARTIFACT_HASH_BASIS = (
+    "PRE_PERSISTENCE_COLLECTION_EVIDENCE"
+)
 
 
 def canonical_sha256(value: Any) -> str:
@@ -236,6 +239,11 @@ def build_durable_collection_sentinel(
         "reservedAt": reserved_at,
         "completedAt": completed_at,
         "artifactSha256": artifact_sha256,
+        "artifactHashBasis": (
+            PRE_PERSISTENCE_ARTIFACT_HASH_BASIS
+            if artifact_sha256 is not None
+            else None
+        ),
         "requestCounts": {
             key: int(value)
             for key, value in sorted((request_counts or {}).items())
@@ -259,6 +267,19 @@ def classify_durable_collection_sentinel(
         return "DURABLE_SENTINEL_MISSING"
     hashed = dict(sentinel)
     sentinel_sha256 = str(hashed.pop("sentinelSha256", ""))
+    artifact_sha256 = sentinel.get("artifactSha256")
+    artifact_hash_basis = sentinel.get("artifactHashBasis")
+    terminal_artifact_hash_valid = (
+        sentinel.get("status") == "IN_PROGRESS"
+        and artifact_sha256 is None
+        and artifact_hash_basis is None
+    ) or (
+        sentinel.get("status") in {"COMPLETE", "FAILED"}
+        and re.fullmatch(r"[0-9a-f]{64}", str(artifact_sha256 or ""))
+        is not None
+        and artifact_hash_basis
+        in {None, PRE_PERSISTENCE_ARTIFACT_HASH_BASIS}
+    )
     valid = (
         sentinel.get("schemaVersion") == "official-shadow-durable-sentinel-v1"
         and sentinel.get("sourceFamily") == contract.get("sourceFamily")
@@ -277,6 +298,7 @@ def classify_durable_collection_sentinel(
         and sentinel.get("canonicalSourceChanged") is False
         and sentinel.get("policyImpact") == "NONE_REPORT_ONLY"
         and sentinel.get("brokerOrSidecarStateMutation") is False
+        and terminal_artifact_hash_valid
         and sentinel.get("sentinelHashBasis")
         == "CANONICAL_JSON_WITHOUT_SENTINEL_HASH"
         and re.fullmatch(r"[0-9a-f]{64}", sentinel_sha256) is not None
@@ -353,6 +375,11 @@ def finish_collection_sentinel(
             "status": status,
             "completedAt": completed_at,
             "artifactSha256": artifact_sha256,
+            "artifactHashBasis": (
+                PRE_PERSISTENCE_ARTIFACT_HASH_BASIS
+                if artifact_sha256 is not None
+                else None
+            ),
             "requestCounts": {
                 key: int(value) for key, value in sorted(request_counts.items())
             },

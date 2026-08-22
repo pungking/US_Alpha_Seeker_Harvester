@@ -45,10 +45,11 @@ class FakeResponse:
         return self._payload
 
 
-def _atom(cik: str, accession: str) -> bytes:
+def _atom(cik: str, accession: str, form: str) -> bytes:
     digits = accession.replace("-", "")
     return (
-        '<feed xmlns="http://www.w3.org/2005/Atom"><entry><link href="'
+        '<feed xmlns="http://www.w3.org/2005/Atom"><entry>'
+        f'<category term="{form}"/><link href="'
         f"https://www.sec.gov/Archives/edgar/data/{cik}/{digits}/"
         f'{accession}-index.htm"/></entry></feed>'
     ).encode("utf-8")
@@ -89,7 +90,7 @@ class FakeSession:
             if form_filter == "4":
                 return FakeResponse(
                     200,
-                    _atom("123", "0000000123-26-000001"),
+                    _atom("123", "0000000123-26-000001", "4"),
                     content_type="application/atom+xml",
                 )
             if form_filter == "SC 13":
@@ -100,7 +101,7 @@ class FakeSession:
                 )
             return FakeResponse(
                 200,
-                _atom("456", "0000000456-26-000002"),
+                _atom("456", "0000000456-26-000002", "13F-HR"),
                 content_type="application/atom+xml",
             )
         if "submissions/CIK0000000123" in url:
