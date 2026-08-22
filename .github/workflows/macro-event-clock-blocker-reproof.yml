@@ -1,0 +1,70 @@
+name: Macro Event Clock Blocker-only Reproof
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: "Exact blocker-only reproof approval phrase"
+        required: true
+        type: string
+      bea_activation_confirmed:
+        description: "Operator confirmed BEA key activation"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  approval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify explicit approval and BEA activation
+        env:
+          APPROVAL: ${{ inputs.approval }}
+          BEA_ACTIVATION_CONFIRMED: ${{ inputs.bea_activation_confirmed }}
+        run: |
+          test "$APPROVAL" = "AUTHORIZE MACRO EVENT CLOCK BLOCKER-ONLY REPROOF"
+          test "$BEA_ACTIVATION_CONFIRMED" = "true"
+
+  probe:
+    needs: approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install bounded client dependency
+        run: python -m pip install requests
+
+      - name: Verify blocker-only static contract
+        run: python scripts/check_macro_event_clock_blocker_reproof.py
+
+      - name: Run bounded blocker-only reproof
+        env:
+          APPROVAL: ${{ inputs.approval }}
+          BEA_API_KEY: ${{ secrets.BEA_API_KEY }}
+        run: |
+          python scripts/run_macro_event_clock_capability_probe.py \
+            --blocker-only \
+            --approval "$APPROVAL" \
+            --bea-activation-confirmed \
+            --output "$RUNNER_TEMP/macro-event-clock-blocker-reproof.json" \
+            --sentinel "$RUNNER_TEMP/macro-event-clock-blocker-reproof-sentinel.json"
+
+      - name: Upload safe aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: macro-event-clock-blocker-reproof-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/macro-event-clock-blocker-reproof.json
+            ${{ runner.temp }}/macro-event-clock-blocker-reproof-sentinel.json
+          if-no-files-found: warn
