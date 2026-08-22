@@ -44,6 +44,23 @@ BLOCKER_ONLY_REQUEST_BUDGETS = {
     "beaData": 1,
 }
 BLOCKER_ONLY_BASELINE_RUN_ID = "32541234706"
+BLS_REGISTERED_SCHEMA_VERSION = "bls-registered-data-capability-v1"
+BLS_REGISTERED_PASS_STATUS = "BLS_REGISTERED_DATA_API_PASS"
+BLS_REGISTERED_APPROVAL = "AUTHORIZE BLS REGISTERED DATA API ONE-SHOT"
+BLS_REGISTERED_REQUEST_BUDGETS = {
+    "blsRegisteredData": 1,
+    "blsIcal": 0,
+    "blsHtmlFallback": 0,
+    "blsData": 0,
+    "federalReserveCalendar": 0,
+    "beaMetadata": 0,
+    "beaData": 0,
+    "fredMetadata": 0,
+    "fredData": 0,
+    "sec": 0,
+    "finra": 0,
+    "toss": 0,
+}
 
 
 def _utc_now() -> str:
@@ -912,6 +929,163 @@ def collect_macro_event_clock_blocker_reproof(
     )
 
 
+def _bls_registered_result(
+    *,
+    retrieved_at: str,
+    client: _BoundedClient,
+    status: str,
+    primary_blocker: str | None,
+    evidence: Mapping[str, Any] | None = None,
+    series_rows: int = 0,
+    observation_rows: int = 0,
+    catalog_rows: int = 0,
+    effective_period_rows: int = 0,
+    registration_key_used: bool = False,
+) -> dict[str, Any]:
+    response = dict(evidence or {})
+    result = {
+        "schemaVersion": BLS_REGISTERED_SCHEMA_VERSION,
+        "status": status,
+        "primaryBlocker": primary_blocker,
+        "mode": "SHADOW_ONLY_REGISTERED_DATA_PROBE",
+        "retrievedAt": retrieved_at,
+        "requestBudgets": BLS_REGISTERED_REQUEST_BUDGETS,
+        "requestCounts": dict(client.counts),
+        "externalRequestCount": sum(client.counts.values()),
+        "requestBudgetCompliant": all(
+            client.counts[key] <= BLS_REGISTERED_REQUEST_BUDGETS[key]
+            for key in BLS_REGISTERED_REQUEST_BUDGETS
+        ),
+        "httpStatusCategory": response.get("httpStatusCategory"),
+        "responseSha256": response.get("responseSha256"),
+        "seriesRows": series_rows,
+        "observationRows": observation_rows,
+        "catalogPresentRows": catalog_rows,
+        "effectivePeriodRows": effective_period_rows,
+        "publicationTimestampAvailable": False,
+        "registrationKeyUsed": registration_key_used,
+        "calendarStatus": "BLS_CALENDAR_SOURCE_ACCESS_BLOCKED",
+        "unknownOrUnclassifiedRows": 0,
+        "analysisEligible": False,
+        "analysisContinued": True,
+        "canonicalSourceChanged": False,
+        "policyImpact": "NONE_REPORT_ONLY",
+        "stage4To7Impact": "NONE",
+        "rawResponseStored": False,
+        "secretStoredOrPrinted": False,
+        "paginationUsed": False,
+        "retryCount": 0,
+        "recurringProviderEnabled": False,
+        "accountHeaderUsed": False,
+        "accountEndpointUsed": False,
+        "orderEndpointUsed": False,
+        "brokerOrSidecarStateMutation": False,
+    }
+    result["evidenceSha256"] = _canonical_sha256(result)
+    result["evidenceHashBasis"] = "CANONICAL_JSON_WITHOUT_EVIDENCE_HASH"
+    return result
+
+
+def collect_bls_registered_data_capability(
+    *,
+    session: Any,
+    environment: Mapping[str, Any],
+    retrieved_at: str,
+) -> dict[str, Any]:
+    if _parse_timestamp(retrieved_at) is None:
+        raise ValueError("invalid_retrieved_at")
+    client = _BoundedClient(session, BLS_REGISTERED_REQUEST_BUDGETS)
+    if not _configured(environment.get("BLS_API_KEY")):
+        return _bls_registered_result(
+            retrieved_at=retrieved_at,
+            client=client,
+            status="BLS_REGISTRATION_KEY_NOT_VISIBLE_LOCALLY",
+            primary_blocker="BLS_REGISTRATION_KEY_NOT_VISIBLE_LOCALLY",
+        )
+    response, _, evidence = client.request(
+        "blsRegisteredData",
+        "POST",
+        "https://api.bls.gov/publicAPI/v2/timeseries/data/",
+        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+        json={
+            "seriesid": [BLS_CAPABILITY_SERIES_ID],
+            "catalog": True,
+            "registrationkey": str(environment["BLS_API_KEY"]),
+        },
+    )
+    status_code = response.status_code if response is not None else None
+    if status_code in {401, 403}:
+        status = "BLS_AUTH_OR_REGISTRATION_BLOCKED"
+    elif status_code == 429:
+        status = "BLS_REGISTERED_API_RATE_LIMITED"
+    elif response is None or (status_code is not None and status_code >= 500):
+        status = "BLS_REGISTERED_API_TRANSIENT_FAILURE"
+    elif status_code is None or not 200 <= status_code < 300 or evidence["redirected"]:
+        status = "BLS_REGISTERED_API_SCHEMA_INVALID"
+    else:
+        status = ""
+    if status:
+        return _bls_registered_result(
+            retrieved_at=retrieved_at,
+            client=client,
+            status=status,
+            primary_blocker=status,
+            evidence=evidence,
+            registration_key_used=True,
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    results = payload.get("Results") if isinstance(payload, dict) else None
+    series = results.get("series") if isinstance(results, dict) else None
+    rows = series if isinstance(series, list) else []
+    matching_rows = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("seriesID") == BLS_CAPABILITY_SERIES_ID
+    ]
+    observations = [
+        item
+        for row in matching_rows
+        for item in (row.get("data") if isinstance(row.get("data"), list) else [])
+        if isinstance(item, dict)
+    ]
+    catalog_rows = sum(
+        isinstance(row.get("catalog"), dict) and bool(row["catalog"])
+        for row in matching_rows
+    )
+    effective_period_rows = sum(
+        bool(item.get("year")) and bool(item.get("period")) for item in observations
+    )
+    valid = (
+        isinstance(payload, dict)
+        and payload.get("status") == "REQUEST_SUCCEEDED"
+        and len(matching_rows) == 1
+        and catalog_rows == 1
+        and bool(observations)
+        and effective_period_rows == len(observations)
+    )
+    status = (
+        BLS_REGISTERED_PASS_STATUS
+        if valid
+        else "BLS_REGISTERED_API_SCHEMA_INVALID"
+    )
+    return _bls_registered_result(
+        retrieved_at=retrieved_at,
+        client=client,
+        status=status,
+        primary_blocker=None if valid else status,
+        evidence=evidence,
+        series_rows=len(matching_rows),
+        observation_rows=len(observations),
+        catalog_rows=catalog_rows,
+        effective_period_rows=effective_period_rows,
+        registration_key_used=True,
+    )
+
+
 def collect_macro_event_clock_capability(
     *,
     session: Any,
@@ -1069,14 +1243,85 @@ def run_macro_event_clock_blocker_reproof(
     return result
 
 
+def run_bls_registered_data_capability_probe(
+    *,
+    session: Any,
+    environment: Mapping[str, Any],
+    output_path: Path,
+    sentinel_path: Path,
+    retrieved_at: str,
+    approval: str,
+) -> dict[str, Any]:
+    if approval != BLS_REGISTERED_APPROVAL:
+        raise ValueError("bls_registered_approval_required")
+    if output_path.exists():
+        raise FileExistsError(output_path)
+    sentinel_schema = "bls-registered-data-capability-sentinel-v1"
+    _reserve_sentinel(
+        sentinel_path,
+        retrieved_at,
+        request_budgets=BLS_REGISTERED_REQUEST_BUDGETS,
+        schema_version=sentinel_schema,
+    )
+    try:
+        result = collect_bls_registered_data_capability(
+            session=session,
+            environment=environment,
+            retrieved_at=retrieved_at,
+        )
+    except Exception as exc:
+        _atomic_write_json(
+            sentinel_path,
+            {
+                "schemaVersion": sentinel_schema,
+                "status": "FAILED",
+                "reservedAt": retrieved_at,
+                "completedAt": _utc_now(),
+                "safeErrorCategory": type(exc).__name__,
+            },
+        )
+        raise
+    _atomic_write_json(output_path, result)
+    _atomic_write_json(
+        sentinel_path,
+        {
+            "schemaVersion": sentinel_schema,
+            "status": "COMPLETE",
+            "reservedAt": retrieved_at,
+            "completedAt": _utc_now(),
+            "requestCounts": result["requestCounts"],
+            "resultSha256": _sha256(output_path.read_bytes()),
+        },
+    )
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sentinel", type=Path, required=True)
     parser.add_argument("--blocker-only", action="store_true")
+    parser.add_argument("--bls-registered-only", action="store_true")
     parser.add_argument("--approval", default="")
     parser.add_argument("--bea-activation-confirmed", action="store_true")
     args = parser.parse_args()
+    if args.blocker_only and args.bls_registered_only:
+        parser.error("probe modes are mutually exclusive")
+    if args.bls_registered_only:
+        result = run_bls_registered_data_capability_probe(
+            session=requests.Session(),
+            environment=os.environ,
+            output_path=args.output,
+            sentinel_path=args.sentinel,
+            retrieved_at=_utc_now(),
+            approval=args.approval,
+        )
+        print(
+            "[BLS_REGISTERED_DATA_CAPABILITY] "
+            f"status={result['status']} requests={result['externalRequestCount']} "
+            f"unknown={result['unknownOrUnclassifiedRows']} rawStored=false"
+        )
+        return 0 if result["status"] == BLS_REGISTERED_PASS_STATUS else 2
     if args.blocker_only:
         result = run_macro_event_clock_blocker_reproof(
             session=requests.Session(),
