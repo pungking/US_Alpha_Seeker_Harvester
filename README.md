@@ -231,8 +231,10 @@ Timestamp-shape diagnostics also separate an absent key, documented `null`,
 blank text, an unparseable value, and a valid offset-aware value. They persist
 only counts, per-batch reconciliation, safe JSON type counts, and SHA-256 hashes
 of sorted response key sets. They never persist timestamp values, symbols, or
-raw responses. The strict all-row timestamp gate remains unchanged pending the
-report-only policy decision in `TOSS_PRICE_TIMESTAMP_POLICY_REVIEW.md`.
+raw responses. `timestampSliceCounts` additionally separates valid report-only,
+documented nullable, malformed, local-clock-reference, and provider-clock
+slices. This does not promote the valid slice: the strict run-level exclusion
+and canonical-source policy remain unchanged.
 HTTP 2xx timestamp omissions never use auth or egress guidance in Telegram:
 documented optional/null shapes point to policy review, while blank or
 unparseable values point to the provider timestamp-format contract.
@@ -298,6 +300,10 @@ with zero Toss requests, and preserves failed/in-progress sentinels instead of
 automatically retrying. Drive publication archives the previous and current
 shadow before replacing `TOSS_MARKET_DATA_SHADOW.json`; publication failure
 leaves canonical Google Drive/yfinance analysis fail-open and excludes Toss.
+After a terminal collection or persisted alert receipt, later no-op polls do
+not replace the local current artifact. They preserve a matching terminal copy
+or restore the Drive terminal copy once when the local file is absent or stale;
+no-op status remains stdout-only and does not resend Telegram.
 
 No recurring `launchd` job is installed by this repository change. Activation
 requires a separate approval, server-side secret loading, the registered Mac

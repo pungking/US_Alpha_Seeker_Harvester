@@ -1,6 +1,6 @@
 # Toss Price Timestamp Policy Review
 
-Status: `DOCUMENTED_NULLABLE_TIMESTAMP_POLICY_REVIEW_REQUIRED`
+Status: `TOSS_NULLABLE_VALID_SLICE_STATIC_READY`
 
 This package is report-only. It does not authorize a Toss request, a source
 promotion, a timestamp fallback, or a Stage6 policy change.
@@ -18,18 +18,18 @@ The description states that it can be null when no trade has occurred.
 
 ## Runtime evidence and limit
 
-Natural Harvester run `31691710767` returned all 300 requested rows. The current
-parser accepted 192 timestamps and grouped 108 remaining rows under
-`price_timestamp_missing`. Because it used `row.get("timestamp")`, the preserved
-aggregate evidence cannot distinguish an absent key, null, blank text, or an
-unparseable value. The current row-level cause is therefore
-`SAFE_EVIDENCE_INSUFFICIENT`; this is not evidence of a parser field defect or a
-provider contract violation.
+The preserved natural aggregate returned all 300 requested rows: 257 had a
+parseable payload timestamp and 43 carried documented `null`; absent, blank,
+unparseable, and unknown rows were zero. Six of the parseable rows were after
+the local receipt but no later than the HTTP `Date`, so they remain excluded as
+`LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE`. The resulting report-only valid
+slice is 251 rows. HTTP `Date`, local receipt, and `retrievedAt` remain diagnostic
+references only.
 
-The aggregate Telegram alert was delivered, while the published Drive artifact
-still recorded `ALERT_PENDING_POST_PUBLISH`. That is separately classified as
-`ALERT_DELIVERED_RECEIPT_NOT_PERSISTED`; it is not a timestamp root cause and is
-not changed by this package.
+The aggregate alert receipt is persisted in both local and Drive evidence. A
+later no-op collector poll must preserve that terminal local artifact rather
+than replace it with `NOT_RUN`; this durability rule does not change the
+timestamp classification.
 
 ## Current policy
 
@@ -45,10 +45,10 @@ names, per-batch reconciliation, and SHA-256 hashes of sorted response key sets.
 They store no timestamp values, symbols, IP addresses, credentials, or raw
 responses.
 
-## Deferred policy decision
+## Runtime proof
 
-After one previously unseen natural Stage3 collector run captures complete
-aggregate diagnostics, review whether documented null rows should remain a
-run-level exclusion or become a separately excluded, non-comparable shadow
-slice. That review must preserve point-in-time evidence and must not promote a
-row without a provider payload timestamp. No policy migration is approved here.
+The additive slice and terminal-retention contracts are statically verified.
+Their post-merge runtime proof remains limited to the first previously unseen
+natural Stage3 chain. Until then, strict run-level exclusion remains in force;
+no row without a provider payload timestamp is promoted.
+No policy migration is approved here.

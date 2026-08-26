@@ -280,6 +280,142 @@ def main() -> int:
         harvester_module.write_json_report = original_write
         harvester_module.send_telegram = original_send
 
+    terminal_shadow = json.loads(json.dumps(shadow))
+    terminal_shadow.update(
+        {
+            "status": "TOSS_SHADOW_STALE_OR_PARTIAL",
+            "eligible": False,
+            "tossEvidenceExcluded": True,
+            "analysisContinued": True,
+            "prices": [],
+            "runtimeAction": "COLLECTED_REGISTERED_MAC_SHADOW",
+            "alertDelivery": {
+                "status": "ALERT_DELIVERED",
+                "alertType": "TOSS_SHADOW_FAILURE",
+                "alertFingerprint": "e" * 64,
+                "safeErrorCategory": None,
+                "attempted": True,
+                "delivered": True,
+                "duplicateSuppressed": False,
+                "receiptPersistenceStatus": "ALERT_RECEIPT_PERSISTED",
+                "localArtifactPersisted": True,
+                "driveArtifactPersisted": True,
+            },
+        }
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        local_path = Path(temp_dir) / "toss-market-data-shadow.json"
+        original_path = harvester_module.HARVESTER_TOSS_SHADOW_PATH
+        original_load_scope = harvester_module.load_stage3_shadow_handoff_scope
+        original_find = harvester_module.find_file_id
+        original_download = harvester_module.download_json
+        original_runtime_decision = harvester_module.toss_shadow_runtime_decision
+        original_write = harvester_module.write_json_report
+        original_send = harvester_module.send_telegram
+        write_count = 0
+
+        def counted_write(path: str, payload: object, label: str) -> None:
+            nonlocal write_count
+            write_count += 1
+            original_write(path, payload, label)
+
+        try:
+            harvester_module.HARVESTER_TOSS_SHADOW_PATH = str(local_path)
+            harvester_module.toss_shadow_runtime_decision = lambda _env: (
+                True,
+                "registered_server_runtime_enabled",
+            )
+            harvester_module.find_file_id = lambda name, _parent=None: {
+                "US_Alpha_Seeker": "root-id",
+                "System_Identity_Maps": "system-id",
+                "TOSS_MARKET_DATA_SHADOW.json": "shadow-id",
+            }.get(name)
+            harvester_module.download_json = lambda _file_id: terminal_shadow
+            harvester_module.load_stage3_shadow_handoff_scope = (
+                lambda *_args, **_kwargs: {
+                    "status": "STAGE4_ORDERING_WINDOW_CLOSED",
+                    "symbols": [],
+                    "sourceArtifact": None,
+                }
+            )
+            harvester_module.write_json_report = counted_write
+            harvester_module.send_telegram = lambda *_args, **_kwargs: (
+                _ for _ in ()
+            ).throw(AssertionError("no-op poll must not send Telegram"))
+
+            original_write(
+                str(local_path), terminal_shadow, "terminal fixture"
+            )
+            terminal_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
+            for _ in range(3):
+                blocked = harvester_module.run_toss_same_stage3_collector()
+                assert blocked["runtimeAction"] == "PRE_NETWORK_HANDOFF_BLOCKED"
+                assert blocked["requestCounts"] == {
+                    "oauth": 0,
+                    "marketCalendar": 0,
+                    "prices": 0,
+                }
+                assert blocked["localArtifactRetentionStatus"] == (
+                    "TERMINAL_LOCAL_ARTIFACT_PRESERVED"
+                )
+            assert write_count == 0
+            assert hashlib.sha256(local_path.read_bytes()).hexdigest() == terminal_hash
+            assert json.loads(local_path.read_text(encoding="utf-8"))[
+                "alertDelivery"
+            ] == terminal_shadow["alertDelivery"]
+
+            local_path.unlink()
+            restored = harvester_module.run_toss_same_stage3_collector()
+            assert restored["localArtifactRetentionStatus"] == (
+                "TERMINAL_LOCAL_ARTIFACT_RESTORED"
+            )
+            assert write_count == 1
+            assert json.loads(local_path.read_text(encoding="utf-8")) == terminal_shadow
+            harvester_module.run_toss_same_stage3_collector()
+            assert write_count == 1
+
+            for action in (
+                "DUPLICATE_OR_FAILED_SENTINEL_PRESERVED",
+                "EXISTING_MATCHED_SHADOW_REUSED",
+            ):
+                no_op = {
+                    "status": "NOT_RUN",
+                    "runtimeAction": action,
+                    "requestCounts": {
+                        "oauth": 0,
+                        "marketCalendar": 0,
+                        "prices": 0,
+                    },
+                }
+                assert harvester_module._persist_toss_collector_result(
+                    no_op, terminal_shadow, "no-op fixture"
+                ) == "TERMINAL_LOCAL_ARTIFACT_PRESERVED"
+            assert write_count == 1
+
+            local_path.unlink()
+            diagnostic = {
+                "status": "NOT_RUN",
+                "runtimeAction": "PRE_NETWORK_HANDOFF_BLOCKED",
+                "requestCounts": {
+                    "oauth": 0,
+                    "marketCalendar": 0,
+                    "prices": 0,
+                },
+            }
+            assert harvester_module._persist_toss_collector_result(
+                diagnostic, None, "initial diagnostic fixture"
+            ) == "DIAGNOSTIC_LOCAL_ARTIFACT_WRITTEN"
+            assert write_count == 2
+            assert json.loads(local_path.read_text(encoding="utf-8")) == diagnostic
+        finally:
+            harvester_module.HARVESTER_TOSS_SHADOW_PATH = original_path
+            harvester_module.load_stage3_shadow_handoff_scope = original_load_scope
+            harvester_module.find_file_id = original_find
+            harvester_module.download_json = original_download
+            harvester_module.toss_shadow_runtime_decision = original_runtime_decision
+            harvester_module.write_json_report = original_write
+            harvester_module.send_telegram = original_send
+
     with tempfile.TemporaryDirectory() as temp_dir:
         first = reserve_same_stage3_sentinel(
             Path(temp_dir), key, source_artifact, "2026-08-13T00:00:02Z"
