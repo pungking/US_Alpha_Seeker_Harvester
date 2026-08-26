@@ -778,6 +778,24 @@ def _base_result(
                 "BLANK": 0,
                 "UNPARSEABLE": 0,
             },
+            "timestampSliceCounts": {
+                "TOSS_TIMESTAMP_VALID_REPORT_ONLY": 0,
+                "TOSS_TIMESTAMP_DOCUMENTED_NULL_EXCLUDED": 0,
+                "TOSS_TIMESTAMP_OPTIONAL_ABSENT_EXCLUDED": 0,
+                "TOSS_TIMESTAMP_BLANK_EXCLUDED": 0,
+                "TOSS_TIMESTAMP_UNPARSEABLE_EXCLUDED": 0,
+                "TOSS_TIMESTAMP_LOCAL_CLOCK_REFERENCE_EXCLUDED": 0,
+                "TOSS_TIMESTAMP_PROVIDER_CLOCK_VIOLATION_EXCLUDED": 0,
+            },
+            "timestampSliceRows": 0,
+            "timestampSliceCountMatches": True,
+            "timestampSliceUnknownOrUnclassifiedRows": 0,
+            "validReportOnlyRows": 0,
+            "documentedNullableExcludedRows": 0,
+            "localClockReferenceExcludedRows": 0,
+            "timestampFallbackUsed": False,
+            "clockToleranceApplied": False,
+            "macClockSyncStatus": "MAC_CLOCK_SYNC_UNVERIFIED",
             "timestampTypeCounts": {},
             "responseShapeFingerprintCounts": {},
             "missingTimestampRowsByBatch": [],
@@ -1621,6 +1639,36 @@ def collect_toss_shadow_market_data(
         == timestamp_returned_rows
     )
     timestamp_unknown_rows = abs(timestamp_returned_rows - timestamp_evaluated_rows)
+    local_clock_reference_rows = root_cause_counts[
+        "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"
+    ]
+    provider_clock_violation_rows = (
+        future_timestamp_rows
+        - local_clock_reference_rows
+        + out_of_calendar_date_rows
+    )
+    valid_report_only_rows = (
+        timestamp_parseable_rows
+        - future_timestamp_rows
+        - out_of_calendar_date_rows
+    )
+    timestamp_slice_counts = {
+        "TOSS_TIMESTAMP_VALID_REPORT_ONLY": valid_report_only_rows,
+        "TOSS_TIMESTAMP_DOCUMENTED_NULL_EXCLUDED": timestamp_null_rows,
+        "TOSS_TIMESTAMP_OPTIONAL_ABSENT_EXCLUDED": timestamp_field_absent_rows,
+        "TOSS_TIMESTAMP_BLANK_EXCLUDED": timestamp_blank_rows,
+        "TOSS_TIMESTAMP_UNPARSEABLE_EXCLUDED": timestamp_unparseable_rows,
+        "TOSS_TIMESTAMP_LOCAL_CLOCK_REFERENCE_EXCLUDED": (
+            local_clock_reference_rows
+        ),
+        "TOSS_TIMESTAMP_PROVIDER_CLOCK_VIOLATION_EXCLUDED": (
+            provider_clock_violation_rows
+        ),
+    }
+    timestamp_slice_rows = sum(timestamp_slice_counts.values())
+    timestamp_slice_unknown_rows = abs(
+        timestamp_returned_rows - timestamp_slice_rows
+    )
     timestamp_failure_causes = [
         cause
         for count, cause in (
@@ -1660,6 +1708,18 @@ def collect_toss_shadow_market_data(
         "timestampParseableRows": timestamp_parseable_rows,
         "timestampUnparseableRows": timestamp_unparseable_rows,
         "timestampCategoryCounts": timestamp_category_counts,
+        "timestampSliceCounts": timestamp_slice_counts,
+        "timestampSliceRows": timestamp_slice_rows,
+        "timestampSliceCountMatches": (
+            timestamp_slice_rows == timestamp_returned_rows
+        ),
+        "timestampSliceUnknownOrUnclassifiedRows": timestamp_slice_unknown_rows,
+        "validReportOnlyRows": valid_report_only_rows,
+        "documentedNullableExcludedRows": timestamp_null_rows,
+        "localClockReferenceExcludedRows": local_clock_reference_rows,
+        "timestampFallbackUsed": False,
+        "clockToleranceApplied": False,
+        "macClockSyncStatus": "MAC_CLOCK_SYNC_UNVERIFIED",
         "timestampTypeCounts": dict(sorted(timestamp_type_counts.items())),
         "responseShapeFingerprintCounts": dict(
             sorted(response_shape_fingerprint_counts.items())
@@ -2001,21 +2061,48 @@ def dispatch_toss_shadow_alert(
     else:
         error_category = result.get("safeErrorCategory")
         timestamp_cause_line = ""
+        timestamp_slice_line = ""
+        diagnostics = result.get("diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
+        category_counts = diagnostics.get("timestampCategoryCounts")
+        category_counts = (
+            category_counts if isinstance(category_counts, Mapping) else {}
+        )
+        slice_counts = diagnostics.get("timestampSliceCounts")
+        slice_counts = slice_counts if isinstance(slice_counts, Mapping) else {}
+        blank_or_unparseable = sum(
+            int(category_counts.get(key, 0) or 0)
+            for key in ("BLANK", "UNPARSEABLE")
+        )
+        optional_or_nullable = sum(
+            int(category_counts.get(key, 0) or 0)
+            for key in ("OPTIONAL_ABSENT", "NULL")
+        )
+        local_clock_rows = int(
+            slice_counts.get("TOSS_TIMESTAMP_LOCAL_CLOCK_REFERENCE_EXCLUDED", 0)
+            or 0
+        )
+        provider_clock_rows = int(
+            slice_counts.get(
+                "TOSS_TIMESTAMP_PROVIDER_CLOCK_VIOLATION_EXCLUDED", 0
+            )
+            or 0
+        )
+        if local_clock_rows > 0:
+            timestamp_slice = (
+                "DOCUMENTED_NULLABLE_WITH_LOCAL_CLOCK_REFERENCE"
+                if optional_or_nullable > 0
+                else "LOCAL_CLOCK_REFERENCE_ANOMALY"
+            )
+            timestamp_slice_line = f"TimestampSlice: `{timestamp_slice}`\n"
+        elif provider_clock_rows > 0:
+            timestamp_slice_line = "TimestampSlice: `PROVIDER_CLOCK_VIOLATION`\n"
+        elif blank_or_unparseable > 0:
+            timestamp_slice_line = "TimestampSlice: `TIMESTAMP_FORMAT_VIOLATION`\n"
+        elif optional_or_nullable > 0:
+            timestamp_slice_line = "TimestampSlice: `DOCUMENTED_NULLABLE_ONLY`\n"
+
         if error_category == "price_timestamp_missing":
-            diagnostics = result.get("diagnostics")
-            diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
-            category_counts = diagnostics.get("timestampCategoryCounts")
-            category_counts = (
-                category_counts if isinstance(category_counts, Mapping) else {}
-            )
-            blank_or_unparseable = sum(
-                int(category_counts.get(key, 0) or 0)
-                for key in ("BLANK", "UNPARSEABLE")
-            )
-            optional_or_nullable = sum(
-                int(category_counts.get(key, 0) or 0)
-                for key in ("OPTIONAL_ABSENT", "NULL")
-            )
             timestamp_cause = str(
                 diagnostics.get("timestampDiagnosticPrimaryCause")
                 or "SAFE_EVIDENCE_INSUFFICIENT"
@@ -2037,6 +2124,17 @@ def dispatch_toss_shadow_alert(
                     "review provider timestamp format contract; keep Toss evidence "
                     "excluded"
                 )
+            elif local_clock_rows > 0:
+                next_action = (
+                    "review documented optional/nullable timestamp policy and verify "
+                    "Mac clock synchronization without compensation; keep Toss "
+                    "evidence excluded"
+                )
+            elif provider_clock_rows > 0:
+                next_action = (
+                    "review documented optional/nullable timestamp policy and provider "
+                    "clock contract; keep Toss evidence excluded"
+                )
             elif (
                 optional_or_nullable > 0
                 and diagnostics.get("timestampDiagnosticCountMatches") is True
@@ -2054,6 +2152,15 @@ def dispatch_toss_shadow_alert(
                     "verify aggregate timestamp classification contract; keep Toss "
                     "evidence excluded"
                 )
+        elif local_clock_rows > 0:
+            next_action = (
+                "verify Mac clock synchronization without compensation; keep Toss "
+                "evidence excluded"
+            )
+        elif provider_clock_rows > 0:
+            next_action = (
+                "review provider timestamp clock contract; keep Toss evidence excluded"
+            )
         elif error_category == "partial_symbol_response":
             next_action = (
                 "verify hashed missing-symbol lineage and provider symbol mapping; "
@@ -2071,6 +2178,7 @@ def dispatch_toss_shadow_alert(
             f"EndpointGroup: `{result.get('affectedEndpointGroup') or 'unknown'}`\n"
             f"ClockReference: `{clock_summary.get('clockReferenceStatus') or 'not_available'}`\n"
             f"{timestamp_cause_line}"
+            f"{timestamp_slice_line}"
             f"AffectedRows: `{affected_rows}`\n"
             f"OffsetMs: `{offset_range}`\n"
             "Requests: "

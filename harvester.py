@@ -31,6 +31,8 @@ from scripts.toss_read_only_capability import (
     probe_toss_read_only_capability,
 )
 from scripts.toss_shadow_market_data import (
+    FAILURE_STATUSES as TOSS_SHADOW_FAILURE_STATUSES,
+    PASS_STATUS as TOSS_SHADOW_PASS_STATUS,
     SCHEMA_VERSION as TOSS_SHADOW_MARKET_DATA_SCHEMA_VERSION,
     build_same_stage3_readiness,
     build_stage3_request_scope,
@@ -1336,6 +1338,62 @@ def _toss_shadow_not_run_result(reason: str) -> dict[str, Any]:
     }
 
 
+def _is_terminal_toss_shadow(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    delivery = payload.get("alertDelivery")
+    receipt_persisted = (
+        isinstance(delivery, Mapping)
+        and delivery.get("receiptPersistenceStatus") == "ALERT_RECEIPT_PERSISTED"
+    )
+    return (
+        payload.get("status") == TOSS_SHADOW_PASS_STATUS
+        or payload.get("status") in TOSS_SHADOW_FAILURE_STATUSES
+        or receipt_persisted
+    )
+
+
+def _persist_toss_collector_result(
+    result: Mapping[str, Any],
+    previous: Any,
+    label: str,
+) -> str:
+    no_op = result.get("runtimeAction") in {
+        "PRE_NETWORK_HANDOFF_BLOCKED",
+        "DUPLICATE_OR_FAILED_SENTINEL_PRESERVED",
+        "EXISTING_MATCHED_SHADOW_REUSED",
+    }
+    if no_op:
+        local: Any = None
+        try:
+            local = json.loads(
+                Path(HARVESTER_TOSS_SHADOW_PATH).read_text(encoding="utf-8")
+            )
+        except (OSError, TypeError, ValueError):
+            local = None
+        if _is_terminal_toss_shadow(previous):
+            if (
+                _is_terminal_toss_shadow(local)
+                and _canonical_sha256(local) == _canonical_sha256(previous)
+            ):
+                return "TERMINAL_LOCAL_ARTIFACT_PRESERVED"
+            write_json_report(
+                HARVESTER_TOSS_SHADOW_PATH,
+                previous,
+                "Toss terminal local artifact restored",
+            )
+            return "TERMINAL_LOCAL_ARTIFACT_RESTORED"
+        if _is_terminal_toss_shadow(local):
+            return "TERMINAL_LOCAL_ARTIFACT_PRESERVED"
+
+    write_json_report(HARVESTER_TOSS_SHADOW_PATH, result, label)
+    return (
+        "DIAGNOSTIC_LOCAL_ARTIFACT_WRITTEN"
+        if no_op
+        else "LOCAL_ARTIFACT_WRITTEN"
+    )
+
+
 def load_stage3_shadow_scope(
     root_id: str,
     *,
@@ -1644,9 +1702,9 @@ def ensure_toss_shadow_market_data(
             existing_shadow=previous,
             collector_enabled=enabled,
         )
-        write_json_report(
-            HARVESTER_TOSS_SHADOW_PATH,
+        result["localArtifactRetentionStatus"] = _persist_toss_collector_result(
             result,
+            previous,
             "Toss same-Stage3 handoff blocked",
         )
         return result
@@ -1671,9 +1729,9 @@ def ensure_toss_shadow_market_data(
                 "runtimeReadiness": readiness,
             }
         )
-        write_json_report(
-            HARVESTER_TOSS_SHADOW_PATH,
+        reused["localArtifactRetentionStatus"] = _persist_toss_collector_result(
             reused,
+            previous,
             "Toss same-Stage3 matched shadow reused",
         )
         return reused
@@ -1704,9 +1762,9 @@ def ensure_toss_shadow_market_data(
                 "runtimeReadiness": readiness,
             }
         )
-        write_json_report(
-            HARVESTER_TOSS_SHADOW_PATH,
+        result["localArtifactRetentionStatus"] = _persist_toss_collector_result(
             result,
+            previous,
             "Toss same-Stage3 duplicate suppressed",
         )
         return result
@@ -1736,9 +1794,9 @@ def ensure_toss_shadow_market_data(
         result.update(
             complete_same_stage3_sentinel(reservation, status="FAILED")
         )
-        write_json_report(
-            HARVESTER_TOSS_SHADOW_PATH,
+        result["localArtifactRetentionStatus"] = _persist_toss_collector_result(
             result,
+            previous,
             "Toss same-Stage3 handoff window closed",
         )
         return result
@@ -1976,9 +2034,9 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
                 request_source_artifact=scope.get("sourceArtifact"),
             )
         try:
-            write_json_report(
-                HARVESTER_TOSS_SHADOW_PATH,
+            result["localArtifactRetentionStatus"] = _persist_toss_collector_result(
                 result,
+                previous,
                 "Toss same-Stage3 collector result",
             )
         except (OSError, TypeError, ValueError) as exc:
@@ -1988,6 +2046,7 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
             "[TOSS_SAME_STAGE3] "
             f"status={result.get('status')} "
             f"action={result.get('runtimeAction')} "
+            f"retention={result.get('localArtifactRetentionStatus')} "
             f"requests={result.get('thisRunRequestCounts') or result.get('requestCounts')}",
             flush=True,
         )

@@ -232,7 +232,7 @@ def main() -> int:
     assert "HTTP 2xx timestamp omissions never use auth or egress guidance" in (
         readme_source
     )
-    assert "DOCUMENTED_NULLABLE_TIMESTAMP_POLICY_REVIEW_REQUIRED" in (
+    assert "TOSS_NULLABLE_VALID_SLICE_STATIC_READY" in (
         policy_review_source
     )
     assert "No policy migration is approved here" in policy_review_source
@@ -406,6 +406,20 @@ def main() -> int:
     )
     assert success_timestamp_diagnostics["timestampDiagnosticCountMatches"] is True
     assert success_timestamp_diagnostics["timestampUnknownOrUnclassifiedRows"] == 0
+    assert success_timestamp_diagnostics["timestampSliceCounts"] == {
+        "TOSS_TIMESTAMP_VALID_REPORT_ONLY": 300,
+        "TOSS_TIMESTAMP_DOCUMENTED_NULL_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_OPTIONAL_ABSENT_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_BLANK_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_UNPARSEABLE_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_LOCAL_CLOCK_REFERENCE_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_PROVIDER_CLOCK_VIOLATION_EXCLUDED": 0,
+    }
+    assert success_timestamp_diagnostics["timestampSliceRows"] == 300
+    assert success_timestamp_diagnostics["timestampSliceCountMatches"] is True
+    assert success_timestamp_diagnostics[
+        "timestampSliceUnknownOrUnclassifiedRows"
+    ] == 0
     assert sum(
         success_timestamp_diagnostics["responseShapeFingerprintCounts"].values()
     ) == 300
@@ -426,6 +440,75 @@ def main() -> int:
     assert "never-persist-this" not in serialized
     assert "client-secret" not in serialized
     assert "Wed, 12 Aug 2026" not in serialized
+
+    nullable_slice_symbols = [f"N{index:03d}" for index in range(300)]
+
+    def nullable_slice_prices(symbols: list[str], _: int) -> _Response:
+        rows = []
+        for symbol in symbols:
+            index = int(symbol[1:])
+            if index < 43:
+                rows.append(_price_row(symbol, timestamp=None))
+            elif index < 49:
+                rows.append(_price_row(symbol, timestamp="2026-08-12T00:00:02Z"))
+            else:
+                rows.append(_price_row(symbol))
+        return _Response(
+            200,
+            {"result": rows},
+            headers={
+                **RATE_HEADERS,
+                "Date": "Wed, 12 Aug 2026 00:00:03 GMT",
+            },
+        )
+
+    nullable_slice = _collect(
+        _Session(prices=nullable_slice_prices), nullable_slice_symbols
+    )
+    nullable_slice_diagnostics = nullable_slice["diagnostics"]
+    assert nullable_slice["status"] == "TOSS_SHADOW_STALE_OR_PARTIAL"
+    assert nullable_slice["safeErrorCategory"] == "price_timestamp_missing"
+    assert nullable_slice["summary"]["requestedRows"] == 300
+    assert nullable_slice["summary"]["matchedRows"] == 251
+    assert nullable_slice["summary"]["missingRows"] == 49
+    assert nullable_slice_diagnostics["timestampCategoryCounts"] == {
+        "BLANK": 0,
+        "NULL": 43,
+        "OPTIONAL_ABSENT": 0,
+        "PRESENT_VALID": 257,
+        "UNPARSEABLE": 0,
+    }
+    assert nullable_slice_diagnostics["futureTimestampRows"] == 6
+    assert nullable_slice_diagnostics["timestampSliceCounts"] == {
+        "TOSS_TIMESTAMP_VALID_REPORT_ONLY": 251,
+        "TOSS_TIMESTAMP_DOCUMENTED_NULL_EXCLUDED": 43,
+        "TOSS_TIMESTAMP_OPTIONAL_ABSENT_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_BLANK_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_UNPARSEABLE_EXCLUDED": 0,
+        "TOSS_TIMESTAMP_LOCAL_CLOCK_REFERENCE_EXCLUDED": 6,
+        "TOSS_TIMESTAMP_PROVIDER_CLOCK_VIOLATION_EXCLUDED": 0,
+    }
+    assert nullable_slice_diagnostics["timestampSliceRows"] == 300
+    assert nullable_slice_diagnostics["timestampSliceCountMatches"] is True
+    assert nullable_slice_diagnostics[
+        "timestampSliceUnknownOrUnclassifiedRows"
+    ] == 0
+    assert nullable_slice_diagnostics["validReportOnlyRows"] == 251
+    assert nullable_slice_diagnostics["documentedNullableExcludedRows"] == 43
+    assert nullable_slice_diagnostics["localClockReferenceExcludedRows"] == 6
+    assert nullable_slice_diagnostics["timestampFallbackUsed"] is False
+    assert nullable_slice_diagnostics["clockToleranceApplied"] is False
+    assert nullable_slice_diagnostics["macClockSyncStatus"] == (
+        "MAC_CLOCK_SYNC_UNVERIFIED"
+    )
+    assert nullable_slice["eligible"] is False
+    assert nullable_slice["tossEvidenceExcluded"] is True
+    assert nullable_slice["canonicalSourceChanged"] is False
+    assert nullable_slice["policyImpact"] == "NONE_REPORT_ONLY"
+    assert nullable_slice["sourceAsOf"] is None
+    assert nullable_slice["prices"] == []
+    nullable_slice_serialized = json.dumps(nullable_slice, sort_keys=True)
+    assert all(symbol not in nullable_slice_serialized for symbol in nullable_slice_symbols)
 
     provider_format = _collect(_Session(), ["CLASS.A", "CLASS-B"])
     assert provider_format["status"] == "TOSS_SHADOW_PASS"
@@ -548,6 +631,9 @@ def main() -> int:
         "CLOCK_DOMAIN_EVIDENCE_INSUFFICIENT": 0,
     }
     assert future["prices"] == []
+    assert future["diagnostics"]["timestampSliceCounts"][
+        "TOSS_TIMESTAMP_PROVIDER_CLOCK_VIOLATION_EXCLUDED"
+    ] == 1
 
     local_clock_behind = _collect(
         _Session(
@@ -567,6 +653,9 @@ def main() -> int:
         )
     )
     local_clock_summary = local_clock_behind["clockDomainEvidence"]["summary"]
+    assert local_clock_behind["diagnostics"]["timestampSliceCounts"][
+        "TOSS_TIMESTAMP_LOCAL_CLOCK_REFERENCE_EXCLUDED"
+    ] == 1
     assert local_clock_summary["clockReferenceStatus"] == (
         "LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE"
     )
@@ -716,6 +805,9 @@ def main() -> int:
     )
     assert missing_timestamp_diagnostics["timestampDiagnosticCountMatches"] is True
     assert missing_timestamp_diagnostics["timestampUnknownOrUnclassifiedRows"] == 0
+    assert missing_timestamp_diagnostics["timestampSliceCounts"][
+        "TOSS_TIMESTAMP_DOCUMENTED_NULL_EXCLUDED"
+    ] == 1
     assert missing_timestamp["sourceAsOf"] is None
     assert missing_timestamp["eligible"] is False
 
@@ -747,6 +839,9 @@ def main() -> int:
     assert absent_diagnostics["timestampDiagnosticPrimaryCause"] == (
         "TIMESTAMP_KEY_ABSENT"
     )
+    assert absent_diagnostics["timestampSliceCounts"][
+        "TOSS_TIMESTAMP_OPTIONAL_ABSENT_EXCLUDED"
+    ] == 1
 
     timestamp_blank = _collect(
         _Session(
@@ -768,6 +863,9 @@ def main() -> int:
     assert blank_diagnostics["timestampDiagnosticPrimaryCause"] == (
         "TIMESTAMP_NULL_OR_BLANK"
     )
+    assert blank_diagnostics["timestampSliceCounts"][
+        "TOSS_TIMESTAMP_BLANK_EXCLUDED"
+    ] == 1
 
     timestamp_unparseable = _collect(
         _Session(
@@ -789,6 +887,9 @@ def main() -> int:
     assert unparseable_diagnostics["timestampDiagnosticPrimaryCause"] == (
         "TIMESTAMP_FORMAT_UNPARSEABLE"
     )
+    assert unparseable_diagnostics["timestampSliceCounts"][
+        "TOSS_TIMESTAMP_UNPARSEABLE_EXCLUDED"
+    ] == 1
 
     def mixed_timestamp_shapes(symbols: list[str], _: int) -> _Response:
         rows = [_price_row(symbol) for symbol in symbols]
@@ -858,6 +959,9 @@ def main() -> int:
     assert outside_calendar["safeErrorCategory"] == "price_timestamp_outside_calendar"
     assert outside_calendar["diagnostics"]["timestampMissingRows"] == 0
     assert outside_calendar["diagnostics"]["futureTimestampRows"] == 0
+    assert outside_calendar["diagnostics"]["timestampSliceCounts"][
+        "TOSS_TIMESTAMP_PROVIDER_CLOCK_VIOLATION_EXCLUDED"
+    ] == 1
     assert outside_calendar["diagnostics"]["outOfCalendarDateRows"] == 1
     assert outside_calendar["diagnostics"]["unreturnedSymbolRows"] == 0
     assert outside_calendar["clockDomainEvidence"]["summary"][
@@ -1160,11 +1264,34 @@ def main() -> int:
     assert "TimestampCause: `DOCUMENTED_NULLABLE_TIMESTAMP`" in (
         nullable_alert_messages[0]
     )
+    assert "TimestampSlice: `DOCUMENTED_NULLABLE_ONLY`" in (
+        nullable_alert_messages[0]
+    )
     assert "review documented optional/nullable timestamp policy" in (
         nullable_alert_messages[0]
     )
     assert "registered egress, credentials, rate limit" not in (
         nullable_alert_messages[0]
+    )
+
+    nullable_clock_alert_messages: list[str] = []
+    dispatch_toss_shadow_alert(
+        nullable_slice,
+        previous_status="TOSS_SHADOW_PASS",
+        sent_fingerprints=set(),
+        sender=lambda message, *, channel: (
+            nullable_clock_alert_messages.append(message)
+            or {"attempted": True, "delivered": True, "safeErrorCategory": None}
+        ),
+    )
+    assert "TimestampSlice: `DOCUMENTED_NULLABLE_WITH_LOCAL_CLOCK_REFERENCE`" in (
+        nullable_clock_alert_messages[0]
+    )
+    assert "verify Mac clock synchronization without compensation" in (
+        nullable_clock_alert_messages[0]
+    )
+    assert "registered egress, credentials, rate limit" not in (
+        nullable_clock_alert_messages[0]
     )
 
     absent_alert_messages: list[str] = []
@@ -1247,6 +1374,9 @@ def main() -> int:
     )
     assert clock_alert["status"] == "ALERT_DELIVERED"
     assert "ClockReference: `LOCAL_RECEIPT_CLOCK_BEHIND_SERVER_REFERENCE`" in sent[-1]
+    assert "TimestampSlice: `LOCAL_CLOCK_REFERENCE_ANOMALY`" in sent[-1]
+    assert "verify Mac clock synchronization without compensation" in sent[-1]
+    assert "registered egress, credentials, rate limit" not in sent[-1]
     assert "AffectedRows: `1`" in sent[-1]
     assert "OffsetMs: `1000..1000`" in sent[-1]
     assert "SYNTH" not in sent[-1]
