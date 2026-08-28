@@ -4,7 +4,9 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import os
 import re
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlencode, urlparse
 from xml.etree import ElementTree
@@ -173,9 +175,21 @@ def _utc_iso(value: dt.datetime | None) -> str | None:
 
 
 class _BoundedClient:
-    def __init__(self, session: Any) -> None:
+    def __init__(
+        self,
+        session: Any,
+        request_budgets: Mapping[str, int] | None = None,
+    ) -> None:
         self.session = session
-        self.counts = {key: 0 for key in REQUEST_BUDGETS}
+        self.request_budgets = dict(request_budgets or REQUEST_BUDGETS)
+        self.counts = {key: 0 for key in self.request_budgets}
+
+    def _reserve(self, counter: str) -> None:
+        if counter not in self.request_budgets:
+            raise ValueError(f"unknown_request_counter_{counter}")
+        if self.counts[counter] >= self.request_budgets[counter]:
+            raise ValueError(f"request_budget_exceeded_{counter}")
+        self.counts[counter] += 1
 
     def request(
         self,
@@ -184,9 +198,7 @@ class _BoundedClient:
         url: str,
         **kwargs: Any,
     ) -> tuple[Any | None, bytes, dict[str, Any]]:
-        if self.counts[counter] >= REQUEST_BUDGETS[counter]:
-            raise ValueError(f"request_budget_exceeded_{counter}")
-        self.counts[counter] += 1
+        self._reserve(counter)
         try:
             response = self.session.request(
                 method,
@@ -214,6 +226,85 @@ class _BoundedClient:
             ),
             "responseSha256": _sha256(body),
             "responseBytes": len(body),
+            "httpDatePresent": bool(headers.get("date")),
+            "rateLimitHeaderPresent": any(
+                key.startswith("x-ratelimit") or key == "retry-after"
+                for key in headers
+            ),
+            "redirected": bool(
+                getattr(response, "is_redirect", False)
+                or getattr(response, "is_permanent_redirect", False)
+            ),
+        }
+
+    def stream_to_file(
+        self,
+        counter: str,
+        method: str,
+        url: str,
+        path: Path,
+        **kwargs: Any,
+    ) -> tuple[Any | None, dict[str, Any]]:
+        self._reserve(counter)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        response: Any | None = None
+        digest = hashlib.sha256()
+        byte_count = 0
+        try:
+            response = self.session.request(
+                method,
+                url,
+                timeout=(10, 120),
+                allow_redirects=False,
+                stream=True,
+                **kwargs,
+            )
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                chunks = (
+                    response.iter_content(chunk_size=1024 * 1024)
+                    if hasattr(response, "iter_content")
+                    else [bytes(getattr(response, "content", b""))]
+                )
+                for chunk in chunks:
+                    if not chunk:
+                        continue
+                    raw = bytes(chunk)
+                    handle.write(raw)
+                    digest.update(raw)
+                    byte_count += len(raw)
+        except requests.RequestException as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            path.unlink(missing_ok=True)
+            return None, {
+                "httpStatusCategory": None,
+                "safeErrorCategory": type(exc).__name__,
+                "responseSha256": None,
+                "responseBytes": 0,
+                "redirected": False,
+            }
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            if response is not None and hasattr(response, "close"):
+                response.close()
+
+        headers = {
+            str(key).lower(): str(value)
+            for key, value in (getattr(response, "headers", {}) or {}).items()
+        }
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        return response, {
+            "httpStatusCategory": (
+                f"{status_code // 100}xx" if 100 <= status_code <= 599 else "invalid"
+            ),
+            "responseSha256": digest.hexdigest(),
+            "responseBytes": byte_count,
             "httpDatePresent": bool(headers.get("date")),
             "rateLimitHeaderPresent": any(
                 key.startswith("x-ratelimit") or key == "retry-after"
