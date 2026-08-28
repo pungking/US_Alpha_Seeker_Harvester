@@ -1,0 +1,97 @@
+name: Stage0 SEC Financial Publication Lineage Producer
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Exact bounded Stage0 SEC producer approval phrase
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage0-sec-financial-lineage-producer
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate approval and ref
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$APPROVAL" = "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE PRODUCER BOUNDED ONE-SHOT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install producer dependencies
+        run: python -m pip install google-api-python-client google-auth requests yfinance pandas
+
+      - name: Verify static producer contract
+        run: |
+          python scripts/check_financial_publication_lineage_contract.py
+          python scripts/check_financial_publication_lineage_bulk_probe.py
+          python scripts/check_stage0_financial_publication_lineage_producer.py
+
+      - name: Restore exact producer reservation
+        id: reservation
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-reservation
+          key: stage0-sec-financial-lineage-${{ hashFiles('scripts/stage0_financial_publication_lineage_producer.py', 'scripts/check_stage0_financial_publication_lineage_producer.py') }}
+          lookup-only: true
+
+      - name: Reject an existing reservation
+        if: steps.reservation.outputs.cache-hit == 'true'
+        run: exit 1
+
+      - name: Reserve exactly-once sentinel
+        run: |
+          python scripts/stage0_financial_publication_lineage_producer.py \
+            --reserve-only \
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-reservation"
+
+      - name: Persist reservation before network access
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-reservation
+          key: stage0-sec-financial-lineage-${{ hashFiles('scripts/stage0_financial_publication_lineage_producer.py', 'scripts/check_stage0_financial_publication_lineage_producer.py') }}
+
+      - name: Run bounded Stage0 SEC financial lineage producer
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_APPROVAL: ${{ inputs.approval }}
+        run: |
+          python scripts/stage0_financial_publication_lineage_producer.py \
+            --safe-output "$RUNNER_TEMP/stage0-sec-financial-lineage-safe.json" \
+            --private-output "$RUNNER_TEMP/stage0-sec-financial-lineage-private.json" \
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-reservation" \
+            --raw-temp-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-raw"
+
+      - name: Upload safe aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: stage0-sec-financial-lineage-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/stage0-sec-financial-lineage-safe.json
+            ${{ runner.temp }}/stage0-sec-financial-lineage-reservation/*.json
+          if-no-files-found: warn

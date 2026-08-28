@@ -42,6 +42,8 @@ jobs:
         run: python scripts/check_sec_schedule13_exact_family.py
       - name: SEC financial publication lineage bulk-probe contract
         run: python scripts/check_financial_publication_lineage_bulk_probe.py
+      - name: Stage0 SEC financial publication lineage producer
+        run: python scripts/check_stage0_financial_publication_lineage_producer.py
       - name: Macro event clock SHADOW_ONLY capability contract
         run: python scripts/check_macro_event_clock_capability.py
       - name: Macro event clock blocker-only reproof contract
