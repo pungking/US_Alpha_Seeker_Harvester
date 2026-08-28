@@ -754,12 +754,13 @@ def run_bounded_producer(
     private_output_path: Path,
     sentinel_dir: Path,
     raw_temp_dir: Path,
-    retrieved_at: str,
+    retrieved_at: str | None,
     approval: str,
     find_file_id: Callable[[str, str | None], Any],
     download_json: Callable[[str], Any],
     list_files: Callable[[str], list[Mapping[str, Any]]],
     upload_json: Callable[[str, dict[str, Any], str], None],
+    utc_now: Callable[[], str] = _utc_now,
 ) -> dict[str, Any]:
     if approval != PRODUCER_APPROVAL:
         raise RuntimeError("stage0_sec_financial_lineage_producer_approval_required")
@@ -821,6 +822,7 @@ def run_bounded_producer(
         )
         if response is None or not 200 <= int(response.status_code) < 300:
             raise RuntimeError("sec_submissions_bulk_http_failure")
+        effective_retrieved_at = str(retrieved_at or utc_now())
         response_hashes = {
             "secCompanyTickerMap": ticker_metadata["responseSha256"],
             "secCompanyfactsBulk": facts_metadata["responseSha256"],
@@ -839,7 +841,7 @@ def run_bounded_producer(
                 ticker_cik_index=ticker_index,
                 companyfacts_by_cik=_zip_loader(company_archive),
                 submissions_by_cik=_zip_loader(submission_archive),
-                retrieved_at=retrieved_at,
+                retrieved_at=effective_retrieved_at,
                 source_files=source_files,
                 identity_map_sha256=identity_hash,
                 source_response_hashes=response_hashes,
@@ -865,11 +867,12 @@ def run_bounded_producer(
         safe = safe_aggregate(persisted)
     except (json.JSONDecodeError, OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
         status = "STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_RUNTIME_FAILURE"
+        effective_retrieved_at = str(retrieved_at or utc_now())
         safe = {
             "schemaVersion": PRODUCER_SCHEMA_VERSION,
             "mode": "SHADOW_ONLY_STAGE0_FINANCIAL_PUBLICATION_LINEAGE",
             "status": status,
-            "retrievedAt": retrieved_at,
+            "retrievedAt": effective_retrieved_at,
             "collectionKey": PRODUCER_COLLECTION_KEY,
             "requestCounts": dict(sorted(client.counts.items())),
             "externalRequestCount": sum(client.counts.values()),
@@ -901,7 +904,7 @@ def run_bounded_producer(
     finish_collection_sentinel(
         sentinel_path,
         status="COMPLETE" if status == PRODUCER_PASS_STATUS else "FAILED",
-        completed_at=_utc_now(),
+        completed_at=utc_now(),
         artifact_sha256=str(safe["evidenceSha256"]),
         request_counts=client.counts,
     )
@@ -917,9 +920,9 @@ def main() -> int:
     parser.add_argument("--retrieved-at", default=None)
     parser.add_argument("--reserve-only", action="store_true")
     args = parser.parse_args()
-    retrieved_at = str(args.retrieved_at or _utc_now())
+    retrieved_at = str(args.retrieved_at) if args.retrieved_at else None
     if args.reserve_only:
-        reserve_producer(args.sentinel_dir, retrieved_at)
+        reserve_producer(args.sentinel_dir, retrieved_at or _utc_now())
         print("[STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER] reservation=RESERVED requests=0")
         return 0
     if args.safe_output is None or args.private_output is None or args.raw_temp_dir is None:

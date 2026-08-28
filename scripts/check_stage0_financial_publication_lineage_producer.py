@@ -432,6 +432,16 @@ def _test_bounded_runner() -> None:
         root = Path(directory)
         sentinel = reserve_producer(root / "sentinel", "2026-08-02T00:00:00Z")
         session = Session(responses)
+        clock_request_counts: list[int] = []
+
+        def utc_now() -> str:
+            clock_request_counts.append(len(session.requests))
+            return (
+                "2026-08-02T00:00:00Z"
+                if len(clock_request_counts) == 1
+                else "2026-08-02T00:00:01Z"
+            )
+
         result = run_bounded_producer(
             session=session,
             environment={"SEC_USER_AGENT": "US Alpha Seeker contact@example.test"},
@@ -439,7 +449,8 @@ def _test_bounded_runner() -> None:
             private_output_path=root / "private.json",
             sentinel_dir=root / "sentinel",
             raw_temp_dir=root / "raw",
-            retrieved_at="2026-08-02T00:00:00Z",
+            retrieved_at=None,
+            utc_now=utc_now,
             approval=PRODUCER_APPROVAL,
             find_file_id=lambda name, parent=None: ids.get((name, parent)),
             download_json=lambda file_id: copy.deepcopy(payloads[file_id]),
@@ -462,6 +473,8 @@ def _test_bounded_runner() -> None:
         assert not (root / "raw").exists()
         assert (root / "private.json").exists()
         assert len(session.requests) == 3
+        assert clock_request_counts[0] == 3
+        assert result["generatedAt"] == "2026-08-02T00:00:00Z"
         assert all(call["kwargs"].get("allow_redirects") is False for call in session.requests)
         assert len(uploads) == 2
         assert json.loads(sentinel.read_text())["status"] == "COMPLETE"
