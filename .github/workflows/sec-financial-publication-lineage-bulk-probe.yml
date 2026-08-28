@@ -1,0 +1,92 @@
+name: SEC Financial Publication Lineage Bulk Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Exact bounded SEC bulk-probe approval phrase
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sec-financial-publication-lineage-bulk-probe
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate approval and ref
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$APPROVAL" = "AUTHORIZE SEC FINANCIAL PUBLICATION LINEAGE BULK ONE-SHOT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install bounded client dependency
+        run: python -m pip install requests
+
+      - name: Verify static contracts
+        run: |
+          python scripts/check_financial_publication_lineage_contract.py
+          python scripts/check_financial_publication_lineage_bulk_probe.py
+
+      - name: Restore exact one-shot reservation
+        id: reservation
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/sec-financial-lineage-reservation
+          key: sec-financial-lineage-${{ hashFiles('fixtures/financial_publication_lineage_contract.json', 'scripts/run_financial_publication_lineage_bulk_probe.py') }}
+          lookup-only: true
+
+      - name: Reject an existing reservation
+        if: steps.reservation.outputs.cache-hit == 'true'
+        run: exit 1
+
+      - name: Reserve exactly-once sentinel
+        run: |
+          python scripts/run_financial_publication_lineage_bulk_probe.py \
+            --reserve-only \
+            --sentinel-dir "$RUNNER_TEMP/sec-financial-lineage-reservation"
+
+      - name: Persist reservation before network access
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/sec-financial-lineage-reservation
+          key: sec-financial-lineage-${{ hashFiles('fixtures/financial_publication_lineage_contract.json', 'scripts/run_financial_publication_lineage_bulk_probe.py') }}
+
+      - name: Run bounded SEC financial lineage probe
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          SEC_FINANCIAL_LINEAGE_PROBE_APPROVAL: ${{ inputs.approval }}
+        run: |
+          python scripts/run_financial_publication_lineage_bulk_probe.py \
+            --output "$RUNNER_TEMP/sec-financial-publication-lineage-safe.json" \
+            --sentinel-dir "$RUNNER_TEMP/sec-financial-lineage-reservation" \
+            --raw-temp-dir "$RUNNER_TEMP/sec-financial-lineage-private"
+
+      - name: Upload safe aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: sec-financial-publication-lineage-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/sec-financial-publication-lineage-safe.json
+            ${{ runner.temp }}/sec-financial-lineage-reservation/*.json
+          if-no-files-found: warn
