@@ -36,6 +36,9 @@ from sec_finra_shadow_evidence import _BoundedClient, _submission_lineage
 
 
 PRODUCER_APPROVAL = "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE PRODUCER BOUNDED ONE-SHOT"
+PRODUCER_RECURRING_APPROVAL = (
+    "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE PRODUCER RECURRING SECOND-BATCH"
+)
 PRODUCER_SCHEMA_VERSION = "stage0-sec-financial-publication-lineage-v1"
 PRODUCER_SOURCE_FAMILY = "STAGE0_SEC_FINANCIAL_PUBLICATION_LINEAGE"
 PRODUCER_PASS_STATUS = "STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_PASS"
@@ -94,6 +97,7 @@ VERIFIED_STATUSES = {
     "FINANCIAL_LINEAGE_DUPLICATE_SAME_ACCESSION_COLLAPSED",
 }
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _utc_now() -> str:
@@ -106,6 +110,31 @@ def _utc_iso(value: dt.datetime) -> str:
 
 def _valid_sha256(value: Any) -> bool:
     return SHA256_RE.fullmatch(str(value or "")) is not None
+
+
+def _collection_window(value: Any) -> str:
+    text = str(value or "")
+    if DATE_RE.fullmatch(text) is None:
+        raise ValueError("recurring_collection_window_invalid")
+    try:
+        if dt.date.fromisoformat(text).isoformat() != text:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("recurring_collection_window_invalid") from exc
+    return text
+
+
+def recurring_collection_key(collection_window: str) -> str:
+    normalized_window = _collection_window(collection_window)
+    return canonical_sha256(
+        {
+            "activationMode": "RECURRING_SECOND_BATCH",
+            "collectionWindow": normalized_window,
+            "requestScope": sorted(REQUEST_BUDGETS),
+            "schemaVersion": PRODUCER_SCHEMA_VERSION,
+            "sourceFamily": PRODUCER_SOURCE_FAMILY,
+        }
+    )
 
 
 def _source_group(file_name: str, suffix: str) -> str | None:
@@ -474,10 +503,27 @@ def build_lineage_artifact(
     identity_map_sha256: str,
     source_response_hashes: Mapping[str, str],
     request_counts: Mapping[str, int],
+    collection_window: str | None = None,
+    collection_key: str | None = None,
+    recurring_activation_authorized: bool = False,
 ) -> dict[str, Any]:
     retrieved = _parse_utc(retrieved_at)
     if retrieved is None:
         raise ValueError("retrieved_at_utc_required")
+    effective_collection_window = (
+        _collection_window(collection_window)
+        if collection_window is not None
+        else _utc_iso(retrieved)[:10]
+    )
+    if recurring_activation_authorized:
+        expected_collection_key = recurring_collection_key(effective_collection_window)
+        if collection_key != expected_collection_key:
+            raise ValueError("recurring_collection_key_invalid")
+        effective_collection_key = expected_collection_key
+    else:
+        if collection_window is not None or collection_key is not None:
+            raise ValueError("one_shot_collection_override_invalid")
+        effective_collection_key = None
     if not _valid_sha256(identity_map_sha256):
         raise ValueError("identity_map_sha256_required")
     inventory = sorted(
@@ -572,10 +618,11 @@ def build_lineage_artifact(
         "status": producer_status,
         "runId": f"stage0-sec-lineage-{input_hash[:16]}",
         "generatedAt": _utc_iso(retrieved),
-        "collectionWindow": _utc_iso(retrieved)[:10],
-        "collectionKey": canonical_sha256(
+        "collectionWindow": effective_collection_window,
+        "collectionKey": effective_collection_key
+        or canonical_sha256(
             {
-                "collectionWindow": _utc_iso(retrieved)[:10],
+                "collectionWindow": effective_collection_window,
                 "inputHash": input_hash,
                 "schemaVersion": PRODUCER_SCHEMA_VERSION,
             }
@@ -602,7 +649,7 @@ def build_lineage_artifact(
         "unknownOrUnclassifiedRows": unknown,
         "rawResponseStored": False,
         "stageProgressionGate": "STAGE0_LOCKED",
-        "recurringActivationAuthorized": False,
+        "recurringActivationAuthorized": recurring_activation_authorized,
         "canonicalSourceChanged": False,
         "policyImpact": "NONE_REPORT_ONLY",
         "Stage1To7PolicyChanged": False,
@@ -675,11 +722,24 @@ def safe_aggregate(private_artifact: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-def reserve_producer(sentinel_dir: Path, reserved_at: str) -> Path:
+def reserve_producer(
+    sentinel_dir: Path,
+    reserved_at: str,
+    *,
+    collection_window: str | None = None,
+    recurring_activation_authorized: bool = False,
+) -> Path:
+    collection_key = (
+        recurring_collection_key(collection_window or "")
+        if recurring_activation_authorized
+        else PRODUCER_COLLECTION_KEY
+    )
+    if not recurring_activation_authorized and collection_window is not None:
+        raise ValueError("one_shot_collection_override_invalid")
     reservation = reserve_collection_sentinel(
         sentinel_dir,
         source_family=PRODUCER_SOURCE_FAMILY,
-        collection_key=PRODUCER_COLLECTION_KEY,
+        collection_key=collection_key,
         reserved_at=reserved_at,
     )
     if reservation["status"] != "RESERVED":
@@ -687,8 +747,8 @@ def reserve_producer(sentinel_dir: Path, reserved_at: str) -> Path:
     return Path(str(reservation["path"]))
 
 
-def _sentinel(sentinel_dir: Path) -> Path:
-    return _sentinel_path(sentinel_dir, PRODUCER_SOURCE_FAMILY, PRODUCER_COLLECTION_KEY)
+def _sentinel(sentinel_dir: Path, collection_key: str = PRODUCER_COLLECTION_KEY) -> Path:
+    return _sentinel_path(sentinel_dir, PRODUCER_SOURCE_FAMILY, collection_key)
 
 
 def _zip_loader(archive: zipfile.ZipFile) -> Callable[[str], Any]:
@@ -762,15 +822,28 @@ def run_bounded_producer(
     list_files: Callable[[str], list[Mapping[str, Any]]],
     upload_json: Callable[[str, dict[str, Any], str], None],
     utc_now: Callable[[], str] = _utc_now,
+    collection_window: str | None = None,
+    recurring_activation_authorized: bool = False,
 ) -> dict[str, Any]:
-    if approval != PRODUCER_APPROVAL:
+    expected_approval = (
+        PRODUCER_RECURRING_APPROVAL
+        if recurring_activation_authorized
+        else PRODUCER_APPROVAL
+    )
+    if approval != expected_approval:
         raise RuntimeError("stage0_sec_financial_lineage_producer_approval_required")
+    if recurring_activation_authorized:
+        effective_collection_key = recurring_collection_key(collection_window or "")
+    else:
+        if collection_window is not None:
+            raise ValueError("one_shot_collection_override_invalid")
+        effective_collection_key = PRODUCER_COLLECTION_KEY
     sec_user_agent = str(environment.get("SEC_USER_AGENT") or "").strip()
     if "@" not in sec_user_agent:
         raise RuntimeError("sec_fair_access_contact_missing")
     if safe_output_path.exists() or private_output_path.exists():
         raise FileExistsError(safe_output_path)
-    sentinel_path = _sentinel(sentinel_dir)
+    sentinel_path = _sentinel(sentinel_dir, effective_collection_key)
     sentinel = json.loads(sentinel_path.read_text(encoding="utf-8"))
     if sentinel.get("status") != "IN_PROGRESS":
         raise FileExistsError(sentinel_path)
@@ -847,6 +920,11 @@ def run_bounded_producer(
                 identity_map_sha256=identity_hash,
                 source_response_hashes=response_hashes,
                 request_counts=client.counts,
+                collection_window=collection_window,
+                collection_key=(
+                    effective_collection_key if recurring_activation_authorized else None
+                ),
+                recurring_activation_authorized=recurring_activation_authorized,
             )
         persisted = persist_shadow_artifact(
             private,
@@ -874,7 +952,8 @@ def run_bounded_producer(
             "mode": "SHADOW_ONLY_STAGE0_FINANCIAL_PUBLICATION_LINEAGE",
             "status": status,
             "retrievedAt": effective_retrieved_at,
-            "collectionKey": PRODUCER_COLLECTION_KEY,
+            "collectionWindow": collection_window,
+            "collectionKey": effective_collection_key,
             "requestCounts": dict(sorted(client.counts.items())),
             "externalRequestCount": sum(client.counts.values()),
             "requestBudgetCompliant": all(client.counts[key] <= REQUEST_BUDGETS[key] for key in REQUEST_BUDGETS),
@@ -886,7 +965,7 @@ def run_bounded_producer(
             "secretStoredOrPrinted": False,
             "rawResponseStored": False,
             "stageProgressionGate": "STAGE0_LOCKED",
-            "recurringActivationAuthorized": False,
+            "recurringActivationAuthorized": recurring_activation_authorized,
             "canonicalSourceChanged": False,
             "policyImpact": "NONE_REPORT_ONLY",
             "Stage1To7PolicyChanged": False,
@@ -919,11 +998,18 @@ def main() -> int:
     parser.add_argument("--sentinel-dir", type=Path, required=True)
     parser.add_argument("--raw-temp-dir", type=Path)
     parser.add_argument("--retrieved-at", default=None)
+    parser.add_argument("--collection-window", default=None)
+    parser.add_argument("--recurring-activation", action="store_true")
     parser.add_argument("--reserve-only", action="store_true")
     args = parser.parse_args()
     retrieved_at = str(args.retrieved_at) if args.retrieved_at else None
     if args.reserve_only:
-        reserve_producer(args.sentinel_dir, retrieved_at or _utc_now())
+        reserve_producer(
+            args.sentinel_dir,
+            retrieved_at or _utc_now(),
+            collection_window=args.collection_window,
+            recurring_activation_authorized=args.recurring_activation,
+        )
         print("[STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER] reservation=RESERVED requests=0")
         return 0
     if args.safe_output is None or args.private_output is None or args.raw_temp_dir is None:
@@ -959,6 +1045,8 @@ def main() -> int:
                 download_json=harvester.download_json,
                 list_files=list_files,
                 upload_json=harvester.upload_json,
+                collection_window=args.collection_window,
+                recurring_activation_authorized=args.recurring_activation,
             )
     finally:
         session.close()
