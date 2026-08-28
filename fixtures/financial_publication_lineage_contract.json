@@ -1,0 +1,229 @@
+{
+  "schemaVersion": "financial-publication-lineage-capability-v1",
+  "mode": "STATIC_OFFICIAL_SOURCE_CAPABILITY_CONTRACT",
+  "status": "OFFICIAL_SEC_BULK_CAPABILITY_PROBE_REQUIRED",
+  "reviewedAt": "2026-08-28T00:00:00Z",
+  "runtimeEnabled": false,
+  "externalRequestCount": 0,
+  "producerMutationImplemented": false,
+  "canonicalSourceChanged": false,
+  "policyImpact": "NONE_REPORT_ONLY",
+  "stage1To7PolicyChanged": false,
+  "primaryBlocker": "LOCAL_SOURCE_LACKS_IMMUTABLE_PUBLICATION_METADATA_AND_CIK",
+  "localEvidenceAudit": {
+    "upstreamAuditArtifactSha256": "6f7f48ca7355b5cb4e9ffc1eaadbd91bf288f7f6197de146f36f8624fd307fa9",
+    "dailySourceFiles": 26,
+    "dailySourceRows": 5675,
+    "dailyFinancialSourceRows": 0,
+    "dailyFiscalPeriodRows": 0,
+    "dailyFinancialPublishedAtRows": 0,
+    "dailyFinancialRetrievedAtRows": 0,
+    "financialHistoryFilesInspected": 1,
+    "financialHistoryFileSha256": "c685290f1fb645ca562192e68526ab0a29356162543257358cf68282059e68ee",
+    "financialHistoryEntityRows": 308,
+    "statementRowsAcrossViews": 6740,
+    "publicationLikeFields": 0,
+    "identityMapRows": 5677,
+    "identityMapSha256": "3e6f626a9d69ac37b2a60f780ac0016bd002da9a110394a964c5c6176c61ad58",
+    "cikLikeIdentityFields": 0
+  },
+  "requiredProducerSemantics": {
+    "financialSource": "YFINANCE_HISTORY_SEC_EDGAR_EXACT_LINEAGE",
+    "fiscalPeriodBasis": "EXACT_STATEMENT_PERIOD_END",
+    "financialPublishedAtBasis": "SEC_ACCEPTANCE_DATE_TIME",
+    "financialRetrievedAtBasis": "HARVESTER_UTC_RETRIEVAL_TIME",
+    "infoValueWithoutFiscalPeriodEligible": false,
+    "symbolOnlyJoinAllowed": false,
+    "nearestValueMatchAllowed": false,
+    "timestampFallbackAllowed": false,
+    "legacyNetIncomeAsOfIsPublicationTime": false,
+    "publishedAtMustNotExceedRetrievedAt": true,
+    "sourceRecordSha256Required": true
+  },
+  "officialSourceContracts": [
+    {
+      "sourceId": "SEC_COMPANY_TICKER_MAP",
+      "endpoint": "https://www.sec.gov/files/company_tickers.json",
+      "officialDocumentation": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+      "evidenceMeaning": "Official ticker-to-CIK discovery input; effective-dated corporate-action lineage remains mandatory",
+      "requestLimit": 1,
+      "retryAllowed": false,
+      "paginationAllowed": false,
+      "rawResponsePersisted": false
+    },
+    {
+      "sourceId": "SEC_COMPANYFACTS_BULK",
+      "endpoint": "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip",
+      "officialDocumentation": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+      "evidenceMeaning": "Official fact value, taxonomy, concept, unit, fiscal period, form, and accession lineage",
+      "requestLimit": 1,
+      "retryAllowed": false,
+      "paginationAllowed": false,
+      "rawResponsePersisted": false
+    },
+    {
+      "sourceId": "SEC_SUBMISSIONS_BULK",
+      "endpoint": "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip",
+      "officialDocumentation": "https://www.sec.gov/search-filings/edgar-application-programming-interfaces",
+      "evidenceMeaning": "Official accession-to-form, filing date, report date, and acceptanceDateTime lineage",
+      "requestLimit": 1,
+      "retryAllowed": false,
+      "paginationAllowed": false,
+      "rawResponsePersisted": false
+    }
+  ],
+  "exactJoinContract": {
+    "identifierKey": "TEN_DIGIT_CIK",
+    "factToSubmissionKey": "ACCESSION_NUMBER",
+    "publicationField": "acceptanceDateTime",
+    "exactFactMatchFields": [
+      "taxonomy",
+      "concept",
+      "unit",
+      "value",
+      "periodStart",
+      "periodEnd",
+      "form",
+      "accessionNumber"
+    ],
+    "eligibleConcepts": {
+      "us-gaap": [
+        "NetIncomeLoss",
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "ProfitLoss"
+      ],
+      "ifrs-full": [
+        "ProfitLoss",
+        "ProfitLossAttributableToOwnersOfParent"
+      ]
+    },
+    "eligibleForms": [
+      "10-K",
+      "10-K/A",
+      "10-Q",
+      "10-Q/A",
+      "20-F",
+      "20-F/A",
+      "40-F",
+      "40-F/A",
+      "6-K",
+      "6-K/A"
+    ],
+    "filingDateAsPublicationAllowed": false,
+    "fiscalPeriodAsPublicationAllowed": false,
+    "retrievalTimeAsPublicationAllowed": false,
+    "amendmentBackdatingAllowed": false,
+    "duplicateCandidateDisposition": "FAIL_CLOSED",
+    "unknownOrUnclassifiedRows": 0
+  },
+  "boundedOneShotApprovalPackage": {
+    "approvalPhrase": "AUTHORIZE SEC FINANCIAL PUBLICATION LINEAGE BULK ONE-SHOT",
+    "scope": "SERVER_SIDE_HARVESTER_CAPABILITY_ONLY",
+    "requestCounts": {
+      "secCompanyTickerMap": 1,
+      "secCompanyfactsBulk": 1,
+      "secSubmissionsBulk": 1,
+      "total": 3
+    },
+    "retry": 0,
+    "pagination": 0,
+    "privateTemporaryArchiveOnly": true,
+    "persistentRawResponseStorage": false,
+    "deleteTemporaryArchivesBeforeCompletion": true,
+    "safeAggregateArtifactOnly": true,
+    "drivePublish": false,
+    "producerActivation": false,
+    "canonicalSourceReplacement": false,
+    "stage1To7PolicyImpact": "NONE",
+    "brokerOrSidecarStateMutation": false
+  },
+  "syntheticCases": [
+    {
+      "caseId": "exact_fact_accession_and_acceptance",
+      "identifierLineageExact": true,
+      "fiscalPeriod": "2026-06-30",
+      "exactFactMatches": 1,
+      "submissionsAccessionMatched": true,
+      "acceptanceDateTime": "2026-08-01T20:00:00Z",
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "FINANCIAL_LINEAGE_VERIFIED"
+    },
+    {
+      "caseId": "identifier_alias_ambiguous",
+      "identifierLineageExact": false,
+      "fiscalPeriod": "2026-06-30",
+      "exactFactMatches": 1,
+      "submissionsAccessionMatched": true,
+      "acceptanceDateTime": "2026-08-01T20:00:00Z",
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "IDENTIFIER_LINEAGE_INCOMPLETE"
+    },
+    {
+      "caseId": "info_value_has_no_fiscal_period",
+      "identifierLineageExact": true,
+      "fiscalPeriod": null,
+      "exactFactMatches": 1,
+      "submissionsAccessionMatched": true,
+      "acceptanceDateTime": "2026-08-01T20:00:00Z",
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "FISCAL_PERIOD_MISSING"
+    },
+    {
+      "caseId": "nearest_value_is_not_exact",
+      "identifierLineageExact": true,
+      "fiscalPeriod": "2026-06-30",
+      "exactFactMatches": 0,
+      "submissionsAccessionMatched": true,
+      "acceptanceDateTime": "2026-08-01T20:00:00Z",
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "EXACT_FACT_NOT_FOUND"
+    },
+    {
+      "caseId": "multiple_accession_candidates",
+      "identifierLineageExact": true,
+      "fiscalPeriod": "2026-06-30",
+      "exactFactMatches": 2,
+      "submissionsAccessionMatched": true,
+      "acceptanceDateTime": "2026-08-01T20:00:00Z",
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "FACT_ACCESSION_AMBIGUOUS"
+    },
+    {
+      "caseId": "fact_accession_absent_from_submissions",
+      "identifierLineageExact": true,
+      "fiscalPeriod": "2026-06-30",
+      "exactFactMatches": 1,
+      "submissionsAccessionMatched": false,
+      "acceptanceDateTime": "2026-08-01T20:00:00Z",
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "SUBMISSIONS_ACCESSION_MISSING"
+    },
+    {
+      "caseId": "acceptance_timestamp_absent",
+      "identifierLineageExact": true,
+      "fiscalPeriod": "2026-06-30",
+      "exactFactMatches": 1,
+      "submissionsAccessionMatched": true,
+      "acceptanceDateTime": null,
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "ACCEPTANCE_TIMESTAMP_MISSING"
+    },
+    {
+      "caseId": "future_acceptance_rejected",
+      "identifierLineageExact": true,
+      "fiscalPeriod": "2026-06-30",
+      "exactFactMatches": 1,
+      "submissionsAccessionMatched": true,
+      "acceptanceDateTime": "2026-08-03T00:00:00Z",
+      "financialRetrievedAt": "2026-08-02T00:00:00Z",
+      "expectedStatus": "PUBLICATION_AFTER_RETRIEVAL_REJECTED"
+    }
+  ],
+  "auditSummary": {
+    "externalRequestCount": 0,
+    "producerRowsChanged": 0,
+    "fabricatedPublicationTimestampRows": 0,
+    "unknownOrUnclassifiedRows": 0,
+    "stage1To7PolicyChangedRows": 0
+  }
+}
