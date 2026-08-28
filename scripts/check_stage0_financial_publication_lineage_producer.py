@@ -14,10 +14,12 @@ import string
 from official_shadow_runtime import canonical_sha256
 from stage0_financial_publication_lineage_producer import (
     PRODUCER_APPROVAL,
+    PRODUCER_RECURRING_APPROVAL,
     VERIFIED_STATUSES,
     build_financial_input_rows,
     build_lineage_artifact,
     classify_financial_lineage,
+    recurring_collection_key,
     reserve_producer,
     run_bounded_producer,
     safe_aggregate,
@@ -26,6 +28,7 @@ from stage0_financial_publication_lineage_producer import (
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/stage0-sec-financial-lineage-producer.yml"
+MAIN_WORKFLOW = ROOT / ".github/workflows/main.yml"
 CI_WORKFLOW = ROOT / ".github/workflows/telegram-routing-ci.yml"
 SHA = "a" * 64
 
@@ -377,6 +380,55 @@ def _test_artifact() -> None:
     assert public["privateArtifactSha256"] == canonical_sha256(first)
     _assert_redacted(public)
 
+    recurring_window = "2026-08-28"
+    recurring = build_lineage_artifact(
+        **kwargs,
+        collection_window=recurring_window,
+        collection_key=recurring_collection_key(recurring_window),
+        recurring_activation_authorized=True,
+    )
+    assert recurring["collectionWindow"] == recurring_window
+    assert recurring["collectionKey"] == recurring_collection_key(recurring_window)
+    assert recurring["recurringActivationAuthorized"] is True
+
+
+def _test_recurring_reservation() -> None:
+    try:
+        recurring_collection_key("2026-02-30")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid recurring collection date was accepted")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        first_window = "2026-08-28"
+        second_window = "2026-09-01"
+        first = reserve_producer(
+            root,
+            "2026-08-28T03:30:00Z",
+            collection_window=first_window,
+            recurring_activation_authorized=True,
+        )
+        assert first.name.endswith(f"{recurring_collection_key(first_window)}.json")
+        try:
+            reserve_producer(
+                root,
+                "2026-08-28T03:31:00Z",
+                collection_window=first_window,
+                recurring_activation_authorized=True,
+            )
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("same recurring collection window was accepted twice")
+        second = reserve_producer(
+            root,
+            "2026-09-01T03:30:00Z",
+            collection_window=second_window,
+            recurring_activation_authorized=True,
+        )
+        assert first != second
+
 
 def _test_bounded_runner() -> None:
     identity_map = {
@@ -505,6 +557,44 @@ def _test_bounded_runner() -> None:
             raise AssertionError("duplicate producer run was accepted")
         assert duplicate.requests == []
 
+        recurring_window = "2026-08-28"
+        reserve_producer(
+            root / "recurring-sentinel",
+            "2026-08-29T03:13:00Z",
+            collection_window=recurring_window,
+            recurring_activation_authorized=True,
+        )
+        recurring_session = Session(
+            [
+                Response(200, json.dumps({"0": {"cik_str": 123, "ticker": "SYNTH"}}).encode()),
+                Response(200, _zip_bytes({"CIK0000000123.json": _companyfacts(_fact())})),
+                Response(200, _zip_bytes({"CIK0000000123.json": _submissions()})),
+            ]
+        )
+        recurring_result = run_bounded_producer(
+            session=recurring_session,
+            environment={"SEC_USER_AGENT": "US Alpha Seeker contact@example.test"},
+            safe_output_path=root / "safe-recurring.json",
+            private_output_path=root / "private-recurring.json",
+            sentinel_dir=root / "recurring-sentinel",
+            raw_temp_dir=root / "raw-recurring",
+            retrieved_at="2026-08-29T03:13:00Z",
+            approval=PRODUCER_RECURRING_APPROVAL,
+            collection_window=recurring_window,
+            recurring_activation_authorized=True,
+            find_file_id=lambda name, parent=None: ids.get((name, parent)),
+            download_json=lambda file_id: copy.deepcopy(payloads[file_id]),
+            list_files=lambda folder_id: (
+                copy.deepcopy(daily_files)
+                if folder_id == "daily-folder"
+                else copy.deepcopy(history_files)
+            ),
+            upload_json=lambda name, payload, parent: None,
+        )
+        assert recurring_result["recurringActivationAuthorized"] is True
+        assert recurring_result["collectionWindow"] == recurring_window
+        assert recurring_result["collectionKey"] == recurring_collection_key(recurring_window)
+
 
 def _test_workflow() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -527,6 +617,19 @@ def _test_workflow() -> None:
     for forbidden in ("private.json", "companyfacts.zip", "submissions.zip"):
         assert forbidden not in upload
     assert "check_stage0_financial_publication_lineage_producer.py" in CI_WORKFLOW.read_text()
+
+    main_workflow = MAIN_WORKFLOW.read_text(encoding="utf-8")
+    assert "vars.STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_ENABLED == 'true'" in main_workflow
+    assert "github.event.schedule == '13 3 * * 2-6'" in main_workflow
+    assert PRODUCER_RECURRING_APPROVAL in main_workflow
+    assert "--recurring-activation" in main_workflow
+    assert '--collection-window "$COLLECTION_WINDOW"' in main_workflow
+    assert "actions/cache/restore@v4" in main_workflow
+    assert "actions/cache/save@v4" in main_workflow
+    assert "restore-keys:" not in main_workflow
+    assert main_workflow.index("Run Master Harvester") < main_workflow.index(
+        "Run scheduled Stage0 SEC financial lineage producer"
+    )
 
 
 def _test_cli_import_boundary() -> None:
@@ -563,6 +666,7 @@ def main() -> int:
     _test_input_rows()
     _test_classification()
     _test_artifact()
+    _test_recurring_reservation()
     _test_bounded_runner()
     _test_workflow()
     _test_cli_import_boundary()

@@ -26,6 +26,7 @@ on:
   
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  STAGE0_SEC_FINANCIAL_LINEAGE_RUN: ${{ github.event_name == 'schedule' && github.event.schedule == '13 3 * * 2-6' && vars.STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_ENABLED == 'true' }}
 
 concurrency:
   group: master-stock-harvester-${{ github.ref }}
@@ -136,6 +137,66 @@ jobs:
         run: |
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
+
+      - name: Prepare Stage0 SEC financial lineage collection window
+        id: stage0_sec_lineage_window
+        if: env.STAGE0_SEC_FINANCIAL_LINEAGE_RUN == 'true'
+        run: |
+          collection_window="$(TZ=America/New_York date +%F)"
+          collection_key="$(PYTHONPATH=scripts python -c 'from stage0_financial_publication_lineage_producer import recurring_collection_key; import sys; print(recurring_collection_key(sys.argv[1]))' "$collection_window")"
+          echo "collection_window=$collection_window" >> "$GITHUB_OUTPUT"
+          echo "collection_key=$collection_key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Stage0 SEC financial lineage reservation
+        id: stage0_sec_lineage_reservation
+        if: env.STAGE0_SEC_FINANCIAL_LINEAGE_RUN == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-runtime-sentinel
+          key: stage0-sec-financial-lineage-runtime-${{ steps.stage0_sec_lineage_window.outputs.collection_key }}
+          lookup-only: true
+
+      - name: Reserve scheduled Stage0 SEC financial lineage producer
+        if: >-
+          env.STAGE0_SEC_FINANCIAL_LINEAGE_RUN == 'true' &&
+          steps.stage0_sec_lineage_reservation.outputs.cache-hit != 'true'
+        env:
+          COLLECTION_WINDOW: ${{ steps.stage0_sec_lineage_window.outputs.collection_window }}
+        run: |
+          python scripts/stage0_financial_publication_lineage_producer.py \
+            --reserve-only \
+            --recurring-activation \
+            --collection-window "$COLLECTION_WINDOW" \
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-runtime-sentinel"
+
+      - name: Persist scheduled Stage0 SEC financial lineage reservation
+        if: >-
+          env.STAGE0_SEC_FINANCIAL_LINEAGE_RUN == 'true' &&
+          steps.stage0_sec_lineage_reservation.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-runtime-sentinel
+          key: stage0-sec-financial-lineage-runtime-${{ steps.stage0_sec_lineage_window.outputs.collection_key }}
+
+      - name: Run scheduled Stage0 SEC financial lineage producer
+        if: >-
+          env.STAGE0_SEC_FINANCIAL_LINEAGE_RUN == 'true' &&
+          steps.stage0_sec_lineage_reservation.outputs.cache-hit != 'true'
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_APPROVAL: AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE PRODUCER RECURRING SECOND-BATCH
+          COLLECTION_WINDOW: ${{ steps.stage0_sec_lineage_window.outputs.collection_window }}
+        run: |
+          python scripts/stage0_financial_publication_lineage_producer.py \
+            --safe-output "state/stage0-sec-financial-lineage-safe.json" \
+            --private-output "$RUNNER_TEMP/stage0-sec-financial-lineage-private.json" \
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-runtime-sentinel" \
+            --raw-temp-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-raw" \
+            --recurring-activation \
+            --collection-window "$COLLECTION_WINDOW"
 
       - name: Sync Harvester summary to Notion
         if: always()
