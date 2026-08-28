@@ -3,6 +3,9 @@ from __future__ import annotations
 import copy
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -526,12 +529,43 @@ def _test_workflow() -> None:
     assert "check_stage0_financial_publication_lineage_producer.py" in CI_WORKFLOW.read_text()
 
 
+def _test_cli_import_boundary() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment["STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_APPROVAL"] = ""
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/stage0_financial_publication_lineage_producer.py"),
+                "--safe-output",
+                str(root / "safe.json"),
+                "--private-output",
+                str(root / "private.json"),
+                "--sentinel-dir",
+                str(root / "sentinel"),
+                "--raw-temp-dir",
+                str(root / "raw"),
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "ModuleNotFoundError" not in result.stderr
+        assert "stage0_sec_financial_lineage_producer_approval_required" in result.stderr
+
+
 def main() -> int:
     _test_input_rows()
     _test_classification()
     _test_artifact()
     _test_bounded_runner()
     _test_workflow()
+    _test_cli_import_boundary()
     print(
         "[STAGE0_FINANCIAL_PUBLICATION_LINEAGE_PRODUCER] PASS "
         "unknown=0 rawPersistent=false policyChanged=false"

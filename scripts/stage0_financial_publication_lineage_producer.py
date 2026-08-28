@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import string
+import sys
 import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -928,6 +929,7 @@ def main() -> int:
     if args.safe_output is None or args.private_output is None or args.raw_temp_dir is None:
         parser.error("--safe-output, --private-output and --raw-temp-dir are required")
 
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import harvester
 
     def list_files(parent_id: str) -> list[Mapping[str, Any]]:
