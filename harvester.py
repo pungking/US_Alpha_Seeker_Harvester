@@ -97,6 +97,7 @@ TELEGRAM_SIMULATION_CHAT_ID = os.getenv('TELEGRAM_SIMULATION_CHAT_ID')
 TELEGRAM_ALERT_CHAT_ID = os.getenv('TELEGRAM_ALERT_CHAT_ID')
 GITHUB_EVENT_NAME = os.getenv('GITHUB_EVENT_NAME')
 GITHUB_EVENT_PATH = os.getenv('GITHUB_EVENT_PATH')
+GITHUB_EVENT_SCHEDULE = os.getenv('GITHUB_EVENT_SCHEDULE')
 DAILY_BATCH_MODE = (os.getenv('DAILY_BATCH_MODE') or 'auto').strip().lower()
 HARVESTER_RUN_SUMMARY_PATH = (os.getenv("HARVESTER_RUN_SUMMARY_PATH") or "state/last-harvester-run.json").strip()
 HARVESTER_FAILURE_REPORT_PATH = (os.getenv("HARVESTER_FAILURE_REPORT_PATH") or "state/harvester-failure-report.json").strip()
@@ -578,13 +579,16 @@ def _rebuild_drive_service(context):
 
 def resolve_daily_batch(now_kst):
     mode = DAILY_BATCH_MODE
+    source = "schedule" if GITHUB_EVENT_NAME == "schedule" and GITHUB_EVENT_SCHEDULE else "manual"
     # workflow_dispatch 테스트 모드: 강제 1차/2차/전체 선택
     if mode in ("first", "1", "phase1", "batch1"):
-        return DAILY_BATCH_FIRST_LABEL, DAILY_BATCH_FIRST_CHARS, "manual:first"
+        return DAILY_BATCH_FIRST_LABEL, DAILY_BATCH_FIRST_CHARS, f"{source}:first"
     if mode in ("second", "2", "phase2", "batch2"):
-        return DAILY_BATCH_SECOND_LABEL, DAILY_BATCH_SECOND_CHARS, "manual:second"
+        return DAILY_BATCH_SECOND_LABEL, DAILY_BATCH_SECOND_CHARS, f"{source}:second"
     if mode in ("all", "full", "both"):
         return DAILY_BATCH_ALL_LABEL, DAILY_BATCH_ALL_CHARS, "manual:all"
+    if GITHUB_EVENT_NAME == "schedule":
+        raise RuntimeError("scheduled_batch_mapping_missing")
     # 기본: 기존 로직 유지 (KST 시간대에 따른 자동 분할)
     current_hour = now_kst.hour
     if 6 <= current_hour <= 11:
@@ -8026,6 +8030,7 @@ def run_harvester():
             "mode": run_mode,
             "batchLabel": daily_group_label,
             "batchMode": daily_batch_mode,
+            "scheduleExpression": GITHUB_EVENT_SCHEDULE,
             "targetSymbols": daily_target_count,
             "weekendUpdate": bool(is_weekend_update),
             "successCount": total_success,
@@ -8123,6 +8128,7 @@ def run_harvester():
             "mode": run_mode,
             "batchLabel": daily_group_label,
             "batchMode": daily_batch_mode,
+            "scheduleExpression": GITHUB_EVENT_SCHEDULE,
             "targetSymbols": daily_target_count,
             "successCount": total_success,
             "errorCount": total_error,

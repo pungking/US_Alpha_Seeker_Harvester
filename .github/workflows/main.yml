@@ -5,10 +5,11 @@ on:
   repository_dispatch:
     types: [stage3_completed]
     
-  # 정기 스케줄 (KST 기준 1차 07:00, 2차 12:00)
+  # 정기 스케줄 (KST 기준 1차 07:13, 2차 12:13).
+  # GitHub recommends avoiding minute 0 because scheduled delivery may be delayed.
   schedule:
-    - cron: '0 22 * * 1-5'
-    - cron: '0 3 * * 2-6'
+    - cron: '13 22 * * 1-5'
+    - cron: '13 3 * * 2-6'
     
   workflow_dispatch: # 수동 실행 버튼
     inputs:
@@ -50,6 +51,8 @@ jobs:
 
       - name: Symbol-agnostic runtime guard
         run: python scripts/check_symbol_agnostic_runtime.py
+      - name: Harvester schedule-slot contract
+        run: python scripts/check_harvester_schedule_slot_contract.py
       - name: Telegram routing policy audit
         run: python scripts/check_telegram_routing_policy.py
       - name: Target lineage contract
@@ -114,7 +117,8 @@ jobs:
           
           # 🎯 파이썬 코드가 웹앱 신호인지 스케줄 실행인지 판단하는 핵심 변수
           GITHUB_EVENT_NAME: ${{ github.event_name }}
-          DAILY_BATCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_mode || 'auto' }}
+          GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
+          DAILY_BATCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_mode || github.event.schedule == '13 22 * * 1-5' && 'first' || github.event.schedule == '13 3 * * 2-6' && 'second' || 'auto' }}
           HARVESTER_RUN_SUMMARY_PATH: state/last-harvester-run.json
           HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH: state/stage4-earnings-event-coverage-audit.json
           HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH: state/harvester-mapping-freshness-audit.json

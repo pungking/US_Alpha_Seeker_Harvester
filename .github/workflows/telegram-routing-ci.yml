@@ -24,6 +24,8 @@ jobs:
         run: pip install google-api-python-client google-auth requests yfinance pandas
       - name: Symbol-agnostic runtime guard
         run: python scripts/check_symbol_agnostic_runtime.py
+      - name: Harvester schedule-slot contract
+        run: python scripts/check_harvester_schedule_slot_contract.py
       - name: Telegram routing policy audit
         run: python scripts/check_telegram_routing_policy.py
       - name: Target lineage contract
