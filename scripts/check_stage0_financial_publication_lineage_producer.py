@@ -28,9 +28,14 @@ from stage0_financial_publication_lineage_producer import (
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/stage0-sec-financial-lineage-producer.yml"
+RECOVERY_WORKFLOW = ROOT / ".github/workflows/stage0-sec-financial-lineage-current-window-recovery.yml"
 MAIN_WORKFLOW = ROOT / ".github/workflows/main.yml"
 CI_WORKFLOW = ROOT / ".github/workflows/telegram-routing-ci.yml"
 SHA = "a" * 64
+RECOVERY_APPROVAL = (
+    "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE CURRENT-WINDOW RECOVERY ONE-SHOT"
+)
+RECOVERY_TRIGGER_MODE = "MANUAL_CURRENT_WINDOW_RECOVERY"
 
 
 class Response:
@@ -367,6 +372,8 @@ def _test_artifact() -> None:
     assert first["unknownOrUnclassifiedRows"] == 0
     assert first["rawResponseStored"] is False
     assert first["requestBudgetExact"] is True
+    assert first["triggerMode"] == "BOUNDED_ONE_SHOT"
+    assert first["sourceHashCoverage"] == 100
     assert first["Stage1To7PolicyChanged"] is False
     assert first["inputHash"] == second["inputHash"]
     assert first["outputHash"] == second["outputHash"]
@@ -390,6 +397,18 @@ def _test_artifact() -> None:
     assert recurring["collectionWindow"] == recurring_window
     assert recurring["collectionKey"] == recurring_collection_key(recurring_window)
     assert recurring["recurringActivationAuthorized"] is True
+    assert recurring["triggerMode"] == "SCHEDULED_SECOND_BATCH"
+
+    recovery = build_lineage_artifact(
+        **kwargs,
+        collection_window=recurring_window,
+        collection_key=recurring_collection_key(recurring_window),
+        recurring_activation_authorized=True,
+        trigger_mode=RECOVERY_TRIGGER_MODE,
+    )
+    assert recovery["collectionKey"] == recurring["collectionKey"]
+    assert recovery["triggerMode"] == RECOVERY_TRIGGER_MODE
+    assert safe_aggregate(recovery)["triggerMode"] == RECOVERY_TRIGGER_MODE
 
 
 def _test_recurring_reservation() -> None:
@@ -595,6 +614,45 @@ def _test_bounded_runner() -> None:
         assert recurring_result["collectionWindow"] == recurring_window
         assert recurring_result["collectionKey"] == recurring_collection_key(recurring_window)
 
+        reserve_producer(
+            root / "recovery-sentinel",
+            "2026-08-29T03:14:00Z",
+            collection_window=recurring_window,
+            recurring_activation_authorized=True,
+        )
+        recovery_session = Session(
+            [
+                Response(200, json.dumps({"0": {"cik_str": 123, "ticker": "SYNTH"}}).encode()),
+                Response(200, _zip_bytes({"CIK0000000123.json": _companyfacts(_fact())})),
+                Response(200, _zip_bytes({"CIK0000000123.json": _submissions()})),
+            ]
+        )
+        recovery_result = run_bounded_producer(
+            session=recovery_session,
+            environment={"SEC_USER_AGENT": "US Alpha Seeker contact@example.test"},
+            safe_output_path=root / "safe-recovery.json",
+            private_output_path=root / "private-recovery.json",
+            sentinel_dir=root / "recovery-sentinel",
+            raw_temp_dir=root / "raw-recovery",
+            retrieved_at="2026-08-29T03:14:00Z",
+            approval=RECOVERY_APPROVAL,
+            collection_window=recurring_window,
+            recurring_activation_authorized=True,
+            trigger_mode=RECOVERY_TRIGGER_MODE,
+            find_file_id=lambda name, parent=None: ids.get((name, parent)),
+            download_json=lambda file_id: copy.deepcopy(payloads[file_id]),
+            list_files=lambda folder_id: (
+                copy.deepcopy(daily_files)
+                if folder_id == "daily-folder"
+                else copy.deepcopy(history_files)
+            ),
+            upload_json=lambda name, payload, parent: None,
+        )
+        assert recovery_result["status"] == "STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_PASS"
+        assert recovery_result["triggerMode"] == RECOVERY_TRIGGER_MODE
+        assert recovery_result["collectionKey"] == recurring_result["collectionKey"]
+        assert len(recovery_session.requests) == 3
+
 
 def _test_workflow() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -630,6 +688,33 @@ def _test_workflow() -> None:
     assert main_workflow.index("Run Master Harvester") < main_workflow.index(
         "Run scheduled Stage0 SEC financial lineage producer"
     )
+
+    recovery_workflow = RECOVERY_WORKFLOW.read_text(encoding="utf-8")
+    assert "workflow_dispatch:" in recovery_workflow
+    for forbidden in ("schedule:", "pull_request:", "push:"):
+        assert forbidden not in recovery_workflow
+    assert RECOVERY_APPROVAL in recovery_workflow
+    assert 'test "$GITHUB_REF" = "refs/heads/main"' in recovery_workflow
+    assert 'test "$GITHUB_RUN_ATTEMPT" = "1"' in recovery_workflow
+    assert "TZ=America/New_York date +%F" in recovery_workflow
+    assert "recurring_collection_key" in recovery_workflow
+    assert "actions/cache/restore@v4" in recovery_workflow
+    assert "actions/cache/save@v4" in recovery_workflow
+    assert "lookup-only: true" in recovery_workflow
+    assert "restore-keys:" not in recovery_workflow
+    assert "STAGE0_CURRENT_WINDOW_ALREADY_RESERVED" in recovery_workflow
+    assert "--recurring-activation" in recovery_workflow
+    assert '--collection-window "$COLLECTION_WINDOW"' in recovery_workflow
+    assert f'--trigger-mode "{RECOVERY_TRIGGER_MODE}"' in recovery_workflow
+    assert recovery_workflow.index("actions/cache/save@v4") < recovery_workflow.index(
+        "Run current-window Stage0 SEC financial lineage producer"
+    )
+    assert "python harvester.py" not in recovery_workflow
+    assert "SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}" in recovery_workflow
+    assert "GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}" in recovery_workflow
+    recovery_upload = recovery_workflow.split("Upload safe aggregate evidence", 1)[1]
+    for forbidden in ("private.json", "companyfacts.zip", "submissions.zip"):
+        assert forbidden not in recovery_upload
 
 
 def _test_cli_import_boundary() -> None:
