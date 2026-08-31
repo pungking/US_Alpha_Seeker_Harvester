@@ -39,6 +39,12 @@ PRODUCER_APPROVAL = "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE PRODUCER BOUNDED ONE
 PRODUCER_RECURRING_APPROVAL = (
     "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE PRODUCER RECURRING SECOND-BATCH"
 )
+PRODUCER_CURRENT_WINDOW_RECOVERY_APPROVAL = (
+    "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE CURRENT-WINDOW RECOVERY ONE-SHOT"
+)
+TRIGGER_BOUNDED_ONE_SHOT = "BOUNDED_ONE_SHOT"
+TRIGGER_SCHEDULED_SECOND_BATCH = "SCHEDULED_SECOND_BATCH"
+TRIGGER_MANUAL_CURRENT_WINDOW_RECOVERY = "MANUAL_CURRENT_WINDOW_RECOVERY"
 PRODUCER_SCHEMA_VERSION = "stage0-sec-financial-publication-lineage-v1"
 PRODUCER_SOURCE_FAMILY = "STAGE0_SEC_FINANCIAL_PUBLICATION_LINEAGE"
 PRODUCER_PASS_STATUS = "STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_PASS"
@@ -135,6 +141,22 @@ def recurring_collection_key(collection_window: str) -> str:
             "sourceFamily": PRODUCER_SOURCE_FAMILY,
         }
     )
+
+
+def _resolve_trigger_mode(
+    *, recurring_activation_authorized: bool, trigger_mode: str | None
+) -> str:
+    if recurring_activation_authorized:
+        mode = trigger_mode or TRIGGER_SCHEDULED_SECOND_BATCH
+        if mode not in {
+            TRIGGER_SCHEDULED_SECOND_BATCH,
+            TRIGGER_MANUAL_CURRENT_WINDOW_RECOVERY,
+        }:
+            raise ValueError("recurring_trigger_mode_invalid")
+        return mode
+    if trigger_mode not in (None, TRIGGER_BOUNDED_ONE_SHOT):
+        raise ValueError("one_shot_trigger_mode_invalid")
+    return TRIGGER_BOUNDED_ONE_SHOT
 
 
 def _source_group(file_name: str, suffix: str) -> str | None:
@@ -506,6 +528,7 @@ def build_lineage_artifact(
     collection_window: str | None = None,
     collection_key: str | None = None,
     recurring_activation_authorized: bool = False,
+    trigger_mode: str | None = None,
 ) -> dict[str, Any]:
     retrieved = _parse_utc(retrieved_at)
     if retrieved is None:
@@ -514,6 +537,10 @@ def build_lineage_artifact(
         _collection_window(collection_window)
         if collection_window is not None
         else _utc_iso(retrieved)[:10]
+    )
+    effective_trigger_mode = _resolve_trigger_mode(
+        recurring_activation_authorized=recurring_activation_authorized,
+        trigger_mode=trigger_mode,
     )
     if recurring_activation_authorized:
         expected_collection_key = recurring_collection_key(effective_collection_window)
@@ -627,7 +654,9 @@ def build_lineage_artifact(
                 "schemaVersion": PRODUCER_SCHEMA_VERSION,
             }
         ),
+        "triggerMode": effective_trigger_mode,
         "sourceFileCount": len(inventory),
+        "sourceHashCoverage": 100,
         "sourceInputRows": len(ordered_records),
         "sourceParsedRows": len(lineage_rows),
         "sourceRejectedRows": unresolved,
@@ -674,7 +703,9 @@ def safe_aggregate(private_artifact: Mapping[str, Any]) -> dict[str, Any]:
         "generatedAt",
         "collectionWindow",
         "collectionKey",
+        "triggerMode",
         "sourceFileCount",
+        "sourceHashCoverage",
         "sourceInputRows",
         "sourceParsedRows",
         "sourceRejectedRows",
@@ -824,12 +855,17 @@ def run_bounded_producer(
     utc_now: Callable[[], str] = _utc_now,
     collection_window: str | None = None,
     recurring_activation_authorized: bool = False,
+    trigger_mode: str | None = None,
 ) -> dict[str, Any]:
-    expected_approval = (
-        PRODUCER_RECURRING_APPROVAL
-        if recurring_activation_authorized
-        else PRODUCER_APPROVAL
+    effective_trigger_mode = _resolve_trigger_mode(
+        recurring_activation_authorized=recurring_activation_authorized,
+        trigger_mode=trigger_mode,
     )
+    expected_approval = {
+        TRIGGER_BOUNDED_ONE_SHOT: PRODUCER_APPROVAL,
+        TRIGGER_SCHEDULED_SECOND_BATCH: PRODUCER_RECURRING_APPROVAL,
+        TRIGGER_MANUAL_CURRENT_WINDOW_RECOVERY: PRODUCER_CURRENT_WINDOW_RECOVERY_APPROVAL,
+    }[effective_trigger_mode]
     if approval != expected_approval:
         raise RuntimeError("stage0_sec_financial_lineage_producer_approval_required")
     if recurring_activation_authorized:
@@ -925,6 +961,7 @@ def run_bounded_producer(
                     effective_collection_key if recurring_activation_authorized else None
                 ),
                 recurring_activation_authorized=recurring_activation_authorized,
+                trigger_mode=effective_trigger_mode,
             )
         persisted = persist_shadow_artifact(
             private,
@@ -954,12 +991,14 @@ def run_bounded_producer(
             "retrievedAt": effective_retrieved_at,
             "collectionWindow": collection_window,
             "collectionKey": effective_collection_key,
+            "triggerMode": effective_trigger_mode,
             "requestCounts": dict(sorted(client.counts.items())),
             "externalRequestCount": sum(client.counts.values()),
             "requestBudgetCompliant": all(client.counts[key] <= REQUEST_BUDGETS[key] for key in REQUEST_BUDGETS),
             "requestBudgetExact": client.counts == REQUEST_BUDGETS,
             "safeErrorCategory": type(exc).__name__,
             "publicationLineageRows": 0,
+            "sourceHashCoverage": 0,
             "privatePublicationLineageRowsStored": False,
             "actualIdentifiersStoredOrPrinted": False,
             "secretStoredOrPrinted": False,
@@ -999,6 +1038,7 @@ def main() -> int:
     parser.add_argument("--raw-temp-dir", type=Path)
     parser.add_argument("--retrieved-at", default=None)
     parser.add_argument("--collection-window", default=None)
+    parser.add_argument("--trigger-mode", default=None)
     parser.add_argument("--recurring-activation", action="store_true")
     parser.add_argument("--reserve-only", action="store_true")
     args = parser.parse_args()
@@ -1047,6 +1087,7 @@ def main() -> int:
                 upload_json=harvester.upload_json,
                 collection_window=args.collection_window,
                 recurring_activation_authorized=args.recurring_activation,
+                trigger_mode=args.trigger_mode,
             )
     finally:
         session.close()

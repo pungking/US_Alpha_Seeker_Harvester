@@ -1,0 +1,154 @@
+name: Stage0 SEC Financial Lineage Current-Window Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: Exact current-window recovery approval phrase
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: master-stock-harvester-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate approval and ref
+        env:
+          APPROVAL: ${{ inputs.approval }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$APPROVAL" = "AUTHORIZE STAGE0 SEC FINANCIAL LINEAGE CURRENT-WINDOW RECOVERY ONE-SHOT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install producer dependencies
+        run: python -m pip install google-api-python-client google-auth requests yfinance pandas
+
+      - name: Verify static producer contract
+        run: |
+          python scripts/check_financial_publication_lineage_contract.py
+          python scripts/check_financial_publication_lineage_bulk_probe.py
+          python scripts/check_stage0_financial_publication_lineage_producer.py
+
+      - name: Resolve current collection window
+        id: window
+        run: |
+          collection_window="$(TZ=America/New_York date +%F)"
+          collection_key="$(PYTHONPATH=scripts python -c 'from stage0_financial_publication_lineage_producer import recurring_collection_key; import sys; print(recurring_collection_key(sys.argv[1]))' "$collection_window")"
+          echo "collection_window=$collection_window" >> "$GITHUB_OUTPUT"
+          echo "collection_key=$collection_key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore exact current-window reservation
+        id: reservation
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-runtime-sentinel
+          key: stage0-sec-financial-lineage-runtime-${{ steps.window.outputs.collection_key }}
+          lookup-only: true
+
+      - name: Report an existing current-window reservation
+        if: steps.reservation.outputs.cache-hit == 'true'
+        env:
+          COLLECTION_WINDOW: ${{ steps.window.outputs.collection_window }}
+          COLLECTION_KEY: ${{ steps.window.outputs.collection_key }}
+        run: |
+          PYTHONPATH=scripts python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from stage0_financial_publication_lineage_producer import canonical_sha256
+
+          result = {
+              "schemaVersion": "stage0-sec-financial-publication-lineage-v1",
+              "mode": "SHADOW_ONLY_STAGE0_FINANCIAL_PUBLICATION_LINEAGE",
+              "status": "STAGE0_CURRENT_WINDOW_ALREADY_RESERVED",
+              "collectionWindow": os.environ["COLLECTION_WINDOW"],
+              "collectionKey": os.environ["COLLECTION_KEY"],
+              "triggerMode": "MANUAL_CURRENT_WINDOW_RECOVERY",
+              "requestCounts": {
+                  "secCompanyTickerMap": 0,
+                  "secCompanyfactsBulk": 0,
+                  "secSubmissionsBulk": 0,
+              },
+              "externalRequestCount": 0,
+              "requestBudgetCompliant": True,
+              "requestBudgetExact": False,
+              "sourceHashCoverage": 0,
+              "rawResponseStored": False,
+              "actualIdentifiersStoredOrPrinted": False,
+              "secretStoredOrPrinted": False,
+              "stageProgressionGate": "STAGE0_LOCKED",
+              "recurringActivationAuthorized": True,
+              "canonicalSourceChanged": False,
+              "policyImpact": "NONE_REPORT_ONLY",
+              "Stage1To7PolicyChanged": False,
+              "brokerOrSidecarStateMutation": False,
+              "unknownOrUnclassifiedRows": 0,
+          }
+          result["evidenceSha256"] = canonical_sha256(result)
+          path = Path(os.environ["RUNNER_TEMP"]) / "stage0-sec-financial-lineage-current-window-safe.json"
+          path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Reserve current-window Stage0 SEC financial lineage producer
+        if: steps.reservation.outputs.cache-hit != 'true'
+        env:
+          COLLECTION_WINDOW: ${{ steps.window.outputs.collection_window }}
+        run: |
+          python scripts/stage0_financial_publication_lineage_producer.py \
+            --reserve-only \
+            --recurring-activation \
+            --collection-window "$COLLECTION_WINDOW" \
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-runtime-sentinel"
+
+      - name: Persist reservation before network access
+        if: steps.reservation.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-runtime-sentinel
+          key: stage0-sec-financial-lineage-runtime-${{ steps.window.outputs.collection_key }}
+
+      - name: Run current-window Stage0 SEC financial lineage producer
+        if: steps.reservation.outputs.cache-hit != 'true'
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_APPROVAL: ${{ inputs.approval }}
+          COLLECTION_WINDOW: ${{ steps.window.outputs.collection_window }}
+        run: |
+          python scripts/stage0_financial_publication_lineage_producer.py \
+            --safe-output "$RUNNER_TEMP/stage0-sec-financial-lineage-current-window-safe.json" \
+            --private-output "$RUNNER_TEMP/stage0-sec-financial-lineage-current-window-private.json" \
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-runtime-sentinel" \
+            --raw-temp-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-current-window-raw" \
+            --recurring-activation \
+            --collection-window "$COLLECTION_WINDOW" \
+            --trigger-mode "MANUAL_CURRENT_WINDOW_RECOVERY"
+
+      - name: Upload safe aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: stage0-sec-financial-lineage-current-window-${{ github.run_id }}
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-current-window-safe.json
+          if-no-files-found: error
