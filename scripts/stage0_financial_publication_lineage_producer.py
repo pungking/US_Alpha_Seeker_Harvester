@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -45,7 +46,7 @@ PRODUCER_CURRENT_WINDOW_RECOVERY_APPROVAL = (
 TRIGGER_BOUNDED_ONE_SHOT = "BOUNDED_ONE_SHOT"
 TRIGGER_SCHEDULED_SECOND_BATCH = "SCHEDULED_SECOND_BATCH"
 TRIGGER_MANUAL_CURRENT_WINDOW_RECOVERY = "MANUAL_CURRENT_WINDOW_RECOVERY"
-PRODUCER_SCHEMA_VERSION = "stage0-sec-financial-publication-lineage-v1"
+PRODUCER_SCHEMA_VERSION = "stage0-sec-financial-publication-lineage-v2"
 PRODUCER_SOURCE_FAMILY = "STAGE0_SEC_FINANCIAL_PUBLICATION_LINEAGE"
 PRODUCER_PASS_STATUS = "STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_PASS"
 PRODUCER_CURRENT_FILENAME = "STAGE0_SEC_FINANCIAL_PUBLICATION_LINEAGE.json"
@@ -116,6 +117,10 @@ def _utc_iso(value: dt.datetime) -> str:
 
 def _valid_sha256(value: Any) -> bool:
     return SHA256_RE.fullmatch(str(value or "")) is not None
+
+
+def _raw_sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def _collection_window(value: Any) -> str:
@@ -523,6 +528,7 @@ def build_lineage_artifact(
     retrieved_at: str,
     source_files: list[Mapping[str, Any]],
     identity_map_sha256: str,
+    identity_map_content_sha256: str,
     source_response_hashes: Mapping[str, str],
     request_counts: Mapping[str, int],
     collection_window: str | None = None,
@@ -553,6 +559,8 @@ def build_lineage_artifact(
         effective_collection_key = None
     if not _valid_sha256(identity_map_sha256):
         raise ValueError("identity_map_sha256_required")
+    if not _valid_sha256(identity_map_content_sha256):
+        raise ValueError("identity_map_content_sha256_required")
     inventory = sorted(
         (
             {
@@ -560,6 +568,8 @@ def build_lineage_artifact(
                 "sourceKind": str(row.get("sourceKind") or ""),
                 "contentSha256": str(row.get("contentSha256") or ""),
                 "hashBasis": "CANONICAL_JSON_DOWNLOADED_FROM_DRIVE",
+                "rawContentSha256": str(row.get("rawContentSha256") or ""),
+                "rawHashBasis": "RAW_DRIVE_FILE_BYTES",
             }
             for row in source_files
         ),
@@ -567,7 +577,12 @@ def build_lineage_artifact(
     )
     if len({(row["sourceKind"], row["fileName"]) for row in inventory}) != len(inventory):
         raise ValueError("duplicate_source_file_identity")
-    if any(not row["fileName"] or not _valid_sha256(row["contentSha256"]) for row in inventory):
+    if any(
+        not row["fileName"]
+        or not _valid_sha256(row["contentSha256"])
+        or not _valid_sha256(row["rawContentSha256"])
+        for row in inventory
+    ):
         raise ValueError("invalid_source_file_inventory")
     response_hashes = dict(sorted(source_response_hashes.items()))
     if set(response_hashes) != set(REQUEST_BUDGETS) or any(
@@ -617,9 +632,21 @@ def build_lineage_artifact(
     )
     request_budget_exact = counts == REQUEST_BUDGETS
     source_inventory_sha256 = canonical_sha256(inventory)
+    raw_source_inventory_sha256 = canonical_sha256(
+        [
+            {
+                "fileName": row["fileName"],
+                "rawContentSha256": row["rawContentSha256"],
+                "rawHashBasis": row["rawHashBasis"],
+                "sourceKind": row["sourceKind"],
+            }
+            for row in inventory
+        ]
+    )
     input_hash = canonical_sha256(
         {
             "identityMapSha256": identity_map_sha256,
+            "identityMapContentSha256": identity_map_content_sha256,
             "records": ordered_records,
             "sourceFileHashes": inventory,
             "sourceResponseHashes": response_hashes,
@@ -657,12 +684,15 @@ def build_lineage_artifact(
         "triggerMode": effective_trigger_mode,
         "sourceFileCount": len(inventory),
         "sourceHashCoverage": 100,
+        "rawSourceHashCoverage": 100,
         "sourceInputRows": len(ordered_records),
         "sourceParsedRows": len(lineage_rows),
         "sourceRejectedRows": unresolved,
         "sourceFileHashes": inventory,
         "sourceInventorySha256": source_inventory_sha256,
+        "rawSourceInventorySha256": raw_source_inventory_sha256,
         "identityMapSha256": identity_map_sha256,
+        "identityMapContentSha256": identity_map_content_sha256,
         "sourceResponseHashes": response_hashes,
         "requestCounts": counts,
         "externalRequestCount": sum(counts.values()),
@@ -706,11 +736,14 @@ def safe_aggregate(private_artifact: Mapping[str, Any]) -> dict[str, Any]:
         "triggerMode",
         "sourceFileCount",
         "sourceHashCoverage",
+        "rawSourceHashCoverage",
         "sourceInputRows",
         "sourceParsedRows",
         "sourceRejectedRows",
         "sourceInventorySha256",
+        "rawSourceInventorySha256",
         "identityMapSha256",
+        "identityMapContentSha256",
         "sourceResponseHashes",
         "requestCounts",
         "externalRequestCount",
@@ -797,9 +830,16 @@ def _zip_loader(archive: zipfile.ZipFile) -> Callable[[str], Any]:
 def _drive_source_files(
     *,
     find_file_id: Callable[[str, str | None], Any],
-    download_json: Callable[[str], Any],
+    download_json_with_bytes: Callable[[str], tuple[Any, bytes]],
     list_files: Callable[[str], list[Mapping[str, Any]]],
-) -> tuple[str, Mapping[str, Any], str, list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    str,
+    Mapping[str, Any],
+    str,
+    str,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     root_id = find_file_id("US_Alpha_Seeker", None)
     system_id = find_file_id("System_Identity_Maps", root_id)
     daily_id = find_file_id("Financial_Data_Daily", system_id)
@@ -807,10 +847,13 @@ def _drive_source_files(
     identity_id = find_file_id("Ticker_ID_Mapping_Final.json", system_id)
     if not all((root_id, system_id, daily_id, history_id, identity_id)):
         raise ValueError("drive_stage0_source_contract_incomplete")
-    identity_map = download_json(identity_id)
+    identity_map, identity_raw = download_json_with_bytes(identity_id)
     if not isinstance(identity_map, Mapping):
         raise ValueError("identity_map_invalid")
+    if not isinstance(identity_raw, bytes):
+        raise ValueError("identity_map_raw_bytes_invalid")
     identity_hash = canonical_sha256(identity_map)
+    identity_content_hash = _raw_sha256(identity_raw)
 
     def read_folder(folder_id: str, suffix: str) -> list[dict[str, Any]]:
         files = [
@@ -823,19 +866,29 @@ def _drive_source_files(
             raise ValueError(f"incomplete_stage0_{suffix}_source_inventory")
         result = []
         for row in sorted(files, key=lambda value: str(value.get("name") or "")):
-            payload = download_json(str(row.get("id") or ""))
+            payload, raw = download_json_with_bytes(str(row.get("id") or ""))
             if not isinstance(payload, Mapping):
                 raise ValueError(f"invalid_stage0_{suffix}_source_payload")
+            if not isinstance(raw, bytes):
+                raise ValueError(f"invalid_stage0_{suffix}_source_raw_bytes")
             result.append(
                 {
                     "fileName": str(row["name"]),
                     "contentSha256": canonical_sha256(payload),
+                    "rawContentSha256": _raw_sha256(raw),
                     "payload": payload,
                 }
             )
         return result
 
-    return system_id, identity_map, identity_hash, read_folder(daily_id, "daily"), read_folder(history_id, "history")
+    return (
+        system_id,
+        identity_map,
+        identity_hash,
+        identity_content_hash,
+        read_folder(daily_id, "daily"),
+        read_folder(history_id, "history"),
+    )
 
 
 def run_bounded_producer(
@@ -849,7 +902,7 @@ def run_bounded_producer(
     retrieved_at: str | None,
     approval: str,
     find_file_id: Callable[[str, str | None], Any],
-    download_json: Callable[[str], Any],
+    download_json_with_bytes: Callable[[str], tuple[Any, bytes]],
     list_files: Callable[[str], list[Mapping[str, Any]]],
     upload_json: Callable[[str, dict[str, Any], str], None],
     utc_now: Callable[[], str] = _utc_now,
@@ -889,9 +942,16 @@ def run_bounded_producer(
     status = "STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_RUNTIME_FAILURE"
     safe: dict[str, Any] = {}
     try:
-        system_id, identity_map, identity_hash, daily_files, history_files = _drive_source_files(
+        (
+            system_id,
+            identity_map,
+            identity_hash,
+            identity_content_hash,
+            daily_files,
+            history_files,
+        ) = _drive_source_files(
             find_file_id=find_file_id,
-            download_json=download_json,
+            download_json_with_bytes=download_json_with_bytes,
             list_files=list_files,
         )
         records = build_financial_input_rows(
@@ -939,10 +999,20 @@ def run_bounded_producer(
             "secSubmissionsBulk": submissions_metadata["responseSha256"],
         }
         source_files = [
-            {"fileName": row["fileName"], "sourceKind": "DAILY", "contentSha256": row["contentSha256"]}
+            {
+                "fileName": row["fileName"],
+                "sourceKind": "DAILY",
+                "contentSha256": row["contentSha256"],
+                "rawContentSha256": row["rawContentSha256"],
+            }
             for row in daily_files
         ] + [
-            {"fileName": row["fileName"], "sourceKind": "HISTORY", "contentSha256": row["contentSha256"]}
+            {
+                "fileName": row["fileName"],
+                "sourceKind": "HISTORY",
+                "contentSha256": row["contentSha256"],
+                "rawContentSha256": row["rawContentSha256"],
+            }
             for row in history_files
         ]
         with zipfile.ZipFile(companyfacts_path) as company_archive, zipfile.ZipFile(submissions_path) as submission_archive:
@@ -954,6 +1024,7 @@ def run_bounded_producer(
                 retrieved_at=effective_retrieved_at,
                 source_files=source_files,
                 identity_map_sha256=identity_hash,
+                identity_map_content_sha256=identity_content_hash,
                 source_response_hashes=response_hashes,
                 request_counts=client.counts,
                 collection_window=collection_window,
@@ -999,6 +1070,7 @@ def run_bounded_producer(
             "safeErrorCategory": type(exc).__name__,
             "publicationLineageRows": 0,
             "sourceHashCoverage": 0,
+            "rawSourceHashCoverage": 0,
             "privatePublicationLineageRowsStored": False,
             "actualIdentifiersStoredOrPrinted": False,
             "secretStoredOrPrinted": False,
@@ -1082,7 +1154,9 @@ def main() -> int:
                 retrieved_at=retrieved_at,
                 approval=str(os.getenv("STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_APPROVAL") or ""),
                 find_file_id=harvester.find_file_id,
-                download_json=harvester.download_json,
+                download_json_with_bytes=lambda file_id: harvester.download_json(
+                    file_id, include_raw=True
+                ),
                 list_files=list_files,
                 upload_json=harvester.upload_json,
                 collection_window=args.collection_window,

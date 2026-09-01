@@ -713,7 +713,7 @@ def find_file_id(name, parent_id=None):
         f"after {DRIVE_RETRY_ATTEMPTS} attempts: {type(last_error).__name__ if last_error else 'Unknown'}: {last_error}"
     )
 
-def download_json(file_id):
+def download_json(file_id, *, include_raw=False):
     if not file_id: return None # 반환값을 None으로 명확히 하여 메인 로직에서 타입 캐스팅 유도
     last_error = None
     for attempt in range(DRIVE_RETRY_ATTEMPTS): # 다운로드도 3번 재시도
@@ -723,7 +723,9 @@ def download_json(file_id):
             downloader = MediaIoBaseDownload(fh, request)
             done = False
             while not done: _, done = downloader.next_chunk()
-            return json.loads(fh.getvalue().decode())
+            raw = fh.getvalue()
+            payload = json.loads(raw.decode())
+            return (payload, raw) if include_raw else payload
         except json.JSONDecodeError as e:
             print(f"⚠️ JSON 파싱 오류(download_json:{file_id}): {e}", flush=True)
             return None
