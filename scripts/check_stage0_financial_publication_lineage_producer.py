@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -74,6 +75,14 @@ def _zip_bytes(files: dict[str, object]) -> bytes:
         for name, payload in files.items():
             archive.writestr(name, json.dumps(payload, sort_keys=True))
     return output.getvalue()
+
+
+def _raw_json_bytes(payload: object) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _raw_sha256(payload: object) -> str:
+    return hashlib.sha256(_raw_json_bytes(payload)).hexdigest()
 
 
 def _identity(*, alias: bool = False) -> dict[str, object]:
@@ -346,10 +355,21 @@ def _test_artifact() -> None:
         "submissions_by_cik": {"0000000123": _submissions()},
         "retrieved_at": "2026-08-02T00:00:00Z",
         "source_files": [
-            {"fileName": "S_stocks_daily.json", "sourceKind": "DAILY", "contentSha256": SHA},
-            {"fileName": "S_stocks_history.json", "sourceKind": "HISTORY", "contentSha256": "b" * 64},
+            {
+                "fileName": "S_stocks_daily.json",
+                "sourceKind": "DAILY",
+                "contentSha256": SHA,
+                "rawContentSha256": "1" * 64,
+            },
+            {
+                "fileName": "S_stocks_history.json",
+                "sourceKind": "HISTORY",
+                "contentSha256": "b" * 64,
+                "rawContentSha256": "2" * 64,
+            },
         ],
         "identity_map_sha256": "f" * 64,
+        "identity_map_content_sha256": "3" * 64,
         "source_response_hashes": {
             "secCompanyTickerMap": "c" * 64,
             "secCompanyfactsBulk": "d" * 64,
@@ -374,6 +394,12 @@ def _test_artifact() -> None:
     assert first["requestBudgetExact"] is True
     assert first["triggerMode"] == "BOUNDED_ONE_SHOT"
     assert first["sourceHashCoverage"] == 100
+    assert first["rawSourceHashCoverage"] == 100
+    assert first["identityMapContentSha256"] == "3" * 64
+    assert all(
+        row["rawHashBasis"] == "RAW_DRIVE_FILE_BYTES"
+        for row in first["sourceFileHashes"]
+    )
     assert first["Stage1To7PolicyChanged"] is False
     assert first["inputHash"] == second["inputHash"]
     assert first["outputHash"] == second["outputHash"]
@@ -455,6 +481,7 @@ def _test_bounded_runner() -> None:
             "symbol": "SYNTH",
             "sourceSymbol": "SYNTH",
             "analysisEligible": True,
+            "displayName": "synthetic 테스트",
         }
     }
     payloads: dict[str, object] = {"identity": identity_map}
@@ -470,7 +497,7 @@ def _test_bounded_runner() -> None:
     payloads["daily-S"] = {
         "SYNTH": {
             "symbol": "SYNTH",
-            "netIncome": 100,
+            "netIncome": 100.0,
             "netIncomeSource": "HISTORY",
             "netIncomeAsOf": "2026-06-30",
         }
@@ -527,7 +554,10 @@ def _test_bounded_runner() -> None:
             utc_now=utc_now,
             approval=PRODUCER_APPROVAL,
             find_file_id=lambda name, parent=None: ids.get((name, parent)),
-            download_json=lambda file_id: copy.deepcopy(payloads[file_id]),
+            download_json_with_bytes=lambda file_id: (
+                copy.deepcopy(payloads[file_id]),
+                _raw_json_bytes(payloads[file_id]),
+            ),
             list_files=lambda folder_id: (
                 copy.deepcopy(daily_files)
                 if folder_id == "daily-folder"
@@ -549,6 +579,16 @@ def _test_bounded_runner() -> None:
         assert len(session.requests) == 3
         assert clock_request_counts[0] == 3
         assert result["generatedAt"] == "2026-08-02T00:00:00Z"
+        assert result["rawSourceHashCoverage"] == 100
+        private = json.loads((root / "private.json").read_text(encoding="utf-8"))
+        assert private["identityMapContentSha256"] == _raw_sha256(identity_map)
+        assert {
+            row["rawContentSha256"] for row in private["sourceFileHashes"]
+        } == {
+            _raw_sha256(payloads[row["id"]])
+            for row in daily_files + history_files
+        }
+        assert canonical_sha256(payloads["daily-S"]) != _raw_sha256(payloads["daily-S"])
         assert all(call["kwargs"].get("allow_redirects") is False for call in session.requests)
         assert len(uploads) == 2
         assert json.loads(sentinel.read_text())["status"] == "COMPLETE"
@@ -566,7 +606,10 @@ def _test_bounded_runner() -> None:
                 retrieved_at="2026-08-02T00:00:00Z",
                 approval=PRODUCER_APPROVAL,
                 find_file_id=lambda name, parent=None: ids.get((name, parent)),
-                download_json=lambda file_id: copy.deepcopy(payloads[file_id]),
+                download_json_with_bytes=lambda file_id: (
+                    copy.deepcopy(payloads[file_id]),
+                    _raw_json_bytes(payloads[file_id]),
+                ),
                 list_files=lambda folder_id: [],
                 upload_json=lambda name, payload, parent: None,
             )
@@ -602,7 +645,10 @@ def _test_bounded_runner() -> None:
             collection_window=recurring_window,
             recurring_activation_authorized=True,
             find_file_id=lambda name, parent=None: ids.get((name, parent)),
-            download_json=lambda file_id: copy.deepcopy(payloads[file_id]),
+            download_json_with_bytes=lambda file_id: (
+                copy.deepcopy(payloads[file_id]),
+                _raw_json_bytes(payloads[file_id]),
+            ),
             list_files=lambda folder_id: (
                 copy.deepcopy(daily_files)
                 if folder_id == "daily-folder"
@@ -640,7 +686,10 @@ def _test_bounded_runner() -> None:
             recurring_activation_authorized=True,
             trigger_mode=RECOVERY_TRIGGER_MODE,
             find_file_id=lambda name, parent=None: ids.get((name, parent)),
-            download_json=lambda file_id: copy.deepcopy(payloads[file_id]),
+            download_json_with_bytes=lambda file_id: (
+                copy.deepcopy(payloads[file_id]),
+                _raw_json_bytes(payloads[file_id]),
+            ),
             list_files=lambda folder_id: (
                 copy.deepcopy(daily_files)
                 if folder_id == "daily-folder"
