@@ -199,6 +199,9 @@ RAW_QUOTE_OPTIONAL_KEYS = [
 RAW_FUNDAMENTAL_OPTIONAL_KEYS = [
     "netIncome",
     "netIncomeCommonStockholders",
+    "netIncomeEvidenceValue",
+    "netIncomeEvidenceAsOf",
+    "netIncomeEvidenceSource",
 ]
 
 RAW_TRACE_OPTIONAL_KEYS = [
@@ -7743,6 +7746,13 @@ def run_harvester():
                                 "regularMarketChangePercent": info_regular_market_change_pct,
                                 "netIncome": net_income_value,
                                 "netIncomeCommonStockholders": net_income_common_value,
+                                "netIncomeEvidenceValue": history_net_income,
+                                "netIncomeEvidenceAsOf": history_net_income_asof,
+                                "netIncomeEvidenceSource": (
+                                    "HISTORY"
+                                    if history_net_income is not None and history_net_income_asof
+                                    else "MISSING"
+                                ),
                                 "quoteTimestamp": info_quote_timestamp,
                                 "quoteSource": quote_source,
                                 "netIncomeSource": net_income_source,
