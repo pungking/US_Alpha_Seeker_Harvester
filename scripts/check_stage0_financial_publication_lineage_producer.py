@@ -269,6 +269,39 @@ def _test_input_rows() -> None:
     )
     assert info_rows[0]["inputStatus"] == "FINANCIAL_LINEAGE_NOT_APPLICABLE"
 
+    info_with_history_evidence = copy.deepcopy(info)
+    info_with_history_evidence["payload"]["SYNTH"].update(
+        netIncome=999,
+        netIncomeEvidenceValue=100,
+        netIncomeEvidenceAsOf="2026-06-30",
+        netIncomeEvidenceSource="HISTORY",
+    )
+    evidence_rows = build_financial_input_rows(
+        identity_map=identity_map,
+        identity_map_sha256="f" * 64,
+        daily_files=[info_with_history_evidence],
+        history_files=[history],
+    )
+    assert evidence_rows[0]["inputStatus"] == "READY_FOR_EXACT_SEC_LINEAGE"
+    assert evidence_rows[0]["value"] == 100
+    assert evidence_rows[0]["fiscalPeriod"] == "2026-06-30"
+    assert evidence_rows[0]["sourceMetricLabel"] == "Net Income"
+
+
+def _test_harvester_history_evidence_wiring() -> None:
+    source = (ROOT / "harvester.py").read_text(encoding="utf-8")
+    fields = (
+        "netIncomeEvidenceValue",
+        "netIncomeEvidenceAsOf",
+        "netIncomeEvidenceSource",
+    )
+    fundamental_keys = source.split("RAW_FUNDAMENTAL_OPTIONAL_KEYS = [", 1)[1].split("]", 1)[0]
+    for field in fields:
+        assert f'"{field}"' in fundamental_keys
+    assert '"netIncomeEvidenceValue": history_net_income' in source
+    assert '"netIncomeEvidenceAsOf": history_net_income_asof' in source
+    assert '"netIncomeEvidenceSource":' in source
+
 
 def _test_classification() -> None:
     original = _classify()
@@ -798,6 +831,7 @@ def _test_cli_import_boundary() -> None:
 
 def main() -> int:
     _test_input_rows()
+    _test_harvester_history_evidence_wiring()
     _test_classification()
     _test_artifact()
     _test_recurring_reservation()

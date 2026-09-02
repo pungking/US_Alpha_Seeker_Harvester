@@ -252,20 +252,37 @@ def build_financial_input_rows(
                 raise ValueError("invalid_stage0_daily_row")
             symbol = str(daily_row.get("symbol") or key).strip().upper()
             identity = _identity_for_symbol(identity_map, symbol)
+            has_history_evidence = any(
+                field in daily_row
+                for field in (
+                    "netIncomeEvidenceValue",
+                    "netIncomeEvidenceAsOf",
+                    "netIncomeEvidenceSource",
+                )
+            )
             record: dict[str, Any] = {
                 "identity": identity,
                 "identityMapSha256": identity_map_sha256,
                 "financialMetricBasis": "NET_INCOME",
                 "sourceMetricLabel": None,
-                "value": daily_row.get("netIncome"),
-                "fiscalPeriod": str(daily_row.get("netIncomeAsOf") or "").strip() or None,
+                "value": daily_row.get("netIncomeEvidenceValue") if has_history_evidence else daily_row.get("netIncome"),
+                "fiscalPeriod": str(
+                    daily_row.get("netIncomeEvidenceAsOf")
+                    if has_history_evidence
+                    else daily_row.get("netIncomeAsOf")
+                ).strip() or None,
                 "sourceDailyFile": daily_file["fileName"],
                 "sourceDailyFileSha256": daily_file["contentSha256"],
                 "sourceHistoryFile": history_file["fileName"],
                 "sourceHistoryFileSha256": history_file["contentSha256"],
                 "inputStatus": "READY_FOR_EXACT_SEC_LINEAGE",
             }
-            if str(daily_row.get("netIncomeSource") or "").upper() != "HISTORY":
+            evidence_source = (
+                daily_row.get("netIncomeEvidenceSource")
+                if has_history_evidence
+                else daily_row.get("netIncomeSource")
+            )
+            if str(evidence_source or "").upper() != "HISTORY":
                 record["inputStatus"] = "FINANCIAL_LINEAGE_NOT_APPLICABLE"
                 result.append(record)
                 continue
