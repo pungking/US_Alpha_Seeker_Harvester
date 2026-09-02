@@ -260,28 +260,52 @@ def build_financial_input_rows(
                     "netIncomeEvidenceSource",
                 )
             )
+            evidence_value = (
+                daily_row.get("netIncomeEvidenceValue")
+                if has_history_evidence
+                else daily_row.get("netIncome")
+            )
+            evidence_as_of = (
+                daily_row.get("netIncomeEvidenceAsOf")
+                if has_history_evidence
+                else daily_row.get("netIncomeAsOf")
+            )
+            evidence_source = (
+                daily_row.get("netIncomeEvidenceSource")
+                if has_history_evidence
+                else daily_row.get("netIncomeSource")
+            )
+            history_entry = history_payload.get(symbol)
+            if (
+                not has_history_evidence
+                and str(evidence_source or "").upper() != "HISTORY"
+            ):
+                for history_row in _history_rows(history_entry):
+                    period = str(history_row.get("date") or "").strip()
+                    if not period:
+                        continue
+                    for label in SOURCE_METRIC_CONCEPTS:
+                        value = _exact_decimal(history_row.get(label))
+                        if value is not None:
+                            evidence_value = value
+                            evidence_as_of = period
+                            evidence_source = "HISTORY"
+                            break
+                    if str(evidence_source or "").upper() == "HISTORY":
+                        break
             record: dict[str, Any] = {
                 "identity": identity,
                 "identityMapSha256": identity_map_sha256,
                 "financialMetricBasis": "NET_INCOME",
                 "sourceMetricLabel": None,
-                "value": daily_row.get("netIncomeEvidenceValue") if has_history_evidence else daily_row.get("netIncome"),
-                "fiscalPeriod": str(
-                    daily_row.get("netIncomeEvidenceAsOf")
-                    if has_history_evidence
-                    else daily_row.get("netIncomeAsOf")
-                ).strip() or None,
+                "value": evidence_value,
+                "fiscalPeriod": str(evidence_as_of or "").strip() or None,
                 "sourceDailyFile": daily_file["fileName"],
                 "sourceDailyFileSha256": daily_file["contentSha256"],
                 "sourceHistoryFile": history_file["fileName"],
                 "sourceHistoryFileSha256": history_file["contentSha256"],
                 "inputStatus": "READY_FOR_EXACT_SEC_LINEAGE",
             }
-            evidence_source = (
-                daily_row.get("netIncomeEvidenceSource")
-                if has_history_evidence
-                else daily_row.get("netIncomeSource")
-            )
             if str(evidence_source or "").upper() != "HISTORY":
                 record["inputStatus"] = "FINANCIAL_LINEAGE_NOT_APPLICABLE"
                 result.append(record)
@@ -290,7 +314,6 @@ def build_financial_input_rows(
             value = _exact_decimal(record.get("value"))
             selected_label: str | None = None
             if value is not None and fiscal_period:
-                history_entry = history_payload.get(symbol)
                 for history_row in _history_rows(history_entry):
                     if str(history_row.get("date") or "") != fiscal_period:
                         continue

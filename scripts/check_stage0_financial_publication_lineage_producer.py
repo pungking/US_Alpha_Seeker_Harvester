@@ -267,7 +267,18 @@ def _test_input_rows() -> None:
         daily_files=[info],
         history_files=[history],
     )
-    assert info_rows[0]["inputStatus"] == "FINANCIAL_LINEAGE_NOT_APPLICABLE"
+    assert info_rows[0]["inputStatus"] == "READY_FOR_EXACT_SEC_LINEAGE"
+    assert info_rows[0]["value"] == 100
+    assert info_rows[0]["fiscalPeriod"] == "2026-06-30"
+    assert info_rows[0]["sourceMetricLabel"] == "Net Income"
+
+    info_without_history = build_financial_input_rows(
+        identity_map=identity_map,
+        identity_map_sha256="f" * 64,
+        daily_files=[info],
+        history_files=[{**history, "payload": {"SYNTH": {"financials": []}}}],
+    )
+    assert info_without_history[0]["inputStatus"] == "FINANCIAL_LINEAGE_NOT_APPLICABLE"
 
     info_with_history_evidence = copy.deepcopy(info)
     info_with_history_evidence["payload"]["SYNTH"].update(
