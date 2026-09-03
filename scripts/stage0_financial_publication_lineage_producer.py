@@ -287,7 +287,7 @@ def build_financial_input_rows(
                     for label in SOURCE_METRIC_CONCEPTS:
                         value = _exact_decimal(history_row.get(label))
                         if value is not None:
-                            evidence_value = value
+                            evidence_value = history_row.get(label)
                             evidence_as_of = period
                             evidence_source = "HISTORY"
                             break
