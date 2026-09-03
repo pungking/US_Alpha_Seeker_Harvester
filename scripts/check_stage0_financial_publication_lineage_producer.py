@@ -271,6 +271,7 @@ def _test_input_rows() -> None:
     assert info_rows[0]["value"] == 100
     assert info_rows[0]["fiscalPeriod"] == "2026-06-30"
     assert info_rows[0]["sourceMetricLabel"] == "Net Income"
+    assert canonical_sha256(info_rows) == canonical_sha256(copy.deepcopy(info_rows))
 
     info_without_history = build_financial_input_rows(
         identity_map=identity_map,
