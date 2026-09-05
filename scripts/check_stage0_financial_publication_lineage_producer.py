@@ -796,6 +796,9 @@ def _test_workflow() -> None:
     assert "actions/cache/save@v4" in recovery_workflow
     assert "lookup-only: true" in recovery_workflow
     assert "restore-keys:" not in recovery_workflow
+    assert "stage0-sec-financial-lineage-recovery-${{ steps.window.outputs.collection_key }}" in recovery_workflow
+    assert "stage0-sec-financial-lineage-runtime-${{ steps.window.outputs.collection_key }}" not in recovery_workflow
+    assert "stage0-sec-financial-lineage-recovery-sentinel" in recovery_workflow
     assert "STAGE0_CURRENT_WINDOW_ALREADY_RESERVED" in recovery_workflow
     assert "--recurring-activation" in recovery_workflow
     assert '--collection-window "$COLLECTION_WINDOW"' in recovery_workflow

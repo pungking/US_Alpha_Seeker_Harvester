@@ -60,8 +60,8 @@ jobs:
         id: reservation
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/stage0-sec-financial-lineage-runtime-sentinel
-          key: stage0-sec-financial-lineage-runtime-${{ steps.window.outputs.collection_key }}
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-recovery-sentinel
+          key: stage0-sec-financial-lineage-recovery-${{ steps.window.outputs.collection_key }}
           lookup-only: true
 
       - name: Report an existing current-window reservation
@@ -117,14 +117,14 @@ jobs:
             --reserve-only \
             --recurring-activation \
             --collection-window "$COLLECTION_WINDOW" \
-            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-runtime-sentinel"
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-recovery-sentinel"
 
       - name: Persist reservation before network access
         if: steps.reservation.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/stage0-sec-financial-lineage-runtime-sentinel
-          key: stage0-sec-financial-lineage-runtime-${{ steps.window.outputs.collection_key }}
+          path: ${{ runner.temp }}/stage0-sec-financial-lineage-recovery-sentinel
+          key: stage0-sec-financial-lineage-recovery-${{ steps.window.outputs.collection_key }}
 
       - name: Run current-window Stage0 SEC financial lineage producer
         if: steps.reservation.outputs.cache-hit != 'true'
@@ -139,7 +139,7 @@ jobs:
           python scripts/stage0_financial_publication_lineage_producer.py \
             --safe-output "$RUNNER_TEMP/stage0-sec-financial-lineage-current-window-safe.json" \
             --private-output "$RUNNER_TEMP/stage0-sec-financial-lineage-current-window-private.json" \
-            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-runtime-sentinel" \
+            --sentinel-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-recovery-sentinel" \
             --raw-temp-dir "$RUNNER_TEMP/stage0-sec-financial-lineage-current-window-raw" \
             --recurring-activation \
             --collection-window "$COLLECTION_WINDOW" \
