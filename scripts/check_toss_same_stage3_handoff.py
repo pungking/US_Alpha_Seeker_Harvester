@@ -78,6 +78,45 @@ def main() -> int:
     assert scope["status"] == "VERIFIED_STAGE3_REQUEST_SCOPE"
     assert scope["normalizationCollisionRows"] == 0
     assert scope["symbols"] == ["FIXTURE-B", "FIXTURE.A"]
+
+    raw_stage3 = json.dumps(
+        _payload("UNICODE.가", "FIXTURE-B"),
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    dispatch_contract = {
+        "trigger_file": "STAGE3_FUNDAMENTAL_FULL_FIXTURE.json",
+        "artifact_hash": hashlib.sha256(raw_stage3).hexdigest(),
+        "artifact_hash_basis": "UTF8_JSON_BYTES",
+    }
+    hashes = harvester_module.validate_dispatch_stage3_content(
+        dispatch_contract,
+        json.loads(raw_stage3),
+        raw_stage3,
+    )
+    assert hashes["contentSha256"] == dispatch_contract["artifact_hash"]
+    assert hashes["canonicalSha256"] == harvester_module._canonical_sha256(
+        json.loads(raw_stage3)
+    )
+    assert hashes["canonicalSha256"] != hashes["contentSha256"]
+    try:
+        harvester_module.validate_dispatch_stage3_content(
+            {**dispatch_contract, "artifact_hash": "0" * 64},
+            json.loads(raw_stage3),
+            raw_stage3,
+        )
+        raise AssertionError("mismatched dispatch hash must fail closed")
+    except RuntimeError as error:
+        assert str(error) == "specified_stage3_trigger_hash_mismatch"
+    try:
+        harvester_module.validate_dispatch_stage3_content(
+            {**dispatch_contract, "artifact_hash_basis": "CANONICAL_JSON"},
+            json.loads(raw_stage3),
+            raw_stage3,
+        )
+        raise AssertionError("unsupported dispatch hash basis must fail closed")
+    except RuntimeError as error:
+        assert str(error) == "specified_stage3_trigger_hash_invalid"
     source_artifact = scope["sourceArtifact"]
     assert source_artifact["hashBasis"] == "CANONICAL_JSON"
     assert source_artifact["generatedAtSource"] == "ARTIFACT_FIELD"
@@ -688,6 +727,11 @@ def main() -> int:
     assert "--toss-shadow-collector" in harvester_source
     assert "trigger_sha256" in harvester_source
     assert "trigger_request_scope_sha256" in harvester_source
+    assert '"artifact_hash_basis": payload.get("artifact_hash_basis")' in (
+        harvester_source
+    )
+    assert "include_raw=True" in harvester_source
+    assert '"trigger_content_hash_basis": "UTF8_JSON_BYTES"' in harvester_source
     assert "EXISTING_MATCHED_SHADOW_REUSED" in harvester_source
     pending_index = harvester_source.index('"status": "ALERT_PENDING_POST_PUBLISH"')
     dispatch_index = harvester_source.index(
