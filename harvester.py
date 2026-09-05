@@ -5133,16 +5133,47 @@ def _mapping_audit_markdown(audit):
         lines.extend(["## Review Sample", "", ", ".join(f"`{s}`" for s in review[:40]), ""])
     return "\n".join(lines).rstrip() + "\n"
 
-def get_dispatch_trigger_file():
+def get_dispatch_trigger_contract() -> dict[str, Any]:
     if not GITHUB_EVENT_PATH:
-        return None
+        return {}
     try:
         with open(GITHUB_EVENT_PATH, 'r', encoding='utf-8') as f:
             event = json.load(f)
-        return event.get('client_payload', {}).get('trigger_file')
-    except Exception as e:
-        print(f"⚠️ trigger_file 파싱 실패: {str(e)}")
-        return None
+        if not isinstance(event, dict):
+            return {}
+        payload = event.get('client_payload', {})
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            "trigger_file": payload.get("trigger_file"),
+            "artifact_hash": payload.get("artifact_hash"),
+            "artifact_hash_basis": payload.get("artifact_hash_basis"),
+        }
+    except (OSError, json.JSONDecodeError, TypeError) as e:
+        print(f"⚠️ Stage 3 dispatch contract 파싱 실패: {type(e).__name__}")
+        return {}
+
+
+def validate_dispatch_stage3_content(
+    contract: Mapping[str, Any],
+    payload: Any,
+    raw: bytes,
+) -> dict[str, str]:
+    expected = str(contract.get("artifact_hash") or "").strip().lower()
+    if (
+        contract.get("artifact_hash_basis") != "UTF8_JSON_BYTES"
+        or not re.fullmatch(r"[0-9a-f]{64}", expected)
+        or not isinstance(payload, dict)
+        or not isinstance(raw, bytes)
+    ):
+        raise RuntimeError("specified_stage3_trigger_hash_invalid")
+    content_sha256 = hashlib.sha256(raw).hexdigest()
+    if content_sha256 != expected:
+        raise RuntimeError("specified_stage3_trigger_hash_mismatch")
+    return {
+        "contentSha256": content_sha256,
+        "canonicalSha256": _canonical_sha256(payload),
+    }
 
 # [추가됨] 실시간 진행 상태 기록 함수
 def update_progress(
@@ -6800,6 +6831,7 @@ def run_harvester():
     run_mode = "dispatch" if GITHUB_EVENT_NAME == 'repository_dispatch' else "daily"
     dispatch_trigger_file = None
     dispatch_trigger_sha256 = None
+    dispatch_trigger_content_sha256 = None
     dispatch_trigger_request_scope_sha256 = None
     dispatch_total_symbols = 0
     dispatch_benchmark_success = 0
@@ -6841,7 +6873,8 @@ def run_harvester():
         if GITHUB_EVENT_NAME == 'repository_dispatch':
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
-            dispatch_trigger_file = get_dispatch_trigger_file()
+            dispatch_trigger_contract = get_dispatch_trigger_contract()
+            dispatch_trigger_file = dispatch_trigger_contract.get("trigger_file")
             ticker_mapping = {}
             external_source_coverage = {}
             try:
@@ -6878,7 +6911,18 @@ def run_harvester():
                         raise RuntimeError("specified_stage3_trigger_missing")
                     print(f"🎯 지정된 Stage 3 파일 사용: {dispatch_trigger_file}")
                     
-                    s3_data = download_json(target_s3['id'])
+                    downloaded_stage3 = download_json(
+                        target_s3['id'],
+                        include_raw=True,
+                    )
+                    if not isinstance(downloaded_stage3, tuple):
+                        raise RuntimeError("specified_stage3_trigger_content_invalid")
+                    s3_data, s3_raw = downloaded_stage3
+                    dispatch_hashes = validate_dispatch_stage3_content(
+                        dispatch_trigger_contract,
+                        s3_data,
+                        s3_raw,
+                    )
                     current_trigger_file = target_s3['name']
                     dispatch_trigger_file = current_trigger_file
                     toss_stage3_scope = build_stage3_request_scope(
@@ -6886,7 +6930,10 @@ def run_harvester():
                         payload=s3_data,
                         drive_created_at=target_s3.get("createdTime"),
                     )
-                    dispatch_trigger_sha256 = _canonical_sha256(s3_data)
+                    dispatch_trigger_sha256 = dispatch_hashes["canonicalSha256"]
+                    dispatch_trigger_content_sha256 = dispatch_hashes[
+                        "contentSha256"
+                    ]
                     dispatch_trigger_request_scope_sha256 = (
                         toss_stage3_scope.get("requestScopeSha256")
                     )
@@ -7100,6 +7147,10 @@ def run_harvester():
                                 "trigger_file": current_trigger_file,
                                 "trigger_sha256": dispatch_trigger_sha256,
                                 "trigger_hash_basis": "CANONICAL_JSON",
+                                "trigger_content_sha256": (
+                                    dispatch_trigger_content_sha256
+                                ),
+                                "trigger_content_hash_basis": "UTF8_JSON_BYTES",
                                 "trigger_request_scope_sha256": (
                                     dispatch_trigger_request_scope_sha256
                                 ),
@@ -7160,6 +7211,12 @@ def run_harvester():
                 "triggerFile": dispatch_trigger_file,
                 "triggerSha256": dispatch_trigger_sha256,
                 "triggerHashBasis": "CANONICAL_JSON" if dispatch_trigger_sha256 else None,
+                "triggerContentSha256": dispatch_trigger_content_sha256,
+                "triggerContentHashBasis": (
+                    "UTF8_JSON_BYTES"
+                    if dispatch_trigger_content_sha256
+                    else None
+                ),
                 "triggerRequestScopeSha256": (
                     dispatch_trigger_request_scope_sha256
                 ),
