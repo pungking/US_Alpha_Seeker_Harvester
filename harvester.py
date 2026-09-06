@@ -252,6 +252,16 @@ BENCHMARK_SPECS = [
 MARKET_REGIME_FILENAME = "MARKET_REGIME_SNAPSHOT.json"
 EARNINGS_EVENT_FILENAME = "EARNINGS_EVENT_MAP.json"
 EARNINGS_EVENT_COVERAGE_AUDIT_FILENAME = "STAGE4_EARNINGS_EVENT_COVERAGE_AUDIT.json"
+EARNINGS_EVENT_MAX_FORWARD_DAYS = 60
+EARNINGS_EVENT_MARKET_TIMEZONE = "America/New_York"
+EARNINGS_COVERAGE_STATUSES = {
+    "EARNINGS_EVENT_PRESENT",
+    "EARNINGS_EVENT_OUTSIDE_WINDOW_FUTURE",
+    "EARNINGS_ONLY_PAST_EVENT_REPORTED",
+    "EARNINGS_PROVIDER_NO_DATED_EVENT",
+    "EARNINGS_PROVIDER_LOOKUP_FAILED",
+    "EARNINGS_DATE_INVALID",
+}
 CORPORATE_ACTION_LINEAGE_AUDIT_FILENAME = "CORPORATE_ACTION_LINEAGE_RUNTIME_AUDIT.json"
 HARVESTER_SYMBOL_STATE_FILENAME = "HARVESTER_SYMBOL_STATE.json"
 
@@ -6446,7 +6456,10 @@ def normalize_event_date(raw_value):
             ts = ts / 1000.0
         if ts > 0:
             try:
-                dt = datetime.datetime.utcfromtimestamp(ts)
+                dt = datetime.datetime.fromtimestamp(
+                    ts,
+                    tz=datetime.timezone.utc,
+                ).astimezone(ZoneInfo(EARNINGS_EVENT_MARKET_TIMEZONE))
                 return dt.strftime('%Y-%m-%d')
             except Exception:
                 return None
@@ -6470,18 +6483,27 @@ def normalize_event_date(raw_value):
     return None
 
 
-def upsert_earnings_event(event_map, symbol, date_str, now_date, source, confidence):
+def upsert_earnings_event(
+    event_map: dict[str, dict[str, Any]],
+    symbol: str,
+    date_str: str | None,
+    now_date: datetime.date,
+    source: str,
+    confidence: str,
+) -> str:
     if not symbol or not date_str:
-        return
+        return "EARNINGS_DATE_INVALID"
 
     try:
         event_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
-        return
+        return "EARNINGS_DATE_INVALID"
 
     days_to_event = (event_date - now_date).days
-    if days_to_event < 0 or days_to_event > 60:
-        return
+    if days_to_event < 0:
+        return "EARNINGS_ONLY_PAST_EVENT_REPORTED"
+    if days_to_event > EARNINGS_EVENT_MAX_FORWARD_DAYS:
+        return "EARNINGS_EVENT_OUTSIDE_WINDOW_FUTURE"
 
     new_payload = {
         "earnings_date": date_str,
@@ -6494,7 +6516,7 @@ def upsert_earnings_event(event_map, symbol, date_str, now_date, source, confide
     current = event_map.get(symbol)
     if not current:
         event_map[symbol] = new_payload
-        return
+        return "EARNINGS_EVENT_PRESENT"
 
     # 더 가까운 이벤트 우선. 동일 거리면 confidence 높은 소스 우선.
     rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
@@ -6504,6 +6526,7 @@ def upsert_earnings_event(event_map, symbol, date_str, now_date, source, confide
 
     if days_to_event < current_days or (days_to_event == current_days and new_conf > current_conf):
         event_map[symbol] = new_payload
+    return "EARNINGS_EVENT_PRESENT"
 
 
 def _count_event_field(events, key):
@@ -6513,6 +6536,19 @@ def _count_event_field(events, key):
 def build_earnings_event_coverage_audit(tickers, trigger_file, timestamp, event_payload):
     target_symbols = sorted({str(ticker).upper() for ticker in tickers if ticker})
     events = event_payload.get("events", {}) if isinstance(event_payload, dict) else {}
+    coverage_statuses = (
+        event_payload.get("coverage_statuses", {}) if isinstance(event_payload, dict) else {}
+    )
+    coverage_status_counts = Counter()
+    unknown_or_unclassified_rows = 0
+    for symbol in target_symbols:
+        row = coverage_statuses.get(symbol)
+        status = str(row.get("status") or "") if isinstance(row, dict) else ""
+        if status in EARNINGS_COVERAGE_STATUSES:
+            coverage_status_counts[status] += 1
+        else:
+            unknown_or_unclassified_rows += 1
+
     matched_symbols = sorted(set(events.keys()) & set(target_symbols))
     missing_symbols = sorted(set(target_symbols) - set(events.keys()))
     event_count = len(events)
@@ -6523,6 +6559,9 @@ def build_earnings_event_coverage_audit(tickers, trigger_file, timestamp, event_
         "scope": "stage4_earnings_event_map_coverage_audit",
         "trigger_file": trigger_file,
         "source_timestamp": timestamp,
+        "source_retrieved_at": event_payload.get("retrieved_at") if isinstance(event_payload, dict) else None,
+        "market_timezone": event_payload.get("market_timezone") if isinstance(event_payload, dict) else None,
+        "publication_timestamp_available": False,
         "event_map_source": event_payload.get("source", "unavailable") if isinstance(event_payload, dict) else "unavailable",
         "window": event_payload.get("window", {}) if isinstance(event_payload, dict) else {},
         "universe_count": target_count,
@@ -6536,13 +6575,21 @@ def build_earnings_event_coverage_audit(tickers, trigger_file, timestamp, event_
         "source_counts": _count_event_field(events, "source"),
         "confidence_counts": _count_event_field(events, "confidence"),
         "event_risk_counts": _count_event_field(events, "event_risk"),
+        "coverage_status_counts": dict(sorted(coverage_status_counts.items())),
+        "unknown_or_unclassified_rows": unknown_or_unclassified_rows,
         "source_attempts": event_payload.get("source_attempts", []) if isinstance(event_payload, dict) else [],
+        "coverage_contract_status": event_payload.get("coverage_contract_status", "INVALID") if isinstance(event_payload, dict) else "INVALID",
         "done_when": {
             "eventsCountAvailable": event_count >= 0,
             "matchedSymbolsAvailable": True,
             "missingSymbolsAvailable": True,
             "triggerFileRecorded": bool(trigger_file),
-            "sourceTimestampRecorded": bool(timestamp)
+            "sourceTimestampRecorded": bool(timestamp),
+            "coverageStatusReconciled": (
+                unknown_or_unclassified_rows == 0
+                and sum(coverage_status_counts.values()) == target_count
+                and len(matched_symbols) + len(missing_symbols) == target_count
+            ),
         },
         "safety": {
             "brokerMutationAuthorized": False,
@@ -6552,27 +6599,60 @@ def build_earnings_event_coverage_audit(tickers, trigger_file, timestamp, event_
     }
 
 
-def extract_yf_earnings_date(stock):
+def extract_yf_earnings_observation(
+    stock: Any,
+    now_date: datetime.date,
+) -> dict[str, str | None]:
+    lookup_succeeded = False
+    invalid_date_observed = False
+    past_date_observed = False
+    outside_window_date_observed = False
+
+    def normalized_candidate(raw_value: Any) -> str | None:
+        nonlocal invalid_date_observed, past_date_observed, outside_window_date_observed
+        date_str = normalize_event_date(raw_value)
+        if not date_str:
+            if raw_value is not None and str(raw_value).strip():
+                invalid_date_observed = True
+            return None
+        try:
+            event_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            invalid_date_observed = True
+            return None
+        days_to_event = (event_date - now_date).days
+        if 0 <= days_to_event <= EARNINGS_EVENT_MAX_FORWARD_DAYS:
+            return date_str
+        if days_to_event < 0:
+            past_date_observed = True
+        else:
+            outside_window_date_observed = True
+        return None
+
     # 1) get_earnings_dates (가장 신뢰도 높음)
     try:
         df = stock.get_earnings_dates(limit=1)
+        lookup_succeeded = True
         if df is not None and hasattr(df, 'index') and len(df.index) > 0:
-            return normalize_event_date(df.index[0])
+            date_str = normalized_candidate(df.index[0])
+            if date_str:
+                return {"date": date_str, "status": "EARNINGS_DATE_REPORTED"}
     except Exception:
         pass
 
     # 2) calendar 구조 파싱
     try:
         cal = stock.calendar
+        lookup_succeeded = True
         if isinstance(cal, dict):
             for key in ('Earnings Date', 'Earnings Date Start', 'earningsDate'):
                 if key in cal:
                     val = cal.get(key)
                     if isinstance(val, (list, tuple)) and val:
                         val = val[0]
-                    date_str = normalize_event_date(val)
+                    date_str = normalized_candidate(val)
                     if date_str:
-                        return date_str
+                        return {"date": date_str, "status": "EARNINGS_DATE_REPORTED"}
         elif hasattr(cal, 'to_dict'):
             cdict = cal.to_dict()
             if isinstance(cdict, dict):
@@ -6580,50 +6660,78 @@ def extract_yf_earnings_date(stock):
                     if isinstance(v, dict):
                         for kk, vv in v.items():
                             if 'earn' in str(kk).lower():
-                                date_str = normalize_event_date(vv)
+                                date_str = normalized_candidate(vv)
                                 if date_str:
-                                    return date_str
+                                    return {"date": date_str, "status": "EARNINGS_DATE_REPORTED"}
     except Exception:
         pass
 
     # 3) info timestamp fallback
     try:
-        info = stock.info if isinstance(stock.info, dict) else {}
+        raw_info = stock.info
+        lookup_succeeded = True
+        info = raw_info if isinstance(raw_info, dict) else {}
         for key in ('earningsTimestamp', 'earningsTimestampStart', 'earningsTimestampEnd'):
-            date_str = normalize_event_date(info.get(key))
+            date_str = normalized_candidate(info.get(key))
             if date_str:
-                return date_str
+                return {"date": date_str, "status": "EARNINGS_DATE_REPORTED"}
     except Exception:
         pass
 
-    return None
+    if outside_window_date_observed:
+        return {"date": None, "status": "EARNINGS_EVENT_OUTSIDE_WINDOW_FUTURE"}
+    if past_date_observed:
+        return {"date": None, "status": "EARNINGS_ONLY_PAST_EVENT_REPORTED"}
+    if invalid_date_observed:
+        return {"date": None, "status": "EARNINGS_DATE_INVALID"}
+    if lookup_succeeded:
+        return {"date": None, "status": "EARNINGS_PROVIDER_NO_DATED_EVENT"}
+    return {"date": None, "status": "EARNINGS_PROVIDER_LOOKUP_FAILED"}
 
 
 def fetch_earnings_event_map(tickers, trigger_file, timestamp):
+    retrieved_at_dt = datetime.datetime.now(datetime.timezone.utc)
+    retrieved_at = retrieved_at_dt.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    now_market = retrieved_at_dt.astimezone(ZoneInfo(EARNINGS_EVENT_MARKET_TIMEZONE))
+    start_date = now_market.strftime('%Y-%m-%d')
+    end_date = (
+        now_market + datetime.timedelta(days=EARNINGS_EVENT_MAX_FORWARD_DAYS)
+    ).strftime('%Y-%m-%d')
+    now_date = now_market.date()
+    target_set = {str(ticker).upper() for ticker in tickers if ticker}
     payload = {
+        "schema_version": "earnings-event-map-v2",
         "timestamp": timestamp,
         "source_timestamp": timestamp,
+        "retrieved_at": retrieved_at,
+        "market_timezone": EARNINGS_EVENT_MARKET_TIMEZONE,
+        "publication_timestamp_available": False,
         "trigger_file": trigger_file,
         "source": "unavailable",
-        "universe_count": len(tickers),
+        "universe_count": len(target_set),
         "covered_count": 0,
-        "missing_count": len(tickers),
+        "missing_count": len(target_set),
         "matched_symbols": [],
-        "missing_symbols": sorted({ticker.upper() for ticker in tickers if ticker}),
+        "missing_symbols": sorted(target_set),
         "source_attempts": [],
-        "events": {}
+        "events": {},
+        "coverage_statuses": {},
+        "coverage_status_counts": {},
+        "unknown_or_unclassified_rows": 0,
+        "coverage_contract_status": "PASS",
+        "window": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "max_forward_days": EARNINGS_EVENT_MAX_FORWARD_DAYS,
+            "market_timezone": EARNINGS_EVENT_MARKET_TIMEZONE,
+        },
     }
 
-    if not tickers:
+    if not target_set:
         return payload
 
-    now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-    start_date = now_kst.strftime('%Y-%m-%d')
-    end_date = (now_kst + datetime.timedelta(days=45)).strftime('%Y-%m-%d')
-    now_date = now_kst.date()
-
-    target_set = {ticker.upper() for ticker in tickers if ticker}
     event_map = {}
+    coverage_statuses = {}
     source_labels = []
     source_attempts = []
 
@@ -6763,15 +6871,38 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
     if missing_symbols:
         print(f"ℹ️ Earnings fallback(yfinance) 시작: {len(missing_symbols)} symbols")
         yf_found = 0
+        yf_status_counts = Counter()
         for idx, symbol in enumerate(missing_symbols, 1):
             try:
                 stock = yf.Ticker(symbol)
-                date_str = extract_yf_earnings_date(stock)
-                upsert_earnings_event(event_map, symbol, date_str, now_date, 'yfinance', 'MEDIUM')
-                if symbol in event_map and event_map[symbol].get('source') == 'yfinance':
-                    yf_found += 1
+                observation = extract_yf_earnings_observation(stock, now_date)
             except Exception:
-                pass
+                observation = {"date": None, "status": "EARNINGS_PROVIDER_LOOKUP_FAILED"}
+
+            observation_status = str(observation.get("status") or "")
+            if observation_status == "EARNINGS_DATE_REPORTED":
+                coverage_status = upsert_earnings_event(
+                    event_map,
+                    symbol,
+                    observation.get("date"),
+                    now_date,
+                    'yfinance',
+                    'MEDIUM',
+                )
+            elif observation_status in EARNINGS_COVERAGE_STATUSES:
+                coverage_status = observation_status
+            else:
+                coverage_status = ""
+
+            coverage_statuses[symbol] = {
+                "status": coverage_status,
+                "source": "yfinance",
+            }
+            if coverage_status:
+                yf_status_counts[coverage_status] += 1
+
+            if symbol in event_map and event_map[symbol].get('source') == 'yfinance':
+                yf_found += 1
 
             if idx % 50 == 0 or idx == len(missing_symbols):
                 print(f"   > yfinance earnings fallback {idx}/{len(missing_symbols)}")
@@ -6779,12 +6910,19 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
 
         if yf_found > 0:
             source_labels.append('yfinance')
+        yf_failed = yf_status_counts.get("EARNINGS_PROVIDER_LOOKUP_FAILED", 0)
+        yf_invalid = yf_status_counts.get("EARNINGS_DATE_INVALID", 0)
         source_attempts.append({
             "source": "yfinance",
-            "status": "ok",
+            "status": (
+                "failed"
+                if yf_failed == len(missing_symbols)
+                else "partial" if yf_failed or yf_invalid else "ok"
+            ),
             "endpoint": "Ticker.get_earnings_dates/calendar/info",
             "rows": len(missing_symbols),
             "matched_delta": yf_found,
+            "observation_status_counts": dict(sorted(yf_status_counts.items())),
             "errors": []
         })
     else:
@@ -6797,6 +6935,22 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
             "errors": []
         })
 
+    for symbol, event in event_map.items():
+        coverage_statuses[symbol] = {
+            "status": "EARNINGS_EVENT_PRESENT",
+            "source": event.get("source", "unavailable"),
+        }
+
+    coverage_status_counts = Counter()
+    unknown_or_unclassified_rows = 0
+    for symbol in target_set:
+        row = coverage_statuses.get(symbol)
+        status = str(row.get("status") or "") if isinstance(row, dict) else ""
+        if status in EARNINGS_COVERAGE_STATUSES:
+            coverage_status_counts[status] += 1
+        else:
+            unknown_or_unclassified_rows += 1
+
     payload["events"] = event_map
     payload["covered_count"] = len(event_map)
     payload["missing_count"] = max(0, len(target_set) - len(event_map))
@@ -6807,11 +6961,15 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
     payload["source_counts"] = _count_event_field(event_map, "source")
     payload["confidence_counts"] = _count_event_field(event_map, "confidence")
     payload["event_risk_counts"] = _count_event_field(event_map, "event_risk")
-    payload["window"] = {
-        "start_date": start_date,
-        "end_date": end_date,
-        "max_forward_days": 60
-    }
+    payload["coverage_statuses"] = coverage_statuses
+    payload["coverage_status_counts"] = dict(sorted(coverage_status_counts.items()))
+    payload["unknown_or_unclassified_rows"] = unknown_or_unclassified_rows
+    payload["coverage_contract_status"] = (
+        "PASS"
+        if unknown_or_unclassified_rows == 0
+        and sum(coverage_status_counts.values()) == len(target_set)
+        else "INVALID"
+    )
 
     return payload
 
@@ -7105,6 +7263,8 @@ def run_harvester():
                                 today_str,
                                 earnings_event_map
                             )
+                            if not earnings_event_audit["done_when"]["coverageStatusReconciled"]:
+                                raise ValueError("earnings event coverage contract invalid")
                             earnings_event_count = len(earnings_event_map.get('events', {}))
                             earnings_event_source = earnings_event_map.get('source', 'unavailable')
                             earnings_event_missing = int(earnings_event_map.get('missing_count', max(0, total_count - earnings_event_count)))
