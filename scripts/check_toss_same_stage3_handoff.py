@@ -4,7 +4,11 @@ import json
 import hashlib
 import sys
 import tempfile
+import io
+from contextlib import redirect_stdout
+from http.client import IncompleteRead
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -19,6 +23,46 @@ from scripts.toss_shadow_market_data import (
     toss_shadow_matches_stage3,
 )
 import harvester as harvester_module
+
+
+def _check_incomplete_drive_read() -> None:
+    for failures in (1, harvester_module.DRIVE_RETRY_ATTEMPTS):
+        attempts = 0
+        private_marker = "private-fixture-id-and-response"
+        drive = Mock()
+
+        class Downloader:
+            def __init__(self, stream: io.BytesIO, _request: object) -> None:
+                self.stream = stream
+
+            def next_chunk(self) -> tuple[None, bool]:
+                nonlocal attempts
+                attempts += 1
+                if attempts <= failures:
+                    self.stream.write(b'{"partial":')
+                    raise IncompleteRead(private_marker.encode(), 200)
+                self.stream.write(b'{"complete":true}')
+                return None, True
+
+        output = io.StringIO()
+        with patch.multiple(harvester_module, drive_service=drive,
+                            MediaIoBaseDownload=Downloader,
+                            _rebuild_drive_service=Mock(), _retry_backoff_sleep=Mock(return_value=0)), redirect_stdout(output):
+            if failures == 1:
+                assert harvester_module.download_json(private_marker, include_raw=True) == (
+                    {"complete": True}, b'{"complete":true}'
+                ), "truncated bytes must not contaminate a fresh read"
+            else:
+                try:
+                    harvester_module.download_json(private_marker)
+                    raise AssertionError("exhausted Drive read must fail closed")
+                except RuntimeError as error:
+                    assert str(error) == "drive_download_incomplete_read_exhausted"
+            assert attempts == min(failures + 1, harvester_module.DRIVE_RETRY_ATTEMPTS)
+            assert drive.files.return_value.get_media.call_count == attempts
+            assert harvester_module._rebuild_drive_service.call_count == attempts - 1
+            assert harvester_module._retry_backoff_sleep.call_count == attempts - 1
+        assert private_marker not in output.getvalue()
 
 
 def _payload(*symbols: str) -> dict[str, object]:
@@ -64,6 +108,7 @@ def _passing_shadow(source_artifact: dict[str, object]) -> dict[str, object]:
 
 
 def main() -> int:
+    _check_incomplete_drive_read()
     root = Path(__file__).resolve().parents[1]
     harvester_source = (root / "harvester.py").read_text(encoding="utf-8")
     workflow_source = (root / ".github/workflows/main.yml").read_text(
@@ -310,6 +355,26 @@ def main() -> int:
             "prices": 0,
         }
         assert "offline private detail" not in json.dumps(offline)
+        assert offline["affectedEndpointGroup"] == "GOOGLE_DRIVE_HANDOFF"
+        alerts = []
+        harvester_module.dispatch_toss_shadow_alert(
+            offline, previous_status=None, sent_fingerprints=set(),
+            sender=lambda message, **_kwargs: alerts.append(message) or {"delivered": True},
+        )
+        assert len(alerts) == 1
+        assert "Google Drive" in alerts[0]
+        assert "credentials" not in alerts[0]
+        assert "offline private detail" not in alerts[0]
+        with patch.multiple(harvester_module,
+                            find_file_id=lambda *_a, **_k: "fixture-folder",
+                            download_json=lambda *_a, **_k: None,
+                            load_stage3_shadow_handoff_scope=lambda *_a, **_k: scope,
+                            ensure_toss_shadow_market_data=Mock(side_effect=RuntimeError("private-runtime-detail"))):
+            uncertain = harvester_module.run_toss_same_stage3_collector()
+            assert uncertain["affectedEndpointGroup"] == "TOSS_COLLECTION_OR_PERSISTENCE"
+            assert all(value is None for value in uncertain["requestCounts"].values())
+            assert uncertain["requestAccountingStatus"] == "UNVERIFIED_POST_EXCEPTION"
+            assert "private-runtime-detail" not in json.dumps(uncertain)
     finally:
         harvester_module.find_file_id = original_find
         harvester_module.download_json = original_download
@@ -430,6 +495,17 @@ def main() -> int:
                     no_op, terminal_shadow, "no-op fixture"
                 ) == "TERMINAL_LOCAL_ARTIFACT_PRESERVED"
             assert write_count == 1
+
+            preserved_hash = hashlib.sha256(local_path.read_bytes()).hexdigest()
+            for _ in range(3):
+                with patch.object(harvester_module, "find_file_id", side_effect=IncompleteRead(b"private-partial", 1)):
+                    with patch.object(harvester_module, "send_telegram", return_value={"delivered": False}):
+                        interrupted = harvester_module.run_toss_same_stage3_collector()
+                assert interrupted["affectedEndpointGroup"] == "GOOGLE_DRIVE_HANDOFF"
+                assert interrupted["localArtifactRetentionStatus"] == "TERMINAL_LOCAL_ARTIFACT_PRESERVED"
+                assert hashlib.sha256(local_path.read_bytes()).hexdigest() == preserved_hash
+            assert write_count == 1, "pre-provider Drive read errors must preserve terminal evidence"
+            assert json.loads(local_path.read_text()) == terminal_shadow
 
             local_path.unlink()
             diagnostic = {

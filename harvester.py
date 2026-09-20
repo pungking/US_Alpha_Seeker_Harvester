@@ -13,6 +13,7 @@ import ssl
 import traceback
 import hashlib
 from email.utils import parsedate_to_datetime
+from http.client import IncompleteRead
 from pathlib import Path
 import yfinance as yf
 from collections import Counter
@@ -739,6 +740,14 @@ def download_json(file_id, *, include_raw=False):
             raw = fh.getvalue()
             payload = json.loads(raw.decode())
             return (payload, raw) if include_raw else payload
+        except IncompleteRead:
+            # Retry only this idempotent Drive read, with a new empty byte buffer.
+            # Do not broaden upload retry semantics or expose partial response bytes.
+            print(f"[DRIVE_READ] category=IncompleteRead attempt={attempt + 1}/{DRIVE_RETRY_ATTEMPTS}", flush=True)
+            if attempt >= DRIVE_RETRY_ATTEMPTS - 1:
+                raise RuntimeError("drive_download_incomplete_read_exhausted") from None
+            _rebuild_drive_service("download_json_incomplete_read")
+            _retry_backoff_sleep(attempt)
         except json.JSONDecodeError as e:
             print(f"⚠️ JSON 파싱 오류(download_json:{file_id}): {e}", flush=True)
             return None
@@ -1381,7 +1390,11 @@ def _persist_toss_collector_result(
         "PRE_NETWORK_HANDOFF_BLOCKED",
         "DUPLICATE_OR_FAILED_SENTINEL_PRESERVED",
         "EXISTING_MATCHED_SHADOW_REUSED",
-    }
+    } or (
+        result.get("runtimeAction") == "COLLECTOR_EXCEPTION_FAIL_OPEN"
+        and result.get("affectedEndpointGroup") == "GOOGLE_DRIVE_HANDOFF"
+        and result.get("requestCounts") == {"oauth": 0, "marketCalendar": 0, "prices": 0}
+    )
     if no_op:
         local: Any = None
         try:
@@ -1999,6 +2012,7 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
     enabled, runtime_reason = toss_shadow_runtime_decision(os.environ)
     result: dict[str, Any] | None = None
     network_collection_entered = False
+    collector_phase = "GOOGLE_DRIVE_HANDOFF"
     try:
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
@@ -2046,12 +2060,14 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
             )
         else:
             network_collection_entered = True
+            collector_phase = "TOSS_COLLECTION_OR_PERSISTENCE"
             result = ensure_toss_shadow_market_data(
                 root_id,
                 sys_id,
                 scope.get("symbols") or [],
                 request_source_artifact=scope.get("sourceArtifact"),
             )
+        collector_phase = "LOCAL_ARTIFACT_PERSISTENCE"
         try:
             result["localArtifactRetentionStatus"] = _persist_toss_collector_result(
                 result,
@@ -2094,6 +2110,7 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
             safe_error_category=f"collector_{type(exc).__name__}",
             capability_artifact_sha256="0" * 64,
             retrieved_at=now_utc,
+            endpoint_group=collector_phase,
         )
         result.update(
             {
@@ -2117,9 +2134,9 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
             sender=send_telegram,
         )
         try:
-            write_json_report(
-                HARVESTER_TOSS_SHADOW_PATH,
+            result["localArtifactRetentionStatus"] = _persist_toss_collector_result(
                 result,
+                None,
                 "Toss same-Stage3 collector fail-open",
             )
         except (OSError, TypeError, ValueError) as write_exc:
