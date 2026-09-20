@@ -847,6 +847,7 @@ def build_toss_shadow_blocked_result(
     safe_error_category: str,
     capability_artifact_sha256: str,
     retrieved_at: str | None = None,
+    endpoint_group: str = "AUTH",
 ) -> dict[str, Any]:
     result = _base_result(
         symbols=[],
@@ -859,7 +860,7 @@ def build_toss_shadow_blocked_result(
         result,
         status=status,
         category=safe_error_category,
-        endpoint_group="AUTH",
+        endpoint_group=endpoint_group,
     )
 
 
@@ -2102,7 +2103,19 @@ def dispatch_toss_shadow_alert(
         elif optional_or_nullable > 0:
             timestamp_slice_line = "TimestampSlice: `DOCUMENTED_NULLABLE_ONLY`\n"
 
-        if error_category == "price_timestamp_missing":
+        if result.get("affectedEndpointGroup") == "GOOGLE_DRIVE_HANDOFF":
+            next_action = (
+                "review Google Drive handoff read/publish connectivity; "
+                "Toss authentication failure is not established; keep evidence excluded"
+            )
+        elif result.get("affectedEndpointGroup") in {
+            "TOSS_COLLECTION_OR_PERSISTENCE", "LOCAL_ARTIFACT_PERSISTENCE"
+        }:
+            next_action = (
+                "review collector phase and artifact persistence; "
+                "do not infer Toss authentication failure or replay provider requests"
+            )
+        elif error_category == "price_timestamp_missing":
             timestamp_cause = str(
                 diagnostics.get("timestampDiagnosticPrimaryCause")
                 or "SAFE_EVIDENCE_INSUFFICIENT"
