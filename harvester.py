@@ -1391,7 +1391,7 @@ def _persist_toss_collector_result(
         "DUPLICATE_OR_FAILED_SENTINEL_PRESERVED",
         "EXISTING_MATCHED_SHADOW_REUSED",
     } or (
-        result.get("runtimeAction") == "COLLECTOR_EXCEPTION_FAIL_OPEN"
+        result.get("runtimeAction") in {"COLLECTOR_EXCEPTION_FAIL_OPEN", "PRODUCER_EXCEPTION_FAIL_OPEN"}
         and result.get("affectedEndpointGroup") == "GOOGLE_DRIVE_HANDOFF"
         and result.get("requestCounts") == {"oauth": 0, "marketCalendar": 0, "prices": 0}
     )
@@ -1698,7 +1698,14 @@ def ensure_toss_shadow_market_data(
     session: Any | None = None,
     alert_sender: Callable[..., Mapping[str, Any]] | None = None,
     request_source_artifact: Mapping[str, Any] | None = None,
+    request_progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Only this producer knows whether an exception preceded the first Toss call.
+    request_progress = request_progress if request_progress is not None else {}
+    request_progress.update({
+        "phase": "GOOGLE_DRIVE_HANDOFF",
+        "requestCounts": {"oauth": 0, "marketCalendar": 0, "prices": 0},
+    })
     enabled, runtime_reason = toss_shadow_runtime_decision(os.environ)
     if not enabled:
         return _toss_shadow_not_run_result(runtime_reason)
@@ -1856,6 +1863,10 @@ def ensure_toss_shadow_market_data(
         calendar_date = datetime.datetime.now(
             ZoneInfo("America/New_York")
         ).date().isoformat()
+        request_progress.update({
+            "phase": "TOSS_COLLECTION_OR_PERSISTENCE",
+            "requestCounts": {"oauth": None, "marketCalendar": None, "prices": None},
+        })
         result = collect_toss_shadow_market_data(
             session or requests.Session(),
             client_id=TOSS_CLIENT_ID,
@@ -1869,6 +1880,7 @@ def ensure_toss_shadow_market_data(
         )
         result["runtimeAction"] = "COLLECTED_REGISTERED_MAC_SHADOW"
 
+    request_progress["requestCounts"] = dict(result.get("requestCounts") or {})
     result["runtimeReason"] = runtime_reason
     result["idempotencyKey"] = idempotency_key
     result["thisRunRequestCounts"] = dict(result.get("requestCounts") or {})
@@ -2013,6 +2025,7 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
     result: dict[str, Any] | None = None
     network_collection_entered = False
     collector_phase = "GOOGLE_DRIVE_HANDOFF"
+    request_progress: dict[str, Any] = {}
     try:
         root_id = find_file_id("US_Alpha_Seeker")
         sys_id = find_file_id("System_Identity_Maps", root_id)
@@ -2066,8 +2079,10 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
                 sys_id,
                 scope.get("symbols") or [],
                 request_source_artifact=scope.get("sourceArtifact"),
+                request_progress=request_progress,
             )
         collector_phase = "LOCAL_ARTIFACT_PERSISTENCE"
+        request_progress["phase"] = collector_phase
         try:
             result["localArtifactRetentionStatus"] = _persist_toss_collector_result(
                 result,
@@ -2101,16 +2116,18 @@ def run_toss_same_stage3_collector() -> dict[str, Any]:
         )
         if not observed_counts:
             observed_counts = (
-                {"oauth": None, "marketCalendar": None, "prices": None}
-                if network_collection_entered
-                else {"oauth": 0, "marketCalendar": 0, "prices": 0}
+                request_progress.get("requestCounts") or (
+                    {"oauth": None, "marketCalendar": None, "prices": None}
+                    if network_collection_entered
+                    else {"oauth": 0, "marketCalendar": 0, "prices": 0}
+                )
             )
         result = build_toss_shadow_blocked_result(
             status="TOSS_SHADOW_TRANSIENT_FAILURE",
             safe_error_category=f"collector_{type(exc).__name__}",
             capability_artifact_sha256="0" * 64,
             retrieved_at=now_utc,
-            endpoint_group=collector_phase,
+            endpoint_group=request_progress.get("phase", collector_phase),
         )
         result.update(
             {
@@ -7516,6 +7533,10 @@ def run_harvester():
                 filtered_tickers.keys(),
             )
         if TOSS_SHADOW_PROVIDER_ENABLED:
+            toss_request_progress = {
+                "phase": "GOOGLE_DRIVE_HANDOFF",
+                "requestCounts": {"oauth": 0, "marketCalendar": 0, "prices": 0},
+            }
             try:
                 toss_shadow_scope = load_stage3_shadow_handoff_scope(
                     root_id,
@@ -7529,6 +7550,7 @@ def run_harvester():
                         request_source_artifact=toss_shadow_scope.get(
                             "sourceArtifact"
                         ),
+                        request_progress=toss_request_progress,
                     )
                 else:
                     toss_market_data_shadow = _toss_shadow_not_run_result(
@@ -7549,7 +7571,9 @@ def run_harvester():
                     .replace(microsecond=0)
                     .isoformat()
                     .replace("+00:00", "Z"),
+                    endpoint_group=toss_request_progress["phase"],
                 )
+                toss_market_data_shadow["requestCounts"] = dict(toss_request_progress["requestCounts"])
                 toss_market_data_shadow["runtimeAction"] = (
                     "PRODUCER_EXCEPTION_FAIL_OPEN"
                 )
@@ -7565,9 +7589,9 @@ def run_harvester():
                     )
                 )
                 try:
-                    write_json_report(
-                        HARVESTER_TOSS_SHADOW_PATH,
+                    toss_market_data_shadow["localArtifactRetentionStatus"] = _persist_toss_collector_result(
                         toss_market_data_shadow,
+                        None,
                         "Toss market-data shadow producer failure",
                     )
                 except Exception as write_exc:

@@ -507,6 +507,33 @@ def main() -> int:
             assert write_count == 1, "pre-provider Drive read errors must preserve terminal evidence"
             assert json.loads(local_path.read_text()) == terminal_shadow
 
+            # Exercise actual ensure() pre-provider reads, not just initial folder discovery.
+            for failed_read in (2, 3):
+                reads = 0
+
+                def interrupted_download(_file_id: str) -> None:
+                    nonlocal reads
+                    reads += 1
+                    if reads == failed_read:
+                        raise RuntimeError("drive_download_incomplete_read_exhausted")
+                    return None
+
+                with patch.multiple(harvester_module,
+                                    find_file_id=lambda *_a, **_k: "fixture-drive-file",
+                                    download_json=interrupted_download,
+                                    load_stage3_shadow_handoff_scope=lambda *_a, **_k: scope,
+                                    inspect_same_stage3_handoff_window=lambda *_a, **_k: {"open": True},
+                                    reserve_same_stage3_sentinel=Mock(return_value={"status": "RESERVED"}),
+                                    collect_toss_shadow_market_data=Mock(side_effect=AssertionError("provider forbidden")),
+                                    send_telegram=Mock(return_value={"delivered": False})):
+                    interrupted = harvester_module.run_toss_same_stage3_collector()
+                    harvester_module.collect_toss_shadow_market_data.assert_not_called()
+                assert interrupted["affectedEndpointGroup"] == "GOOGLE_DRIVE_HANDOFF"
+                assert interrupted["requestCounts"] == {"oauth": 0, "marketCalendar": 0, "prices": 0}
+                assert interrupted["localArtifactRetentionStatus"] == "TERMINAL_LOCAL_ARTIFACT_PRESERVED"
+                assert hashlib.sha256(local_path.read_bytes()).hexdigest() == preserved_hash
+            assert write_count == 1
+
             local_path.unlink()
             diagnostic = {
                 "status": "NOT_RUN",
