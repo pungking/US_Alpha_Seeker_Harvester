@@ -185,6 +185,7 @@ class UploadContract(unittest.TestCase):
         errors = [TimeoutError(PRIVATE), ConnectionResetError(PRIVATE),
                   IncompleteRead(PRIVATE.encode(), 10),
                   requests.exceptions.ConnectionError(PRIVATE),
+                  requests.exceptions.ChunkedEncodingError(PRIVATE),
                   HttpError(SimpleNamespace(status=503, reason="Unavailable"), PRIVATE.encode())]
         for error in errors:
             with self.subTest(error=type(error).__name__):
@@ -282,6 +283,27 @@ class UploadContract(unittest.TestCase):
             self.assertIsNone(self.invoke())
         self.assertEqual(len(puts), 1, "uncertain PUT must not replay inside the SDK transport")
         self.assertEqual(puts[0], RAW)
+        self.assert_safe()
+
+    def test_real_sdk_truncated_response_reconciles_without_replay(self) -> None:
+        methods = []
+
+        def handler(method: str, body: object) -> tuple:
+            methods.append(method)
+            if method == "PATCH":
+                return 200, {"location": "https://fixture.invalid/upload"}, b""
+            self.assertEqual(method, "PUT")
+            raise requests.exceptions.ChunkedEncodingError(PRIVATE)
+
+        self.files.update.side_effect = lambda **kwargs: HttpRequest(
+            http=Mock(), postproc=lambda *_: {}, uri="https://fixture.invalid/files",
+            method="PATCH", body="", headers={}, resumable=kwargs["media_body"])
+        with self.sdk_transport(handler):
+            self.assertIsNone(self.invoke())
+        self.assertEqual(methods, ["PATCH", "PUT"])
+        self.assertEqual(self.files.list.call_count, 2)
+        self.assertEqual(self.files.get_media.call_count, 1)
+        self.assertIn("EXACT_CONTENT_VERIFIED", self.output.getvalue())
         self.assert_safe()
 
     def test_real_sdk_error_body_does_not_leak_in_logging(self) -> None:

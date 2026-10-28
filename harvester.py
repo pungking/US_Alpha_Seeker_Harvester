@@ -870,7 +870,8 @@ def upload_json(filename: str, data: Any, parent_id: str) -> None:
             file_id = _find_unique_upload_file(filename, parent_id)
             break
         except Exception as error:
-            transient = _is_transient_drive_error(error) or isinstance(error, (BrokenPipeError, IncompleteRead))
+            transient = _is_transient_drive_error(error) or isinstance(
+                error, (BrokenPipeError, IncompleteRead, requests.exceptions.ChunkedEncodingError))
             if not transient or attempt == DRIVE_RETRY_ATTEMPTS - 1:
                 raise DriveUploadError(error, "lookup", attempt + 1, 0) from None
             try:
@@ -890,7 +891,8 @@ def upload_json(filename: str, data: Any, parent_id: str) -> None:
     try:
         _execute_drive_upload_request(request)
     except Exception as error:
-        uncertain = _is_transient_drive_error(error) or isinstance(error, (BrokenPipeError, IncompleteRead))
+        uncertain = _is_transient_drive_error(error) or isinstance(
+            error, (BrokenPipeError, IncompleteRead, requests.exceptions.ChunkedEncodingError))
         verification = _verify_drive_upload(filename, parent_id, file_id, raw) if uncertain else "NOT_ATTEMPTED"
         if verification != "EXACT_CONTENT_VERIFIED":
             raise DriveUploadError(error, "write", attempt + 1, 1, verification) from None
