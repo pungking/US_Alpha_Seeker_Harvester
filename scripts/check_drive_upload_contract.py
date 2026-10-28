@@ -5,6 +5,7 @@ import ast
 import hashlib
 import io
 import json
+import logging
 import re
 import ssl
 import subprocess
@@ -12,13 +13,17 @@ import tempfile
 import traceback
 import unittest
 from contextlib import redirect_stdout
-from http.client import IncompleteRead
+from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock, patch
 
+import httplib2
 import requests
+from google.auth.credentials import AnonymousCredentials
+from google.auth.transport.requests import AuthorizedSession
 from googleapiclient.errors import HttpError
+from googleapiclient.http import DEFAULT_HTTP_TIMEOUT_SEC, HttpRequest, MediaIoBaseUpload
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "harvester.py").read_text()
@@ -26,6 +31,7 @@ NAMES = {
     "_extract_http_status", "_is_transient_drive_error", "DriveUploadError",
     "_find_unique_upload_file", "_verify_drive_upload", "upload_json",
     "harvester_error_alert",
+    "_execute_drive_upload_request",
 }
 PRIVATE = "private-fixture-filename-parent-response"
 PAYLOAD = {"fixture": "value"}
@@ -36,6 +42,8 @@ def load_upload() -> dict:
     nodes = [node for node in ast.parse(SOURCE).body if getattr(node, "name", None) in NAMES]
     scope = dict(io=io, json=json, hashlib=hashlib, re=re, ssl=ssl, requests=requests,
                  HttpError=HttpError, IncompleteRead=IncompleteRead, Any=object,
+                 httplib2=httplib2, SimpleNamespace=SimpleNamespace,
+                 AuthorizedSession=AuthorizedSession, DEFAULT_HTTP_TIMEOUT_SEC=DEFAULT_HTTP_TIMEOUT_SEC,
                  DRIVE_RETRY_ATTEMPTS=3, MediaIoBaseUpload=Mock(),
                  _rebuild_drive_service=Mock(), _retry_backoff_sleep=Mock(return_value=0))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "harvester.py", "exec"), scope)
@@ -72,7 +80,7 @@ class UploadContract(unittest.TestCase):
     def test_normal_write(self) -> None:
         self.assertIsNone(self.invoke())
         self.assertEqual(self.writes(), 1)
-        self.files.update.return_value.execute.assert_called_once_with(num_retries=0)
+        self.files.update.return_value.execute.assert_called_once_with(http=ANY, num_retries=0)
         self.files.get_media.assert_not_called()
         self.assert_safe()
 
@@ -81,7 +89,7 @@ class UploadContract(unittest.TestCase):
         self.assertIsNone(self.invoke())
         self.assertEqual(self.writes(), 1)
         self.assertEqual(self.files.list.call_count, 2)
-        self.files.get_media.return_value.execute.assert_called_once_with(num_retries=0)
+        self.files.get_media.return_value.execute.assert_called_once_with(http=ANY, num_retries=0)
         self.assert_safe()
 
     def test_lost_create_response_never_creates_twice(self) -> None:
@@ -221,6 +229,106 @@ class UploadContract(unittest.TestCase):
                 result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", fixture], cwd=tmp, capture_output=True)
                 self.assertEqual(result.returncode, code)
         self.assertIn("check_drive_upload_contract.py", (ROOT / ".github/workflows/telegram-routing-ci.yml").read_text())
+
+    def sdk_transport(self, handler: object) -> object:
+        """Real SDK/Auth/Requests; replace only the wire with a synthetic response."""
+        self.scope["MediaIoBaseUpload"] = MediaIoBaseUpload
+        self.drive._http.credentials = AnonymousCredentials()
+
+        def wire(_adapter: object, prepared: object, **_kwargs: object) -> requests.Response:
+            status, headers, body = handler(prepared.method, prepared.body)
+            response = requests.Response()
+            response.status_code, response.headers, response._content = status, headers, body
+            response.request = prepared
+            return response
+
+        # Assert the underlying adapter disables retries, not only execute().
+        with AuthorizedSession(AnonymousCredentials(), max_refresh_attempts=0) as session:
+            self.assertEqual(session.get_adapter("https://fixture.invalid").max_retries.total, 0)
+        return patch.object(requests.adapters.HTTPAdapter, "send", wire)
+
+    def test_real_sdk_lost_response_has_no_hidden_second_put(self) -> None:
+        puts = []
+
+        def handler(method: str, body: object) -> tuple:
+            if method == "PATCH":
+                return 200, {"location": "https://fixture.invalid/upload"}, b""
+            self.assertEqual(method, "PUT")
+            puts.append(body.read() if hasattr(body, "read") else body)
+            raise RemoteDisconnected(PRIVATE)
+
+        class Connection:
+            sock = object()
+            def request(self, method: str, uri: str, body: object, headers: object) -> None:
+                puts.append(body.read() if hasattr(body, "read") else body)
+            def getresponse(self) -> None:
+                raise RemoteDisconnected(PRIVATE)
+            def connect(self) -> None:
+                self.sock = object()
+            def close(self) -> None:
+                self.sock = None
+
+        connection = Connection()
+        def old_wire(uri: str, method: str = "GET", body: object = None, headers: object = None) -> tuple:
+            if method == "PATCH":
+                return httplib2.Response({"status": "200", "location": "https://fixture.invalid/upload"}), b""
+            return httplib2.Http()._conn_request(connection, "/upload", method, body, headers)
+
+        self.files.update.side_effect = lambda **kwargs: HttpRequest(
+            http=SimpleNamespace(request=old_wire), postproc=lambda *_: {},
+            uri="https://fixture.invalid/files", method="PATCH", body="", headers={},
+            resumable=kwargs["media_body"])
+        with self.sdk_transport(handler):
+            self.assertIsNone(self.invoke())
+        self.assertEqual(len(puts), 1, "uncertain PUT must not replay inside the SDK transport")
+        self.assertEqual(puts[0], RAW)
+        self.assert_safe()
+
+    def test_real_sdk_error_body_does_not_leak_in_logging(self) -> None:
+        for body in (PRIVATE.encode(), json.dumps({"error": {"message": PRIVATE}}).encode()):
+            old_http = Mock()
+            old_http.request.return_value = httplib2.Response({"status": "403"}), body
+            self.files.list.return_value = HttpRequest(
+                http=old_http, postproc=lambda *_: {}, uri="https://fixture.invalid/files", method="GET")
+            logger = logging.getLogger("googleapiclient.http")
+            capture = logging.StreamHandler(self.output)
+            logger.addHandler(capture)
+            try:
+                with self.sdk_transport(lambda *_: (403, {}, body)):
+                    self.assertIsInstance(self.invoke(), RuntimeError)
+            finally:
+                logger.removeHandler(capture)
+            self.assert_safe()
+
+    def test_real_sdk_successful_resumable_upload(self) -> None:
+        methods = []
+        def handler(method: str, body: object) -> tuple:
+            methods.append(method)
+            if method == "PATCH":
+                return 200, {"Location": "https://fixture.invalid/upload"}, b""
+            self.assertEqual(body.read(), RAW)
+            return 200, {}, b'{"id":"fixture-id"}'
+        self.files.update.side_effect = lambda **kwargs: HttpRequest(
+            http=Mock(), postproc=lambda *_: {}, uri="https://fixture.invalid/files",
+            method="PATCH", body="", headers={}, resumable=kwargs["media_body"])
+        with self.sdk_transport(handler):
+            self.assertIsNone(self.invoke())
+        self.assertEqual(methods, ["PATCH", "PUT"])
+        self.files.get_media.assert_not_called()
+        self.assert_safe()
+
+    def test_real_sdk_auth_and_redirect_never_replay(self) -> None:
+        for status in (401, 302, 307):
+            methods = []
+            def handler(method: str, body: object) -> tuple:
+                methods.append(method)
+                return status, {"location": "https://fixture.invalid/other"}, PRIVATE.encode()
+            self.files.list.return_value = HttpRequest(
+                http=Mock(), postproc=lambda *_: {}, uri="https://fixture.invalid/files", method="GET")
+            with self.sdk_transport(handler):
+                self.assertIsInstance(self.invoke(), RuntimeError)
+            self.assertEqual(methods, ["GET"])
+            self.assert_safe()
 
 
 if __name__ == "__main__":

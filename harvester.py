@@ -12,6 +12,7 @@ import math
 import ssl
 import traceback
 import hashlib
+import httplib2
 from email.utils import parsedate_to_datetime
 from http.client import IncompleteRead
 from pathlib import Path
@@ -21,11 +22,12 @@ from html.parser import HTMLParser
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Iterable, Mapping
+from types import SimpleNamespace
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-from google.auth.transport.requests import Request
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload, DEFAULT_HTTP_TIMEOUT_SEC
+from google.auth.transport.requests import Request, AuthorizedSession
 from scripts.target_lineage import build_target_lineage, build_target_lineage_runtime_audit
 from scripts.toss_read_only_capability import (
     SCHEMA_VERSION as TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
@@ -800,14 +802,32 @@ class DriveUploadError(RuntimeError):
         )
 
 
+def _execute_drive_upload_request(request: Any) -> Any:
+    # httplib2 retries some lost responses even with SDK num_retries=0.
+    with AuthorizedSession(drive_service._http.credentials, max_refresh_attempts=0) as session:
+        def request_once(uri: str, method: str = "GET", body: Any = None,
+                         headers: Any = None) -> tuple[Any, bytes]:
+            response = session.request(
+                method, uri, data=body, headers=headers,
+                timeout=DEFAULT_HTTP_TIMEOUT_SEC, allow_redirects=False,
+            )
+            metadata = httplib2.Response({**response.headers, "status": str(response.status_code)})
+            if response.status_code >= 400 or (300 <= response.status_code < 400 and response.status_code != 308):
+                # Reject before SDK retry diagnostics can log a raw error body.
+                raise HttpError(metadata, b"") from None
+            return metadata, response.content
+
+        return request.execute(http=SimpleNamespace(request=request_once), num_retries=0)
+
+
 def _find_unique_upload_file(filename: str, parent_id: str) -> str | None:
     def escaped(value: str) -> str:
         return value.replace("\\", "\\\\").replace("'", "\\'")
 
-    result = drive_service.files().list(
+    result = _execute_drive_upload_request(drive_service.files().list(
         q=f"name = '{escaped(filename)}' and '{escaped(parent_id)}' in parents and trashed = false",
         fields="files(id),nextPageToken,incompleteSearch", pageSize=2,
-    ).execute(num_retries=0)
+    ))
     if not isinstance(result, dict):
         raise ValueError("upload_identity_response_invalid")
     rows = result.get("files")
@@ -830,7 +850,7 @@ def _verify_drive_upload(filename: str, parent_id: str, file_id: str | None,
         observed_id = _find_unique_upload_file(filename, parent_id)
         if observed_id is None or (file_id is not None and observed_id != file_id):
             return "IDENTITY_MISSING_OR_CHANGED"
-        observed = drive_service.files().get_media(fileId=observed_id).execute(num_retries=0)
+        observed = _execute_drive_upload_request(drive_service.files().get_media(fileId=observed_id))
         if (isinstance(observed, bytes)
                 and hashlib.sha256(observed).digest() == hashlib.sha256(raw).digest()):
             return "EXACT_CONTENT_VERIFIED"
@@ -868,7 +888,7 @@ def upload_json(filename: str, data: Any, parent_id: str) -> None:
     except Exception as error:
         raise DriveUploadError(error, "prepare", attempt + 1, 0) from None
     try:
-        request.execute(num_retries=0)
+        _execute_drive_upload_request(request)
     except Exception as error:
         uncertain = _is_transient_drive_error(error) or isinstance(error, (BrokenPipeError, IncompleteRead))
         verification = _verify_drive_upload(filename, parent_id, file_id, raw) if uncertain else "NOT_ATTEMPTED"

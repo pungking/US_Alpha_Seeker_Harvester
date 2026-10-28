@@ -31,3 +31,13 @@ Done: shell failure regression, exact-byte create/update reconciliation, missing
 duplicate/hash/read-failure rejection with no second write, safe cause/count
 alerts, strict Toss exclusion and existing fixtures pass; required CI passes.
 Rollback: revert this merge. Do not repair or delete historical artifacts.
+
+Review correction: SDK num_retries=0 does not disable httplib2's internal lost-
+response replay. Upload-related requests therefore use the already-installed
+Google AuthorizedSession with refresh replay disabled and redirects disabled,
+adapting only the response interface for the existing generated Drive SDK.
+HTTP errors are stripped of raw bodies before SDK logging. Ordinary reads outside
+upload_json retain their existing implementation. writeAttempts counts logical
+create/update invocations, not the resumable protocol's initialization/chunks.
+Real-SDK fixtures cover successful upload, lost-response PUT count, 401/redirect
+rejection and non-JSON/JSON 403 log redaction without network access.
