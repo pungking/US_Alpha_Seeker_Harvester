@@ -12,6 +12,7 @@ import math
 import ssl
 import traceback
 import hashlib
+import httplib2
 from email.utils import parsedate_to_datetime
 from http.client import IncompleteRead
 from pathlib import Path
@@ -21,11 +22,12 @@ from html.parser import HTMLParser
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Iterable, Mapping
+from types import SimpleNamespace
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-from google.auth.transport.requests import Request
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload, DEFAULT_HTTP_TIMEOUT_SEC
+from google.auth.transport.requests import Request, AuthorizedSession
 from scripts.target_lineage import build_target_lineage, build_target_lineage_runtime_audit
 from scripts.toss_read_only_capability import (
     SCHEMA_VERSION as TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
@@ -785,49 +787,123 @@ def download_json(file_id, *, include_raw=False):
         f"after {DRIVE_RETRY_ATTEMPTS} attempts: {type(last_error).__name__ if last_error else 'Unknown'}: {last_error}"
     )
 
-def upload_json(filename, data, parent_id):
-    print(f"📤 업로드 시도: {filename}...")
-    last_error = None
-    for attempt in range(DRIVE_RETRY_ATTEMPTS): # 🎯 업로드 중 끊김 방지
-        try:
-            file_id = find_file_id(filename, parent_id)
-            fh = io.BytesIO(json.dumps(data, indent=4, ensure_ascii=False).encode())
-            media = MediaIoBaseUpload(fh, mimetype='application/json', resumable=True)
-            
-            if file_id:
-                drive_service.files().update(fileId=file_id, media_body=media).execute()
-            else:
-                meta = {'name': filename, 'parents': [parent_id]}
-                drive_service.files().create(body=meta, media_body=media).execute()
-            print(f"✅ 완료: {filename}")
-            return # 성공하면 함수 깔끔하게 종료
-        except HttpError as e:
-            status = _extract_http_status(e)
-            if status in (401, 403):
-                print(f"⛔ Drive API 인증 오류(upload_json:{filename}): {status} {e}", flush=True)
-                raise
-            last_error = e
-            if _is_transient_drive_error(e) and attempt < DRIVE_RETRY_ATTEMPTS - 1:
-                print(f"   ⚠️ 업로드 실패(upload_json:{filename}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}] transient={status}", flush=True)
-                _rebuild_drive_service(f"upload_json:{filename}")
-                slept = _retry_backoff_sleep(attempt)
-                print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
-                continue
-            break
-        except Exception as e:
-            last_error = e
-            if _is_transient_drive_error(e) and attempt < DRIVE_RETRY_ATTEMPTS - 1:
-                print(f"   ⚠️ 업로드 예외(upload_json:{filename}) [{attempt + 1}/{DRIVE_RETRY_ATTEMPTS}]: {type(e).__name__}: {e}", flush=True)
-                _rebuild_drive_service(f"upload_json:{filename}")
-                slept = _retry_backoff_sleep(attempt)
-                print(f"   ↳ backoff {slept:.2f}s 후 재시도", flush=True)
-                continue
-            break
+class DriveUploadError(RuntimeError):
+    """Safe diagnostics only; never retain provider messages or Drive identities."""
 
-    raise RuntimeError(
-        f"Drive 업로드 최종 실패(upload_json:{filename}, parent={parent_id}) "
-        f"after {DRIVE_RETRY_ATTEMPTS} attempts: {type(last_error).__name__ if last_error else 'Unknown'}: {last_error}"
-    )
+    def __init__(self, error: Exception, phase: str, lookup_attempts: int,
+                 write_attempts: int, verification: str = "NOT_ATTEMPTED") -> None:
+        cause = type(error).__name__
+        status = _extract_http_status(error)
+        super().__init__(
+            f"DRIVE_UPLOAD_FAILED phase={phase} cause={cause} "
+            f"httpStatus={status if isinstance(status, int) else 'unavailable'} "
+            f"lookupAttempts={lookup_attempts} writeAttempts={write_attempts} "
+            f"verification={verification}"
+        )
+
+
+def _execute_drive_upload_request(request: Any) -> Any:
+    # httplib2 retries some lost responses even with SDK num_retries=0.
+    with AuthorizedSession(drive_service._http.credentials, max_refresh_attempts=0) as session:
+        def request_once(uri: str, method: str = "GET", body: Any = None,
+                         headers: Any = None) -> tuple[Any, bytes]:
+            response = session.request(
+                method, uri, data=body, headers=headers,
+                timeout=DEFAULT_HTTP_TIMEOUT_SEC, allow_redirects=False,
+            )
+            metadata = httplib2.Response({**response.headers, "status": str(response.status_code)})
+            if response.status_code >= 400 or (300 <= response.status_code < 400 and response.status_code != 308):
+                # Reject before SDK retry diagnostics can log a raw error body.
+                raise HttpError(metadata, b"") from None
+            return metadata, response.content
+
+        return request.execute(http=SimpleNamespace(request=request_once), num_retries=0)
+
+
+def _find_unique_upload_file(filename: str, parent_id: str) -> str | None:
+    def escaped(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    result = _execute_drive_upload_request(drive_service.files().list(
+        q=f"name = '{escaped(filename)}' and '{escaped(parent_id)}' in parents and trashed = false",
+        fields="files(id),nextPageToken,incompleteSearch", pageSize=2,
+    ))
+    if not isinstance(result, dict):
+        raise ValueError("upload_identity_response_invalid")
+    rows = result.get("files")
+    if (not isinstance(rows, list) or result.get("nextPageToken")
+            or result.get("incompleteSearch") or len(rows) > 1):
+        raise ValueError("upload_identity_not_unique_or_complete")
+    if not rows:
+        return None
+    file_id = rows[0].get("id") if isinstance(rows[0], dict) else None
+    if not isinstance(file_id, str) or not file_id.strip():
+        raise ValueError("upload_identity_invalid")
+    return file_id
+
+
+def _verify_drive_upload(filename: str, parent_id: str, file_id: str | None,
+                         raw: bytes) -> str:
+    # A lost write acknowledgement may hide a committed upload. Never replay it.
+    try:
+        _rebuild_drive_service("upload_verify")
+        observed_id = _find_unique_upload_file(filename, parent_id)
+        if observed_id is None or (file_id is not None and observed_id != file_id):
+            return "IDENTITY_MISSING_OR_CHANGED"
+        observed = _execute_drive_upload_request(drive_service.files().get_media(fileId=observed_id))
+        if (isinstance(observed, bytes)
+                and hashlib.sha256(observed).digest() == hashlib.sha256(raw).digest()):
+            return "EXACT_CONTENT_VERIFIED"
+        return "CONTENT_HASH_MISMATCH"
+    except Exception:
+        # The outer error reports a failed read, never a successful/empty artifact.
+        return "READ_FAILED"
+
+
+def upload_json(filename: str, data: Any, parent_id: str) -> None:
+    try:
+        raw = json.dumps(data, indent=4, ensure_ascii=False).encode()
+    except Exception as error:
+        raise DriveUploadError(error, "serialize", 0, 0) from None
+    for attempt in range(DRIVE_RETRY_ATTEMPTS):
+        try:
+            file_id = _find_unique_upload_file(filename, parent_id)
+            break
+        except Exception as error:
+            transient = _is_transient_drive_error(error) or isinstance(
+                error, (BrokenPipeError, IncompleteRead, requests.exceptions.ChunkedEncodingError))
+            if not transient or attempt == DRIVE_RETRY_ATTEMPTS - 1:
+                raise DriveUploadError(error, "lookup", attempt + 1, 0) from None
+            try:
+                _rebuild_drive_service("upload_lookup")
+                _retry_backoff_sleep(attempt)
+            except Exception as reconnect_error:
+                raise DriveUploadError(reconnect_error, "reconnect", attempt + 1, 0) from None
+    try:
+        media = MediaIoBaseUpload(io.BytesIO(raw), mimetype="application/json", resumable=True)
+        request = (
+            drive_service.files().update(fileId=file_id, media_body=media)
+            if file_id else drive_service.files().create(
+                body={"name": filename, "parents": [parent_id]}, media_body=media)
+        )
+    except Exception as error:
+        raise DriveUploadError(error, "prepare", attempt + 1, 0) from None
+    try:
+        _execute_drive_upload_request(request)
+    except Exception as error:
+        uncertain = _is_transient_drive_error(error) or isinstance(
+            error, (BrokenPipeError, IncompleteRead, requests.exceptions.ChunkedEncodingError))
+        verification = _verify_drive_upload(filename, parent_id, file_id, raw) if uncertain else "NOT_ATTEMPTED"
+        if verification != "EXACT_CONTENT_VERIFIED":
+            raise DriveUploadError(error, "write", attempt + 1, 1, verification) from None
+        print("[DRIVE_UPLOAD] status=EXACT_CONTENT_VERIFIED writeAttempts=1", flush=True)
+        return
+    print("[DRIVE_UPLOAD] status=ACKNOWLEDGED writeAttempts=1", flush=True)
+
+
+def harvester_error_alert(error: Exception) -> str:
+    detail = f"\n`{error}`" if isinstance(error, DriveUploadError) else ""
+    return f"🚨 *Harvester error:* `{type(error).__name__}`{detail}"
 
 
 TOSS_READ_ONLY_CAPABILITY_FILENAME = "TOSS_READ_ONLY_CAPABILITY.json"
@@ -8367,7 +8443,7 @@ def run_harvester():
     except Exception as e:
         record_symbol_failure("RUN", "fatal", "RUN_FATAL", f"{type(e).__name__}: {e}")
         send_telegram(
-            f"🚨 *Harvester error:* `{type(e).__name__}`",
+            harvester_error_alert(e),
             channel="alert",
         )
         if not corporate_action_runtime_audit_written:
