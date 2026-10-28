@@ -1378,7 +1378,10 @@ def main() -> int:
     assert "verify Mac clock synchronization without compensation" in sent[-1]
     assert "registered egress, credentials, rate limit" not in sent[-1]
     assert "AffectedRows: `1`" in sent[-1]
-    assert "OffsetMs: `1000..1000`" in sent[-1]
+    assert "PayloadVsReceiptMs: `1000..1000`" in sent[-1]
+    assert "HttpDateVsReceiptMs: `2000..2000`" in sent[-1]
+    assert "ClockSync: `MAC_CLOCK_SYNC_UNVERIFIED`" in sent[-1]
+    assert "not a measured Mac clock offset" in sent[-1]
     assert "SYNTH" not in sent[-1]
 
     recovery = dispatch_toss_shadow_alert(

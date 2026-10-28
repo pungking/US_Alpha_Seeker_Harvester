@@ -2046,6 +2046,13 @@ def dispatch_toss_shadow_alert(
         if isinstance(offset_min, int) and isinstance(offset_max, int)
         else "not_available"
     )
+    http_offset_min = clock_summary.get("localToHttpDateMinOffsetMs")
+    http_offset_max = clock_summary.get("localToHttpDateMaxOffsetMs")
+    http_offset_range = (
+        f"{http_offset_min}..{http_offset_max}"
+        if isinstance(http_offset_min, int) and isinstance(http_offset_max, int)
+        else "not_available"
+    )
     request_count_labels = {
         key: str(counts.get(key))
         if isinstance(counts.get(key), int) and counts.get(key) >= 0
@@ -2193,7 +2200,10 @@ def dispatch_toss_shadow_alert(
             f"{timestamp_cause_line}"
             f"{timestamp_slice_line}"
             f"AffectedRows: `{affected_rows}`\n"
-            f"OffsetMs: `{offset_range}`\n"
+            f"PayloadVsReceiptMs: `{offset_range}`\n"
+            f"HttpDateVsReceiptMs: `{http_offset_range}`\n"
+            "ClockSync: `MAC_CLOCK_SYNC_UNVERIFIED`\n"
+            "Offsets compare clock domains; not a measured Mac clock offset.\n"
             "Requests: "
             f"oauth={request_count_labels['oauth']}, "
             f"calendar={request_count_labels['marketCalendar']}, "
