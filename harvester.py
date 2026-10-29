@@ -695,6 +695,16 @@ def find_file_id(name, parent_id=None):
         try:
             results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
             return results[0]['id'] if results else None
+        except BrokenPipeError:
+            # Reconnect only the idempotent read; never treat a failed lookup as absent.
+            print(f"[DRIVE_READ] operation=lookup category=BrokenPipeError attempt={attempt + 1}/{DRIVE_RETRY_ATTEMPTS}", flush=True)
+            if attempt >= DRIVE_RETRY_ATTEMPTS - 1:
+                raise RuntimeError("drive_lookup_broken_pipe_exhausted") from None
+            try:
+                _rebuild_drive_service("find_file_id_broken_pipe")
+                _retry_backoff_sleep(attempt)
+            except Exception as error:
+                raise RuntimeError(f"drive_lookup_reconnect_failed cause={type(error).__name__}") from None
         except HttpError as e:
             status = _extract_http_status(e)
             if status in (401, 403):
@@ -742,14 +752,18 @@ def download_json(file_id, *, include_raw=False):
             raw = fh.getvalue()
             payload = json.loads(raw.decode())
             return (payload, raw) if include_raw else payload
-        except IncompleteRead:
+        except (IncompleteRead, BrokenPipeError) as error:
             # Retry only this idempotent Drive read, with a new empty byte buffer.
             # Do not broaden upload retry semantics or expose partial response bytes.
-            print(f"[DRIVE_READ] category=IncompleteRead attempt={attempt + 1}/{DRIVE_RETRY_ATTEMPTS}", flush=True)
+            category = "incomplete_read" if isinstance(error, IncompleteRead) else "broken_pipe"
+            print(f"[DRIVE_READ] category={type(error).__name__} attempt={attempt + 1}/{DRIVE_RETRY_ATTEMPTS}", flush=True)
             if attempt >= DRIVE_RETRY_ATTEMPTS - 1:
-                raise RuntimeError("drive_download_incomplete_read_exhausted") from None
-            _rebuild_drive_service("download_json_incomplete_read")
-            _retry_backoff_sleep(attempt)
+                raise RuntimeError(f"drive_download_{category}_exhausted") from None
+            try:
+                _rebuild_drive_service(f"download_json_{category}")
+                _retry_backoff_sleep(attempt)
+            except Exception as reconnect_error:
+                raise RuntimeError(f"drive_download_reconnect_failed cause={type(reconnect_error).__name__}") from None
         except json.JSONDecodeError as e:
             print(f"⚠️ JSON 파싱 오류(download_json:{file_id}): {e}", flush=True)
             return None
