@@ -41,3 +41,11 @@ upload_json retain their existing implementation. writeAttempts counts logical
 create/update invocations, not the resumable protocol's initialization/chunks.
 Real-SDK fixtures cover successful upload, lost-response PUT count, 401/redirect
 rejection and non-JSON/JSON 403 log redaction without network access.
+
+Post-merge read-path correction: a natural run at this fix failed in the unchanged
+find_file_id GET path, not in upload_json. BrokenPipeError bypassed the existing
+bounded read recovery. Reconnect lookup/download reads within the same three-
+attempt budget, discard partial download bytes, and fail closed on exhaustion or
+reconnect failure. Never turn transport failure into a missing file or replay an
+upload. Preserve IncompleteRead behavior and sanitize the new diagnostics. Test
+recovery, exhaustion, partial buffers, reconnect failure and zero writes offline.

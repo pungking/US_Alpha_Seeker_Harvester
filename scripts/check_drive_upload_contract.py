@@ -32,6 +32,7 @@ NAMES = {
     "_find_unique_upload_file", "_verify_drive_upload", "upload_json",
     "harvester_error_alert",
     "_execute_drive_upload_request",
+    "find_file_id", "download_json",
 }
 PRIVATE = "private-fixture-filename-parent-response"
 PAYLOAD = {"fixture": "value"}
@@ -351,6 +352,87 @@ class UploadContract(unittest.TestCase):
                 self.assertIsInstance(self.invoke(), RuntimeError)
             self.assertEqual(methods, ["GET"])
             self.assert_safe()
+
+
+class ReadContract(unittest.TestCase):
+    def test_reconnect_failure_stops_without_identifier_exposure(self) -> None:
+        for operation in ("find_file_id", "download_json"):
+            scope = load_upload()
+            drive = Mock()
+            scope["drive_service"] = drive
+            drive.files.return_value.list.return_value.execute.side_effect = BrokenPipeError(PRIVATE)
+            downloader = Mock()
+            downloader.next_chunk.side_effect = BrokenPipeError(PRIVATE)
+            scope["MediaIoBaseDownload"] = Mock(return_value=downloader)
+            scope["_rebuild_drive_service"].side_effect = RuntimeError(PRIVATE)
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertRaises(RuntimeError) as caught:
+                scope[operation](PRIVATE)
+            self.assertIn("reconnect_failed", str(caught.exception))
+            self.assertNotIn(PRIVATE, str(caught.exception))
+            self.assertNotIn(PRIVATE, output.getvalue())
+            scope["_rebuild_drive_service"].assert_called_once()
+            scope["_retry_backoff_sleep"].assert_not_called()
+            drive.files.return_value.create.assert_not_called()
+            drive.files.return_value.update.assert_not_called()
+
+    def test_broken_pipe_lookup_reconnects_with_existing_bound(self) -> None:
+        for failures in (2, 3):
+            scope = load_upload()
+            drive = Mock()
+            scope["drive_service"] = drive
+            lookup = drive.files.return_value.list.return_value.execute
+            lookup.side_effect = [BrokenPipeError(PRIVATE)] * failures + [{"files": [{"id": "fixture-id"}]}]
+            output = io.StringIO()
+            with redirect_stdout(output):
+                if failures == 2:
+                    self.assertEqual(scope["find_file_id"](PRIVATE, PRIVATE), "fixture-id")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "drive_lookup_broken_pipe_exhausted") as caught:
+                        scope["find_file_id"](PRIVATE, PRIVATE)
+                    self.assertNotIn(PRIVATE, str(caught.exception))
+            self.assertEqual(lookup.call_count, 3)
+            self.assertEqual(scope["_rebuild_drive_service"].call_count, 2)
+            self.assertEqual(scope["_retry_backoff_sleep"].call_count, 2)
+            drive.files.return_value.create.assert_not_called()
+            drive.files.return_value.update.assert_not_called()
+            self.assertNotIn(PRIVATE, output.getvalue())
+
+    def test_broken_pipe_download_discards_partial_bytes(self) -> None:
+        for failures in (2, 3):
+            scope = load_upload()
+            drive = Mock()
+            scope["drive_service"] = drive
+            attempts = 0
+
+            class Downloader:
+                def __init__(self, stream: io.BytesIO, request: object) -> None:
+                    self.stream = stream
+
+                def next_chunk(self) -> tuple[None, bool]:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts <= failures:
+                        self.stream.write(b'{"partial":')
+                        raise BrokenPipeError(PRIVATE)
+                    self.stream.write(RAW)
+                    return None, True
+
+            scope["MediaIoBaseDownload"] = Downloader
+            output = io.StringIO()
+            with redirect_stdout(output):
+                if failures == 2:
+                    self.assertEqual(scope["download_json"](PRIVATE, include_raw=True), (PAYLOAD, RAW))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "drive_download_broken_pipe_exhausted") as caught:
+                        scope["download_json"](PRIVATE)
+                    self.assertNotIn(PRIVATE, str(caught.exception))
+            self.assertEqual(attempts, 3)
+            self.assertEqual(scope["_rebuild_drive_service"].call_count, 2)
+            self.assertEqual(scope["_retry_backoff_sleep"].call_count, 2)
+            drive.files.return_value.create.assert_not_called()
+            drive.files.return_value.update.assert_not_called()
+            self.assertNotIn(PRIVATE, output.getvalue())
 
 
 if __name__ == "__main__":
