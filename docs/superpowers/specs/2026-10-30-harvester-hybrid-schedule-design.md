@@ -1,6 +1,6 @@
 # Harvester native schedule with optional Mac assist
 
-Status: DESIGN_REVIEW_REQUIRED. No implementation or activation approval.
+Status: DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING. No implementation or activation approval.
 Date: 2026-10-30, Asia/Seoul.
 Work item: HARVESTER_NATIVE_SCHEDULE_MAC_ASSIST_DESIGN_V1.
 Baseline: 536205c29e2961622182172443730925a9967d26, locally verified main/origin/main.
@@ -80,7 +80,7 @@ Identity is repository + KST slot date + explicit canonical batch. Sender host,
 event name, run ID, code version and adjustable deadline are NOT identity fields.
 They cannot be changed to obtain a second attempt for the same scope.
 
-Designer proposal requiring document approval: admit a collector start only in
+Approved design choice, not operational activation: admit a collector start only in
 the half-open interval `[scheduledFor, scheduledFor + 3 hours)`. This permits an
 08:00 recovery of the 07:13 first slot without unlimited late backfill. It also
 means a native second run first starting at 18:50 would be expired, not collected
@@ -108,7 +108,7 @@ not consume its receipt.
 
 ## 5. Durable admission, not just concurrency
 
-Designer proposal: safe scheduling receipts on a dedicated GitHub branch
+Approved design choice: safe scheduling receipts on a dedicated GitHub branch
 `harvester-schedule-receipts`, using repository Contents API and the existing
 main-workflow concurrency group. This is NEW orchestration metadata, not existing
 functionality. Creating that branch or writing receipts is operational activation
@@ -261,9 +261,9 @@ report original GitHub scheduledFor or a punctuality SLA that was not observed.
 
 ## 10. Boundaries and remaining approval
 
-Document approval must explicitly cover the proposed 3-hour admission window,
-new safe scheduling receipt branch and automatic/manual shared-gate behavior.
-These are designer recommendations, not claims of prior operator approval.
+The operator approved the document and implementation planning, including the
+3-hour admission window, safe scheduling receipt branch and automatic/manual
+shared-gate behavior. This approval does not authorize implementation or rollout.
 Installation, repository permissions/variables, real dispatch, receipt writes,
 provider requests, workflow activation and runtime proof remain separately gated.
 
@@ -292,4 +292,5 @@ protection configuration, on-host launchd installation, or a successful run.
 - Proposed window arithmetic: 16 boundary cases PASS; four SEC New York date
   examples PASS. These are design checks, not new production fixture coverage.
 - No product code, runtime configuration, provider request or activation changed.
-- Operator document approval is still required before an implementation plan.
+- Operator reply on 2026-10-30: design approved; prepare the implementation plan.
+- Preserve the original reviewed design in commit 6aac9eb38ac6e6e8d1370384936dbba11a8572de.
