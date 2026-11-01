@@ -228,7 +228,8 @@ class AdmissionProof:
                 "runAttempt": 1, "attemptSha256": self.attempt_sha256, "attemptPath": self.slot.attempt_path}
 
 
-def validate_proof(raw: bytes, control: Control, run_id: str, head_sha: str, now: dt.datetime) -> AdmissionProof:
+def validate_proof(raw: bytes, control: Control, run_id: str, head_sha: str, now: dt.datetime,
+                   *, allow_expired: bool = False) -> AdmissionProof:
     value = decode(raw)
     exact(value, {"schemaVersion", "slot", "controlSha256", "runId", "headSha", "runAttempt", "attemptSha256", "attemptPath"})
     slot = slot_from_wire(value["slot"], control.repository)
@@ -238,7 +239,8 @@ def validate_proof(raw: bytes, control: Control, run_id: str, head_sha: str, now
             and type(value["runAttempt"]) is int and value["runAttempt"] == 1
             and valid_hash(value["attemptSha256"]) and value["attemptPath"] == slot.attempt_path,
             "PROOF_IDENTITY_MISMATCH")
-    require(slot.scheduled_for >= control.activation_at and slot_is_open(slot, now), "PROOF_WINDOW_INVALID")
+    require(slot.scheduled_for >= control.activation_at and
+            (slot.scheduled_for <= now if allow_expired else slot_is_open(slot, now)), "PROOF_WINDOW_INVALID")
     return AdmissionProof(slot, control.sha256, run_id, head_sha, value["attemptSha256"])
 
 
