@@ -5,7 +5,10 @@ import datetime as dt
 import hashlib
 import json
 import re
+import os
+import stat
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -261,3 +264,46 @@ class GateResult:
     def wire(self) -> dict[str, Any]:
         return {"status": self.status, "mayCollect": self.may_collect,
                 "proof": self.proof.wire() if self.proof else None}
+
+
+def read_json_file(path: str, *, private: bool = False) -> dict[str, Any]:
+    require(isinstance(path, str) and bool(path), "INPUT_FILE_REQUIRED")
+    try:
+        target = Path(path)
+        info = target.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_size <= 1024*1024, "INPUT_FILE_INVALID")
+        if private:
+            require(info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, "PRIVATE_INPUT_REQUIRED")
+        return decode(target.read_bytes())
+    except OSError as exc:
+        raise ContractError("INPUT_FILE_UNAVAILABLE") from exc
+
+
+def environment_event(env: Mapping[str, str]) -> dict[str, Any]:
+    if env.get("GITHUB_EVENT_PATH"):
+        return read_json_file(env["GITHUB_EVENT_PATH"])
+    require(env.get("GITHUB_EVENT_NAME", "") != "repository_dispatch", "DISPATCH_EVENT_REQUIRED")
+    return {}
+
+
+def assert_environment_start(env: Mapping[str, str], now: dt.datetime) -> str:
+    """Called before Drive auth and again before collection, without network."""
+    mode = env.get("HARVESTER_SCHEDULE_MODE", "legacy")
+    require(mode in {"legacy", "hybrid"}, "INVALID_MODE")
+    event = environment_event(env)
+    event_name = env.get("GITHUB_EVENT_NAME", "")
+    if is_stage3_event(event_name, event):
+        return "stage3"
+    if mode == "legacy":
+        require(event_name != "repository_dispatch", "ASSIST_NOT_ENABLED")
+        return "legacy_daily"
+    bundle = read_json_file(env.get("HARVESTER_SCHEDULE_PROOF_PATH", ""), private=True)
+    exact(bundle, {"proof", "control"})
+    require(isinstance(bundle["control"], str), "INVALID_CONTROL")
+    control = validate_control(bundle["control"].encode(), env.get("HARVESTER_SCHEDULE_CONTROL_SHA256", ""),
+                               env.get("GITHUB_REPOSITORY", ""))
+    proof = validate_proof(encode(bundle["proof"]), control, env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_SHA", ""), now)
+    require(env.get("GITHUB_RUN_ATTEMPT") == "1", "MAIN_FIRST_ATTEMPT_REQUIRED")
+    route = resolve_route(event_name, event, env.get("GITHUB_REF", ""), 1, now, now, mode, control.repository)
+    require(route.slot == proof.slot and env.get("DAILY_BATCH_MODE") == proof.slot.batch, "ROUTE_PROOF_MISMATCH")
+    return "hybrid_daily"

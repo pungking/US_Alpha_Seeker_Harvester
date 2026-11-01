@@ -168,9 +168,10 @@ def recheck_admission(proof: c.AdmissionProof, now: Callable[[], dt.datetime], t
 def finish_slot(proof: c.AdmissionProof, outcome: Mapping[str, Any], now: Callable[[], dt.datetime],
                 transport: GitHubTransport) -> c.GateResult:
     required = {"collectorExit", "workflowJobResult", "secPhase"}
-    c.require(isinstance(outcome, dict) and required <= set(outcome) <= required|{"aggregateSummarySha256"}, "INVALID_OUTCOME")
+    c.require(isinstance(outcome, dict) and required <= set(outcome) <= required|{"aggregateSummarySha256", "notionPhase"}, "INVALID_OUTCOME")
     allowed = {"success", "failure", "skipped", "unknown", "cancelled"}
     c.require(all(outcome[k] in allowed for k in required), "INVALID_OUTCOME")
+    c.require(outcome.get("notionPhase", "unknown") in allowed, "INVALID_NOTION_OUTCOME")
     if "aggregateSummarySha256" in outcome:
         c.require(c.valid_hash(outcome["aggregateSummarySha256"]), "INVALID_OUTCOME_HASH")
     verify_attempt(proof, transport, now(), allow_expired=True)

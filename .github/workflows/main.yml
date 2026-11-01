@@ -3,7 +3,7 @@ name: Master Stock Harvester
 on:
   # 웹앱에서 신호를 주면 즉시 실행
   repository_dispatch:
-    types: [stage3_completed]
+    types: [stage3_completed, harvester_daily_slot_requested]
     
   # 정기 스케줄 (KST 기준 1차 07:13, 2차 12:13).
   # GitHub recommends avoiding minute 0 because scheduled delivery may be delayed.
@@ -13,6 +13,10 @@ on:
     
   workflow_dispatch: # 수동 실행 버튼
     inputs:
+      scheduled_for:
+        description: "Exact UTC daily slot (hybrid mode only)"
+        required: false
+        type: string
       batch_mode:
         description: "데일리 수집 배치 선택 (수동 실행 전용)"
         required: false
@@ -26,16 +30,76 @@ on:
   
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Inert until a separately approved control/receipt cutover.
+  HARVESTER_SCHEDULE_MODE: legacy
+  HARVESTER_SCHEDULE_CONTROL_SHA256: ''
+  SEC_RECURRING_ENABLED: ${{ vars.STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_ENABLED }}
   STAGE0_SEC_FINANCIAL_LINEAGE_RUN: ${{ github.event_name == 'schedule' && github.event.schedule == '13 3 * * 2-6' && vars.STAGE0_SEC_FINANCIAL_LINEAGE_PRODUCER_ENABLED == 'true' }}
 
 concurrency:
   group: master-stock-harvester-${{ github.ref }}
   # Stage3 handoff is time-sensitive for Stage4 readiness; let it preempt
   # stale daily/manual collection runs instead of competing for Drive/API quota.
-  cancel-in-progress: ${{ github.event_name == 'repository_dispatch' }}
+  cancel-in-progress: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'stage3_completed' }}
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
+  route:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      kind: ${{ steps.route.outputs.kind }}
+      batch: ${{ steps.route.outputs.batch }}
+      sec_enabled: ${{ steps.route.outputs.sec_enabled }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install existing transport dependency for hybrid metadata only
+        if: env.HARVESTER_SCHEDULE_MODE == 'hybrid'
+        run: pip install requests
+      - id: route
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/run_harvester_schedule_gate.py resolve
+
+  reserve:
+    needs: route
+    if: needs.route.outputs.kind == 'hybrid_daily'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      admitted: ${{ steps.reserve.outputs.admitted }}
+      proof_json: ${{ steps.reserve.outputs.proof_json }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - id: reserve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/run_harvester_schedule_gate.py reserve
+
   build:
+    needs: [route, reserve]
+    if: >-
+      always() && needs.route.result == 'success' &&
+      (needs.route.outputs.kind != 'hybrid_daily' ||
+       (needs.reserve.result == 'success' && needs.reserve.outputs.admitted == 'true'))
+    env:
+      STAGE0_SEC_FINANCIAL_LINEAGE_RUN: ${{ needs.route.outputs.sec_enabled }}
+    outputs:
+      collector_outcome: ${{ steps.collect.outcome }}
+      sec_outcome: ${{ steps.stage0_sec_producer.outcome }}
+      notion_phase: ${{ steps.notion.outcome }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -85,7 +149,17 @@ jobs:
       - name: Toss same-Stage3 handoff contract
         run: python scripts/check_toss_same_stage3_handoff.py
         
+      - name: Recheck hybrid admission before provider authentication
+        if: needs.route.outputs.kind == 'hybrid_daily'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROOF_JSON: ${{ needs.reserve.outputs.proof_json }}
+          HARVESTER_SCHEDULE_PROOF_PATH: ${{ runner.temp }}/harvester-schedule-proof.json
+          DAILY_BATCH_MODE: ${{ needs.route.outputs.batch }}
+        run: python scripts/run_harvester_schedule_gate.py recheck
+
       - name: Run Master Harvester
+        id: collect
         shell: bash
         env:
           # 🎯 [본계정 모드 전용 키로 교체]
@@ -122,9 +196,10 @@ jobs:
           TELEGRAM_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_ALERT_CHAT_ID || vars.TELEGRAM_ALERT_CHAT_ID || secrets.TELEGRAM_SIMULATION_CHAT_ID || vars.TELEGRAM_SIMULATION_CHAT_ID }}
           
           # 🎯 파이썬 코드가 웹앱 신호인지 스케줄 실행인지 판단하는 핵심 변수
+          HARVESTER_SCHEDULE_PROOF_PATH: ${{ runner.temp }}/harvester-schedule-proof.json
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
-          DAILY_BATCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_mode || github.event.schedule == '13 22 * * 1-5' && 'first' || github.event.schedule == '13 3 * * 2-6' && 'second' || 'auto' }}
+          DAILY_BATCH_MODE: ${{ needs.route.outputs.batch || github.event_name == 'workflow_dispatch' && inputs.batch_mode || github.event.schedule == '13 22 * * 1-5' && 'first' || github.event.schedule == '13 3 * * 2-6' && 'second' || 'auto' }}
           HARVESTER_RUN_SUMMARY_PATH: state/last-harvester-run.json
           HARVESTER_EARNINGS_EVENT_COVERAGE_AUDIT_PATH: state/stage4-earnings-event-coverage-audit.json
           HARVESTER_MAPPING_FRESHNESS_AUDIT_PATH: state/harvester-mapping-freshness-audit.json
@@ -138,6 +213,7 @@ jobs:
           HARVESTER_MACRO_EVENT_CLOCK_SHADOW_PATH: state/macro-event-clock-shadow.json
           HARVESTER_OFFICIAL_SHADOW_SENTINEL_DIR: ${{ runner.temp }}/official-shadow-sentinels
         run: |
+          set -euo pipefail
           mkdir -p state
           python harvester.py | tee state/harvester-output.log
 
@@ -182,6 +258,7 @@ jobs:
           key: stage0-sec-financial-lineage-runtime-${{ steps.stage0_sec_lineage_window.outputs.collection_key }}
 
       - name: Run scheduled Stage0 SEC financial lineage producer
+        id: stage0_sec_producer
         if: >-
           env.STAGE0_SEC_FINANCIAL_LINEAGE_RUN == 'true' &&
           steps.stage0_sec_lineage_reservation.outputs.cache-hit != 'true'
@@ -202,7 +279,10 @@ jobs:
             --collection-window "$COLLECTION_WINDOW"
 
       - name: Sync Harvester summary to Notion
-        if: always()
+        id: notion
+        if: >-
+          always() && (needs.route.outputs.kind != 'hybrid_daily' ||
+          (steps.collect.outcome != 'skipped' && hashFiles('state/last-harvester-run.json') != ''))
         continue-on-error: ${{ vars.NOTION_HARVESTER_SYNC_REQUIRED != 'true' }}
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -239,3 +319,28 @@ jobs:
           if-no-files-found: warn
 
          
+
+  finish:
+    needs: [route, reserve, build]
+    if: >-
+      always() && needs.route.outputs.kind == 'hybrid_daily' &&
+      needs.reserve.result == 'success' && needs.reserve.outputs.admitted == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: Record observed outcomes without source coverage promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROOF_JSON: ${{ needs.reserve.outputs.proof_json }}
+          COLLECTOR_OUTCOME: ${{ needs.build.outputs.collector_outcome }}
+          COLLECTOR_JOB_RESULT: ${{ needs.build.result }}
+          SEC_OUTCOME: ${{ needs.build.outputs.sec_outcome }}
+          NOTION_OUTCOME: ${{ needs.build.outputs.notion_phase }}
+        run: python scripts/run_harvester_schedule_gate.py finish
