@@ -18,6 +18,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_importing_fixtures_do_not_inherit_live_admission(self):
+        text=(ROOT/'.github/workflows/main.yml').read_text()
+        for check in ('listing_lifecycle_contract','corporate_action_lineage_contract',
+                      'earnings_event_coverage_contract','toss_same_stage3_handoff'):
+            step=next(s for s in text.split('      - name: ') if f'python scripts/check_{check}.py' in s)
+            self.assertIn('HARVESTER_SCHEDULE_MODE: legacy',step)
+            self.assertIn('GITHUB_EVENT_NAME: offline_fixture',step)
+            self.assertIn("GITHUB_EVENT_PATH: ''",step)
+        collector=next(s for s in text.split('      - name: ') if s.startswith('Run Master Harvester'))
+        self.assertNotIn('HARVESTER_SCHEDULE_MODE: legacy',collector)
+
+    def test_ci_registration_and_runbook(self):
+        ci=(ROOT/'.github/workflows/telegram-routing-ci.yml').read_text()
+        for name in ('admission','integration'):
+            self.assertIn(f'python scripts/check_harvester_schedule_{name}.py',ci)
+        self.assertIn('python scripts/check_harvester_mac_assist.py',ci)
+        self.assertIn('contents: read',ci)
+        self.assertNotIn('contents: write',ci)
+        main=(ROOT/'.github/workflows/main.yml').read_text()
+        self.assertNotIn('pull_request:',main)
+        runbook=(ROOT/'docs/ops/harvester-hybrid-schedule-runbook.md').read_text()
+        for phrase in ('STATIC_READY_NOT_ACTIVATED','harvester-schedule-receipts',
+                       'pending queue','gate-only rollback','no-delete','no-force',
+                       'old-job drain','current-cutoff','manual auto/all','GET<=12'):
+            self.assertIn(phrase,runbook)
+
     def test_assist_is_daily_not_stage3(self):
         source = (ROOT/'harvester.py').read_text()
         self.assertIn('GITHUB_EVENT_ACTION == "stage3_completed"', source)

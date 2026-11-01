@@ -123,10 +123,22 @@ jobs:
       - name: Target lineage contract
         run: python scripts/check_target_lineage_contract.py
       - name: Listing lifecycle and partial retry contract
+        env:
+          HARVESTER_SCHEDULE_MODE: legacy
+          GITHUB_EVENT_NAME: offline_fixture
+          GITHUB_EVENT_PATH: ''
         run: python scripts/check_listing_lifecycle_contract.py
       - name: Corporate-action lineage contract
+        env:
+          HARVESTER_SCHEDULE_MODE: legacy
+          GITHUB_EVENT_NAME: offline_fixture
+          GITHUB_EVENT_PATH: ''
         run: python scripts/check_corporate_action_lineage_contract.py
       - name: Earnings event coverage contract
+        env:
+          HARVESTER_SCHEDULE_MODE: legacy
+          GITHUB_EVENT_NAME: offline_fixture
+          GITHUB_EVENT_PATH: ''
         run: python scripts/check_earnings_event_coverage_contract.py
       - name: SEC and FINRA SHADOW_ONLY capability contract
         run: python scripts/check_sec_finra_shadow_capability.py
@@ -147,6 +159,10 @@ jobs:
       - name: Toss Phase2a shadow market-data contract
         run: python scripts/check_toss_shadow_market_data.py
       - name: Toss same-Stage3 handoff contract
+        env:
+          HARVESTER_SCHEDULE_MODE: legacy
+          GITHUB_EVENT_NAME: offline_fixture
+          GITHUB_EVENT_PATH: ''
         run: python scripts/check_toss_same_stage3_handoff.py
         
       - name: Recheck hybrid admission before provider authentication

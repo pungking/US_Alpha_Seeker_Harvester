@@ -1,6 +1,8 @@
 # Harvester native schedule with optional Mac assist
 
-Status: DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING. No implementation or activation approval.
+Original status (2026-10-30): DESIGN_APPROVED_FOR_IMPLEMENTATION_PLANNING.
+Subsequent approval: Native offline implementation, review, PR/CI and merge.
+Activation/installation/operational requests remain unapproved.
 Date: 2026-10-30, Asia/Seoul.
 Work item: HARVESTER_NATIVE_SCHEDULE_MAC_ASSIST_DESIGN_V1.
 Baseline: 536205c29e2961622182172443730925a9967d26, locally verified main/origin/main.
