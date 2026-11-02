@@ -26,6 +26,12 @@ jobs:
         run: python scripts/check_symbol_agnostic_runtime.py
       - name: Harvester schedule-slot contract
         run: python scripts/check_harvester_schedule_slot_contract.py
+      - name: Hybrid schedule admission offline contract
+        run: python scripts/check_harvester_schedule_admission.py
+      - name: Hybrid schedule integration offline contract
+        run: python scripts/check_harvester_schedule_integration.py
+      - name: Inactive Mac assist offline contract
+        run: python scripts/check_harvester_mac_assist.py
       - name: Drive upload and failure propagation contract
         run: python scripts/check_drive_upload_contract.py
       - name: Telegram routing policy audit

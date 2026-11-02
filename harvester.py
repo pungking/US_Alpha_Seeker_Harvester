@@ -28,6 +28,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload, DEFAULT_HTTP_TIMEOUT_SEC
 from google.auth.transport.requests import Request, AuthorizedSession
+from scripts.harvester_schedule_contract import assert_environment_start, collector_start_evidence, environment_event
 from scripts.target_lineage import build_target_lineage, build_target_lineage_runtime_audit
 from scripts.toss_read_only_capability import (
     SCHEMA_VERSION as TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
@@ -538,6 +539,13 @@ def get_drive_service():
         creds.refresh(Request())
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
+def assert_schedule_start(*, completed_collector_required: bool = False) -> None:
+    assert_environment_start(os.environ, datetime.datetime.now(datetime.timezone.utc),
+                             completed_collector_required=completed_collector_required)
+
+
+GITHUB_EVENT_ACTION = environment_event(os.environ).get("action", "")
+assert_schedule_start(completed_collector_required=__name__ != "__main__")
 drive_service = get_drive_service()
 
 DRIVE_RETRY_ATTEMPTS = 3
@@ -7100,8 +7108,10 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
 
 # --- [4. 메인 엔진] ---
 def run_harvester():
+    schedule_started_at = datetime.datetime.now(datetime.timezone.utc)
+    schedule_admission = collector_start_evidence(os.environ, schedule_started_at)
     start_time = time.time()
-    started_at_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    started_at_utc = schedule_started_at.isoformat().replace("+00:00", "Z")
     total_success, total_error = 0, 0
     total_lifecycle_skipped = 0
     total_mapping_pruned = 0
@@ -7110,7 +7120,7 @@ def run_harvester():
     now_kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     today_str = now_kst.strftime('%Y-%m-%d %H:%M:%S')
     is_weekend_update = (now_kst.weekday() in (5, 6))
-    run_mode = "dispatch" if GITHUB_EVENT_NAME == 'repository_dispatch' else "daily"
+    run_mode = "dispatch" if GITHUB_EVENT_NAME == 'repository_dispatch' and GITHUB_EVENT_ACTION == "stage3_completed" else "daily"
     dispatch_trigger_file = None
     dispatch_trigger_sha256 = None
     dispatch_trigger_content_sha256 = None
@@ -7152,7 +7162,7 @@ def run_harvester():
         sys_id = find_file_id("System_Identity_Maps", root_id) # 변수명 오류 수정 (find_id_map 제거)
 
         # 🎯 1. [특별 작업 모드] 웹앱 신호 시 OHLCV 300개 수집
-        if GITHUB_EVENT_NAME == 'repository_dispatch':
+        if GITHUB_EVENT_NAME == 'repository_dispatch' and GITHUB_EVENT_ACTION == "stage3_completed":
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
             dispatch_trigger_contract = get_dispatch_trigger_contract()
@@ -8389,6 +8399,7 @@ def run_harvester():
             "eventName": GITHUB_EVENT_NAME or "unknown",
             "mode": run_mode,
             "batchLabel": daily_group_label,
+            "scheduleAdmission": schedule_admission,
             "batchMode": daily_batch_mode,
             "scheduleExpression": GITHUB_EVENT_SCHEDULE,
             "targetSymbols": daily_target_count,
