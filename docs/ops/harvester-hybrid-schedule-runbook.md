@@ -65,6 +65,14 @@ Lost create response or readback failure blocks; no retry or artifact deletion.
 The pre-import guard precedes Drive authentication and is rechecked at collector
 entry. A runner that waited past the start deadline does not collect. Stage3
 preemption after reservation may leave an unresolved attempt; preserve it.
+The resolved canonical slot is frozen across jobs: a delayed reservation cannot
+roll into tomorrow's slot. The collector uses a cancellation-aware job condition.
+An additive `scheduleAdmission` field in its existing successful run summary
+binds actual start time to the exact admission proof. A later SEC library import
+requires that same-run/head/proof-bound completion evidence before authentication,
+without imposing the daily start deadline on continuation. Calling the collector
+again still requires a current start window. No new runtime flag or receipt store
+is introduced. Failed/missing/mismatched summaries cannot authorize continuation.
 GitHub's pending queue may replace a waiting run even with cancellation disabled.
 That is an availability failure, never permission for a duplicate attempt. There
 is no fairness, punctuality, exact original native trigger time, or successful

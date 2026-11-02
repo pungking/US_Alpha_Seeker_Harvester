@@ -286,7 +286,7 @@ def environment_event(env: Mapping[str, str]) -> dict[str, Any]:
     return {}
 
 
-def assert_environment_start(env: Mapping[str, str], now: dt.datetime) -> str:
+def assert_environment_start(env: Mapping[str, str], now: dt.datetime, *, completed_collector_required: bool = False) -> str:
     """Called before Drive auth and again before collection, without network."""
     mode = env.get("HARVESTER_SCHEDULE_MODE", "legacy")
     require(mode in {"legacy", "hybrid"}, "INVALID_MODE")
@@ -302,8 +302,29 @@ def assert_environment_start(env: Mapping[str, str], now: dt.datetime) -> str:
     require(isinstance(bundle["control"], str), "INVALID_CONTROL")
     control = validate_control(bundle["control"].encode(), env.get("HARVESTER_SCHEDULE_CONTROL_SHA256", ""),
                                env.get("GITHUB_REPOSITORY", ""))
-    proof = validate_proof(encode(bundle["proof"]), control, env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_SHA", ""), now)
+    proof = validate_proof(encode(bundle["proof"]), control, env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_SHA", ""), now,
+                           allow_expired=completed_collector_required)
     require(env.get("GITHUB_RUN_ATTEMPT") == "1", "MAIN_FIRST_ATTEMPT_REQUIRED")
-    route = resolve_route(event_name, event, env.get("GITHUB_REF", ""), 1, now, now, mode, control.repository)
+    route = resolve_route(event_name, event, env.get("GITHUB_REF", ""), 1, proof.slot.scheduled_for,
+                          proof.slot.scheduled_for, mode, control.repository)
     require(route.slot == proof.slot and env.get("DAILY_BATCH_MODE") == proof.slot.batch, "ROUTE_PROOF_MISMATCH")
+    if completed_collector_required:
+        # A library import may continue an admitted, completed run; it cannot start a collector.
+        summary = read_json_file(env.get("HARVESTER_RUN_SUMMARY_PATH", ""))
+        admission = summary.get("scheduleAdmission")
+        exact(admission, {"proofSha256", "startedAt"})
+        started, completed = parse_time(admission["startedAt"]), parse_time(summary.get("completedAt"))
+        require(summary.get("status") == "success" and summary.get("mode") == "daily"
+                and summary.get("batchMode") == proof.slot.batch
+                and summary.get("startedAt") == admission["startedAt"]
+                and admission["proofSha256"] == digest(encode(bundle["proof"]))
+                and slot_is_open(proof.slot, started) and started <= completed <= now,
+                "COMPLETED_COLLECTOR_EVIDENCE_REQUIRED")
     return "hybrid_daily"
+
+
+def collector_start_evidence(env: Mapping[str, str], now: dt.datetime) -> dict[str, str] | None:
+    if assert_environment_start(env, now) != "hybrid_daily":
+        return None
+    bundle = read_json_file(env.get("HARVESTER_SCHEDULE_PROOF_PATH", ""), private=True)
+    return {"proofSha256": digest(encode(bundle["proof"])), "startedAt": stamp(now)}

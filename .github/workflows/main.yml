@@ -53,6 +53,7 @@ jobs:
     outputs:
       kind: ${{ steps.route.outputs.kind }}
       batch: ${{ steps.route.outputs.batch }}
+      slot_json: ${{ steps.route.outputs.slot_json }}
       sec_enabled: ${{ steps.route.outputs.sec_enabled }}
     steps:
       - uses: actions/checkout@v5
@@ -86,12 +87,13 @@ jobs:
       - id: reserve
         env:
           GH_TOKEN: ${{ github.token }}
+          RESOLVED_SLOT_JSON: ${{ needs.route.outputs.slot_json }}
         run: python scripts/run_harvester_schedule_gate.py reserve
 
   build:
     needs: [route, reserve]
     if: >-
-      always() && needs.route.result == 'success' &&
+      !cancelled() && needs.route.result == 'success' &&
       (needs.route.outputs.kind != 'hybrid_daily' ||
        (needs.reserve.result == 'success' && needs.reserve.outputs.admitted == 'true'))
     env:
@@ -279,6 +281,9 @@ jobs:
           env.STAGE0_SEC_FINANCIAL_LINEAGE_RUN == 'true' &&
           steps.stage0_sec_lineage_reservation.outputs.cache-hit != 'true'
         env:
+          HARVESTER_SCHEDULE_PROOF_PATH: ${{ runner.temp }}/harvester-schedule-proof.json
+          HARVESTER_RUN_SUMMARY_PATH: state/last-harvester-run.json
+          DAILY_BATCH_MODE: ${{ needs.route.outputs.batch }}
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}

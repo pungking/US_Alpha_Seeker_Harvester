@@ -28,7 +28,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload, DEFAULT_HTTP_TIMEOUT_SEC
 from google.auth.transport.requests import Request, AuthorizedSession
-from scripts.harvester_schedule_contract import assert_environment_start, environment_event
+from scripts.harvester_schedule_contract import assert_environment_start, collector_start_evidence, environment_event
 from scripts.target_lineage import build_target_lineage, build_target_lineage_runtime_audit
 from scripts.toss_read_only_capability import (
     SCHEMA_VERSION as TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
@@ -539,12 +539,13 @@ def get_drive_service():
         creds.refresh(Request())
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-def assert_schedule_start() -> None:
-    assert_environment_start(os.environ, datetime.datetime.now(datetime.timezone.utc))
+def assert_schedule_start(*, completed_collector_required: bool = False) -> None:
+    assert_environment_start(os.environ, datetime.datetime.now(datetime.timezone.utc),
+                             completed_collector_required=completed_collector_required)
 
 
 GITHUB_EVENT_ACTION = environment_event(os.environ).get("action", "")
-assert_schedule_start()
+assert_schedule_start(completed_collector_required=__name__ != "__main__")
 drive_service = get_drive_service()
 
 DRIVE_RETRY_ATTEMPTS = 3
@@ -7107,9 +7108,10 @@ def fetch_earnings_event_map(tickers, trigger_file, timestamp):
 
 # --- [4. 메인 엔진] ---
 def run_harvester():
-    assert_schedule_start()
+    schedule_started_at = datetime.datetime.now(datetime.timezone.utc)
+    schedule_admission = collector_start_evidence(os.environ, schedule_started_at)
     start_time = time.time()
-    started_at_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    started_at_utc = schedule_started_at.isoformat().replace("+00:00", "Z")
     total_success, total_error = 0, 0
     total_lifecycle_skipped = 0
     total_mapping_pruned = 0
@@ -8397,6 +8399,7 @@ def run_harvester():
             "eventName": GITHUB_EVENT_NAME or "unknown",
             "mode": run_mode,
             "batchLabel": daily_group_label,
+            "scheduleAdmission": schedule_admission,
             "batchMode": daily_batch_mode,
             "scheduleExpression": GITHUB_EVENT_SCHEDULE,
             "targetSymbols": daily_target_count,

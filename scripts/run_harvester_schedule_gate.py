@@ -60,12 +60,15 @@ def execute(phase: str, env: Mapping[str, str], now: Any, transport: r.GitHubTra
     if phase == 'resolve':
         route = environment_route(env, now(), transport)
         return {'kind':route.kind, 'batch':route.slot.batch if route.slot else '',
+                'slot_json':route.slot.wire() if route.slot else {},
                 'sec_enabled':str(c.sec_phase_allowed(route, True, env.get('SEC_RECURRING_ENABLED')=='true')).lower()}
     c.require(env.get('HARVESTER_SCHEDULE_MODE') == 'hybrid' and transport is not None, 'HYBRID_REQUIRED')
     if phase == 'reserve':
-        route = environment_route(env, now())
-        c.require(route.kind == 'hybrid_daily', 'DAILY_ROUTE_REQUIRED')
-        result = r.reserve_slot(route.slot, env.get('HARVESTER_SCHEDULE_CONTROL_SHA256',''), env.get('GITHUB_RUN_ID',''),
+        slot = c.slot_from_wire(c.decode(env.get('RESOLVED_SLOT_JSON','').encode()),env.get('GITHUB_REPOSITORY',''))
+        route = environment_route(env, slot.scheduled_for)
+        c.require(route.kind == 'hybrid_daily' and route.slot == slot, 'DAILY_ROUTE_REQUIRED')
+        c.require(c.slot_is_open(slot,now()),'RESOLVED_SLOT_EXPIRED')
+        result = r.reserve_slot(slot, env.get('HARVESTER_SCHEDULE_CONTROL_SHA256',''), env.get('GITHUB_RUN_ID',''),
                                 env.get('GITHUB_SHA',''), now, transport)
         return {'admitted':'true', 'proof_json':result.proof.wire(), 'status':result.status}
     proof = proof_from_environment(env, now(), finishing=phase=='finish')
