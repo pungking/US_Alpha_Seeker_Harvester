@@ -196,6 +196,36 @@ class UploadContract(unittest.TestCase):
         self.assertEqual(self.files.get_media.call_count, len(errors))
         self.assert_safe()
 
+    def test_http_502_exact_readback_verifies_without_replay(self) -> None:
+        # 502 can be returned after a write that actually committed.
+        self.files.update.return_value.execute.side_effect = HttpError(
+            SimpleNamespace(status=502, reason="Bad Gateway"), PRIVATE.encode())
+        self.assertIsNone(self.invoke())
+        self.assertEqual(self.writes(), 1)
+        self.assertEqual(self.files.list.call_count, 2)
+        self.files.get_media.return_value.execute.assert_called_once_with(
+            http=ANY, num_retries=0)
+        self.assertIn("status=EXACT_CONTENT_VERIFIED", self.output.getvalue())
+        self.assert_safe()
+
+    def test_http_502_mismatched_readback_fails_without_replay(self) -> None:
+        # This mirrors the 2026-11-12 Run #786 error and must stay fail-closed.
+        self.files.update.return_value.execute.side_effect = HttpError(
+            SimpleNamespace(status=502, reason="Bad Gateway"), PRIVATE.encode())
+        self.files.get_media.return_value.execute.return_value = b"previous unrelated JSON"
+        error = self.invoke()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("DRIVE_UPLOAD_FAILED phase=write", str(error))
+        self.assertIn("cause=HttpError httpStatus=502", str(error))
+        self.assertIn("writeAttempts=1", str(error))
+        self.assertIn("verification=CONTENT_HASH_MISMATCH", str(error))
+        self.assertEqual(self.writes(), 1)
+        self.assertEqual(self.files.list.call_count, 2)
+        self.files.get_media.return_value.execute.assert_called_once_with(
+            http=ANY, num_retries=0)
+        self.assertNotIn(PRIVATE, str(error))
+        self.assert_safe()
+
     def test_prewrite_permanent_failure_reports_one_lookup_zero_writes(self) -> None:
         self.files.list.return_value.execute.side_effect = ValueError(PRIVATE)
         error = self.invoke()
