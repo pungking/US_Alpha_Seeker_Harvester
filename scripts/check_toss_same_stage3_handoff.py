@@ -22,6 +22,7 @@ from scripts.toss_shadow_market_data import (
     same_stage3_scope_matches,
     toss_shadow_matches_stage3,
 )
+from scripts.stage4_collection_evidence import build_stage4_collection_evidence
 import harvester as harvester_module
 
 
@@ -107,7 +108,56 @@ def _passing_shadow(source_artifact: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _check_stage4_collection_evidence() -> None:
+    # No provider or Drive calls: report-only count, clock and GitHub identity fixtures.
+    env = {
+        "GITHUB_RUN_ID": "123456",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_SHA": "a" * 40,
+    }
+    input = dict(
+        target=4, success=4, skipped=2, errors=0,
+        started_at="2026-11-15T08:00:00Z",
+        completed_at="2026-11-15T08:01:00Z",
+        github_env=env,
+    )
+    normal = build_stage4_collection_evidence(**input)
+    assert normal["collectionStatus"] == "COMPLETE"
+    assert normal["skippedWithinSuccessCount"] == 2
+    assert normal["producerRunId"] == "123456"
+    assert normal["producerRunAttempt"] == 2
+    assert normal["producerHeadSha"] == "a" * 40
+    assert normal["marketDataAsOfStatus"] == "UNVERIFIED_AT_COLLECTION_SUMMARY"
+    assert normal["downstreamAdmissionAuthorized"] is False
+
+    partial = build_stage4_collection_evidence(**{**input, "success": 3, "errors": 1})
+    assert partial["collectionStatus"] == "PARTIAL"
+    assert partial["downstreamAdmissionAuthorized"] is False
+    assert build_stage4_collection_evidence(**{**input, "success": 3})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "skipped": 5})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "target": 0, "success": 0})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "errors": -1})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "completed_at": "2026-11-15T07:00:00Z"})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "completed_at": "bad"})["collectionStatus"] == "UNVERIFIED"
+    for bad_env in ({}, {**env, "GITHUB_RUN_ID": "invalid"},
+                    {**env, "GITHUB_RUN_ATTEMPT": "0"},
+                    {**env, "GITHUB_SHA": "0" * 39}):
+        out = build_stage4_collection_evidence(**{**input, "github_env": bad_env})
+        assert out["producerIdentityStatus"] == "UNVERIFIED"
+        assert out["producerRunId"] is None
+        assert out["downstreamAdmissionAuthorized"] is False
+
+    root = Path(__file__).resolve().parents[1]
+    producer = (root / "harvester.py").read_text(encoding="utf-8")
+    assert "stage4_collection_evidence = build_stage4_collection_evidence(" in producer
+    assert '"collectionEvidence": stage4_collection_evidence' in producer
+    assert producer.count('"collectionEvidence": stage4_collection_evidence') == 2
+    assert '"status": "COMPLETED"' in producer  # existing operational state unchanged
+    print("[STAGE4_COLLECTION_EVIDENCE] PASS (report-only; no providers/Drive)")
+
+
 def main() -> int:
+    _check_stage4_collection_evidence()
     _check_incomplete_drive_read()
     root = Path(__file__).resolve().parents[1]
     harvester_source = (root / "harvester.py").read_text(encoding="utf-8")
