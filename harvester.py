@@ -7164,6 +7164,8 @@ def run_harvester():
 
         # 🎯 1. [특별 작업 모드] 웹앱 신호 시 OHLCV 300개 수집
         if GITHUB_EVENT_NAME == 'repository_dispatch' and GITHUB_EVENT_ACTION == "stage3_completed":
+            # Report-only evidence must also be defined when Stage3 has no usable tickers.
+            stage4_collection_evidence = None
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
             dispatch_trigger_contract = get_dispatch_trigger_contract()
@@ -7505,6 +7507,15 @@ def run_harvester():
                         "comparisonCoverageStatus"
                     )
                     or "unverified_external_event_source_coverage"
+                )
+            # No Stage4 Ready was emitted if collection never entered the symbol loop.
+            # Preserve existing operational status, but never omit/report stale evidence.
+            if stage4_collection_evidence is None:
+                stage4_collection_evidence = build_stage4_collection_evidence(
+                    target=0, success=0, skipped=0, errors=0,
+                    started_at=started_at_utc,
+                    completed_at=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                    github_env=os.environ,
                 )
             duration = (time.time() - start_time) / 60
             summary_payload = {
