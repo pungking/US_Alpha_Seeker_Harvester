@@ -30,6 +30,7 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload, DEFAULT
 from google.auth.transport.requests import Request, AuthorizedSession
 from scripts.harvester_schedule_contract import assert_environment_start, collector_start_evidence, environment_event
 from scripts.target_lineage import build_target_lineage, build_target_lineage_runtime_audit
+from scripts.stage4_collection_evidence import build_stage4_collection_evidence
 from scripts.toss_read_only_capability import (
     SCHEMA_VERSION as TOSS_READ_ONLY_CAPABILITY_SCHEMA_VERSION,
     probe_toss_read_only_capability,
@@ -7163,6 +7164,8 @@ def run_harvester():
 
         # 🎯 1. [특별 작업 모드] 웹앱 신호 시 OHLCV 300개 수집
         if GITHUB_EVENT_NAME == 'repository_dispatch' and GITHUB_EVENT_ACTION == "stage3_completed":
+            # Report-only evidence must also be defined when Stage3 has no usable tickers.
+            stage4_collection_evidence = None
             ohlcv_dir_id = find_file_id("Financial_Data_OHLCV", sys_id)
             s3_folder_id = find_file_id("Stage3_Fundamental_Data", root_id)
             dispatch_trigger_contract = get_dispatch_trigger_contract()
@@ -7423,6 +7426,15 @@ def run_harvester():
                         dispatch_earnings_event_missing = earnings_event_missing
                         dispatch_earnings_event_source = earnings_event_source
 
+                        stage4_collection_evidence = build_stage4_collection_evidence(
+                            target=total_count,
+                            success=total_success,
+                            skipped=ohlcv_skipped,
+                            errors=total_error,
+                            started_at=started_at_utc,
+                            completed_at=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                            github_env=os.environ,
+                        )
                         update_progress(
                             total_count,
                             total_count,
@@ -7438,6 +7450,7 @@ def run_harvester():
                             "LATEST_STAGE4_READY.json",
                             {
                                 "status": "COMPLETED",
+                                "collectionEvidence": stage4_collection_evidence,
                                 "trigger_file": current_trigger_file,
                                 "trigger_sha256": dispatch_trigger_sha256,
                                 "trigger_hash_basis": "CANONICAL_JSON",
@@ -7495,6 +7508,15 @@ def run_harvester():
                     )
                     or "unverified_external_event_source_coverage"
                 )
+            # No Stage4 Ready was emitted if collection never entered the symbol loop.
+            # Preserve existing operational status, but never omit/report stale evidence.
+            if stage4_collection_evidence is None:
+                stage4_collection_evidence = build_stage4_collection_evidence(
+                    target=0, success=0, skipped=0, errors=0,
+                    started_at=started_at_utc,
+                    completed_at=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                    github_env=os.environ,
+                )
             duration = (time.time() - start_time) / 60
             summary_payload = {
                 "status": "success",
@@ -7517,6 +7539,7 @@ def run_harvester():
                 "targetSymbols": dispatch_total_symbols,
                 "batchLabel": "dispatch_stage4",
                 "batchMode": "repository_dispatch",
+                "collectionEvidence": stage4_collection_evidence,
                 "marketRegimeReady": dispatch_market_regime_ready,
                 "earningsEventReady": dispatch_earnings_event_ready,
                 "earningsEventCount": dispatch_earnings_event_count,

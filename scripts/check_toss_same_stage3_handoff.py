@@ -22,6 +22,7 @@ from scripts.toss_shadow_market_data import (
     same_stage3_scope_matches,
     toss_shadow_matches_stage3,
 )
+from scripts.stage4_collection_evidence import build_stage4_collection_evidence
 import harvester as harvester_module
 
 
@@ -107,7 +108,124 @@ def _passing_shadow(source_artifact: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _check_stage4_collection_evidence() -> None:
+    # No provider or Drive calls: report-only count, clock and GitHub identity fixtures.
+    env = {
+        "GITHUB_RUN_ID": "123456",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_SHA": "a" * 40,
+    }
+    input = dict(
+        target=4, success=4, skipped=2, errors=0,
+        started_at="2026-11-15T08:00:00Z",
+        completed_at="2026-11-15T08:01:00Z",
+        github_env=env,
+    )
+    normal = build_stage4_collection_evidence(**input)
+    assert normal["collectionStatus"] == "COMPLETE"
+    assert normal["skippedWithinSuccessCount"] == 2
+    assert normal["producerRunId"] == "123456"
+    assert normal["producerRunAttempt"] == 2
+    assert normal["producerHeadSha"] == "a" * 40
+    assert normal["marketDataAsOfStatus"] == "UNVERIFIED_AT_COLLECTION_SUMMARY"
+    assert normal["downstreamAdmissionAuthorized"] is False
+
+    partial = build_stage4_collection_evidence(**{**input, "success": 3, "errors": 1})
+    assert partial["collectionStatus"] == "PARTIAL"
+    assert partial["downstreamAdmissionAuthorized"] is False
+    assert build_stage4_collection_evidence(**{**input, "success": 3})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "skipped": 5})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "target": 0, "success": 0})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "errors": -1})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "completed_at": "2026-11-15T07:00:00Z"})["collectionStatus"] == "UNVERIFIED"
+    assert build_stage4_collection_evidence(**{**input, "completed_at": "bad"})["collectionStatus"] == "UNVERIFIED"
+    for bad_env in ({}, {**env, "GITHUB_RUN_ID": "invalid"},
+                    {**env, "GITHUB_RUN_ATTEMPT": "0"},
+                    {**env, "GITHUB_SHA": "0" * 39}):
+        out = build_stage4_collection_evidence(**{**input, "github_env": bad_env})
+        assert out["producerIdentityStatus"] == "UNVERIFIED"
+        assert out["producerRunId"] is None
+        assert out["downstreamAdmissionAuthorized"] is False
+
+    root = Path(__file__).resolve().parents[1]
+    producer = (root / "harvester.py").read_text(encoding="utf-8")
+    assert "stage4_collection_evidence = build_stage4_collection_evidence(" in producer
+    assert '"collectionEvidence": stage4_collection_evidence' in producer
+    assert producer.count('"collectionEvidence": stage4_collection_evidence') == 2
+    assert '"status": "COMPLETED"' in producer  # existing operational state unchanged
+    print("[STAGE4_COLLECTION_EVIDENCE] PASS (report-only; no providers/Drive)")
+
+
+def _check_stage4_empty_dispatch_reporting() -> None:
+    """Exercise the actual dispatch summary with all provider/Drive I/O mocked."""
+    stage3_file = "STAGE3_FUNDAMENTAL_FULL_EMPTY_fixture.json"
+    fake_drive = Mock()
+    fake_drive.files.return_value.list.return_value.execute.return_value = {
+        "files": [{"id": "fixture-stage3-id", "name": stage3_file, "createdTime": "2026-11-15T00:00:00Z"}]
+    }
+    summary_write = Mock()
+    upload = Mock()
+
+    def read_stub(_file_id: str, *, include_raw: bool = False) -> object:
+        if include_raw:
+            return {"fundamental_universe": []}, b'{"fundamental_universe":[]}'
+        return {}
+
+    for missing_stage3_folder in (False, True):
+        summary_write.reset_mock()
+        upload.reset_mock()
+
+        def find_stub(name: str, *_args: object) -> str | None:
+            if missing_stage3_folder and name == "Stage3_Fundamental_Data":
+                return None
+            return "fixture-folder-id"
+
+        with patch.multiple(
+            harvester_module,
+            GITHUB_EVENT_NAME="repository_dispatch",
+            GITHUB_EVENT_ACTION="stage3_completed",
+            collector_start_evidence=Mock(return_value={}),
+            find_file_id=Mock(side_effect=find_stub),
+            get_dispatch_trigger_contract=Mock(return_value={"trigger_file": stage3_file}),
+            drive_service=fake_drive,
+            download_json=Mock(side_effect=read_stub),
+            validate_dispatch_stage3_content=Mock(return_value={
+                "canonicalSha256": "b" * 64, "contentSha256": "a" * 64,
+            }),
+            build_stage3_request_scope=Mock(return_value={"requestScopeSha256": "c" * 64}),
+            build_corporate_action_runtime_audit=Mock(return_value={"summary": {}}),
+            build_harvester_failure_report=Mock(return_value={
+                "failureSummary": {"categoryCounts": {}},
+                "skipSummary": {"categoryCounts": {}},
+                "failures": [],
+            }),
+            write_json_report=Mock(),
+            write_harvester_failure_report=Mock(),
+            write_harvester_run_summary=summary_write,
+            send_telegram=Mock(),
+            upload_json=upload,
+        ), redirect_stdout(io.StringIO()):
+            harvester_module.run_harvester()
+
+        assert summary_write.call_count == 1, "every dispatch path must produce one summary"
+        summary = summary_write.call_args.args[0]
+        evidence = summary["collectionEvidence"]
+        assert summary["mode"] == "dispatch"
+        assert evidence["collectionStatus"] == "UNVERIFIED"
+        assert evidence["targetSymbols"] == 0
+        assert evidence["countsVerified"] is False
+        assert evidence["marketDataAsOf"] is None
+        assert evidence["downstreamAdmissionAuthorized"] is False
+        assert all(
+            call.args[0] != "LATEST_STAGE4_READY.json"
+            for call in upload.call_args_list
+        ), "empty Stage3 must not publish Ready"
+    print("[STAGE4_EMPTY_DISPATCH] PASS (mock-only, no provider/Drive calls)")
+
+
 def main() -> int:
+    _check_stage4_collection_evidence()
+    _check_stage4_empty_dispatch_reporting()
     _check_incomplete_drive_read()
     root = Path(__file__).resolve().parents[1]
     harvester_source = (root / "harvester.py").read_text(encoding="utf-8")
